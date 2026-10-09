@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -84,7 +85,9 @@ def test_agent_rollback_drafts_and_connection_cleanup(window, tmp_path):
         gateway.execute("undo", {})
         assert ed.doc.resource(7)["framerate"] == original["framerate"]
         assert json.loads(path.read_text())["url"].startswith("http://127.0.0.1:")
-        assert path.stat().st_mode & 0o077 == 0
+        if os.name == "posix":
+            # Windows has no POSIX permission bits for chmod to set.
+            assert path.stat().st_mode & 0o077 == 0
     finally:
         gateway.stop()
     assert not path.exists()

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sc-studio"
+version = "0.5.1"
+requires-python = ">=3.10"
+description = "PyQt6 SC2 v5/v6 resource and movieclip editor"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE", "THIRD_PARTY_LICENSE.txt"]
+dependencies = [
+    "PyQt6>=6.7,<7",
+    "flatbuffers>=24.3.25",
+    "zstandard>=0.23",
+    "Pillow>=10",
+    "texture2ddecoder>=1.0.4",
+    "mcp>=1.30,<2",
+]
+
+[project.scripts]
+sc-studio = "sc_studio.app:main"
+sc-studio-mcp = "sc_studio.mcp_server:main"
+
+[tool.setuptools.package-data]
+sc_studio = ["schemas/*.fbs", "third_party/*.txt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

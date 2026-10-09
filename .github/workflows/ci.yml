@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests (Python ${{ matrix.python }} on ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        include:
+          # Cross-platform smoke runs: one Python version each.
+          - os: windows-latest
+            python: "3.12"
+          - os: macos-latest
+            python: "3.12"
+
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUTF8: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      # Qt's offscreen platform plugin still needs these shared libraries.
+      - name: Install Qt runtime libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1
+
+      - name: Install package and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install . pytest
+
+      - name: Show environment
+        run: |
+          python --version
+          python -m pip list
+
+      - name: Run tests
+        run: python -m pytest tests -q
+
+  package:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+
+      - name: Check distribution metadata
+        run: python -m twine check dist/*
+
+      # The schemas and third-party notice ship as package data; a missing
+      # MANIFEST entry would not fail the build but would break installed use.
+      - name: Verify package data is present
+        run: |
+          python - <<'PY'
+          import glob, sys, zipfile
+          wheel = glob.glob("dist/*.whl")[0]
+          names = zipfile.ZipFile(wheel).namelist()
+          required = ["sc_studio/schemas/MovieClips.fbs",
+                      "sc_studio/schemas/Textures.fbs",
+                      "sc_studio/third_party/SupercellFlash_LICENSE.txt"]
+          missing = [r for r in required if r not in names]
+          print(f"{len(names)} entries in {wheel}")
+          if missing:
+              sys.exit(f"missing package data: {missing}")
+          print("package data OK")
+          PY
+
+      - name: Install the wheel and load the entry points
+        run: |
+          python -m pip install dist/*.whl
+          python -c "import sc_studio, sc_studio.mcp_server, sc_studio.app; print('imports OK')"
+          command -v sc-studio
+          command -v sc-studio-mcp
+          sc-studio --help || true
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/*
+          if-no-files-found: error

@@ -1,0 +1,39 @@
+# Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Packaging and build output
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test and tool caches
+.pytest_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+.directory
+
+# Local SC Studio state (MCP connection descriptor, settings)
+.sc-studio/
+
+# Extracted game resource files: these are Supercell assets and must not be
+# published. Remove this line if you add a sample file whose license permits
+# redistribution.
+examples/*.sc

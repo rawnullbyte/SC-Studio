@@ -1,0 +1,59 @@
+namespace sc.flash.SC2;
+
+enum TextFieldStyle : ubyte(bit_flags) {
+    use_device_font,
+    has_outline,
+    bold,
+    italic,
+    is_multiline,
+    unknown_flag,
+    auto_kern
+}
+
+// A TextField is used to display text or simply as a bound
+// Inherited from DisplayObject
+struct TextField
+{
+    // Display Object Id
+    id: ushort;
+
+    unused1: ushort;
+
+    // Font Name Reference Id
+    font_name_ref_id: uint;
+
+    // Bound
+    left: short;
+    top: short;
+    right: short;
+    bottom: short;
+
+    // Color of text
+    font_color: uint;
+
+    // Color of text outline
+    outline_color: uint;
+
+    // Placeholder text reference Id
+    text_ref_id: uint;
+
+    typography_ref_id: uint; // Maybe typography path
+
+    styles: ubyte;
+
+    align: ubyte;
+
+    // Size of text
+    font_size: ubyte;
+
+    unused2: ubyte;
+    outline_angle: int;
+}
+
+// Third chunk. Contains TextField structures
+table TextFields
+{
+    textfields: [TextField];
+}
+
+root_type TextFields;

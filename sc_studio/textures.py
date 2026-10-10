@@ -8,6 +8,42 @@ import texture2ddecoder as dec
 import zstandard
 
 
+# GL_COMPRESSED_RGBA_ASTC_<NxM>_KHR starts at 0x93B0, in this order. The SRGB
+# variants start at 0x93D0 with the same layout.
+ASTC_BLOCKS = [
+    (4, 4),
+    (5, 4),
+    (5, 5),
+    (6, 5),
+    (6, 6),
+    (8, 5),
+    (8, 6),
+    (8, 8),
+    (10, 5),
+    (10, 6),
+    (10, 8),
+    (10, 10),
+    (12, 10),
+    (12, 12),
+]
+
+
+def astc_block_size(data, raw):
+    """(width, height) of one ASTC block, or None when the bytes are not ASTC.
+
+    Accepts the unpacked KTX blob so callers can reuse a payload already read
+    from disk or from an embedded external sidecar.
+    """
+    if not raw.startswith(b"\xabKTX 11"):
+        return None
+    internal = struct.unpack_from("<I", raw, 28)[0]
+    if 0x93B0 <= internal <= 0x93BD:
+        return ASTC_BLOCKS[internal - 0x93B0]
+    if 0x93D0 <= internal <= 0x93DD:
+        return ASTC_BLOCKS[internal - 0x93D0]
+    return None
+
+
 def texture_bytes(data, directory):
     if data.get("external_texture"):
         raw = (Path(directory) / data["external_texture"]).read_bytes()
@@ -49,24 +85,8 @@ def image(data, directory=Path(".")):
                     "RGBA" if fmt == 0x1908 else "RGB", (w, h), pixels
                 ).convert("RGBA")
             raise ValueError(f"Unsupported uncompressed KTX GL format {fmt:#x}")
-        astc = [
-            (4, 4),
-            (5, 4),
-            (5, 5),
-            (6, 5),
-            (6, 6),
-            (8, 5),
-            (8, 6),
-            (8, 8),
-            (10, 5),
-            (10, 6),
-            (10, 8),
-            (10, 10),
-            (12, 10),
-            (12, 12),
-        ]
-        if 0x93B0 <= internal <= 0x93BD or 0x93D0 <= internal <= 0x93DD:
-            block = astc[internal - (0x93D0 if internal >= 0x93D0 else 0x93B0)]
+        block = astc_block_size(data, raw)
+        if block is not None:
             out = dec.decode_astc(pixels, w, h, *block)
         elif internal in (0x8D64,):
             out = dec.decode_etc1(pixels, w, h)

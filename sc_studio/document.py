@@ -10,6 +10,7 @@ import os
 import struct
 import tempfile
 import zstandard
+from . import atlas_crop
 from .flatcodec import decode, encode
 from .packed import external_banks, compressed_frame
 
@@ -685,6 +686,126 @@ class Document:
             self.__dict__ = backup
             raise
 
+    def _plan_crops(self, source, objects):
+        """Cropped replacement per atlas, keyed by texture index.
+
+        Runs before anything is copied so each atlas is cropped once against
+        every shape that samples it. highres and lowres must stay in step, since
+        one UV rewrite has to serve both, so an atlas whose variants cannot all
+        be cropped is left out and copied whole, as earlier releases did.
+        """
+        by_atlas = {}
+        for _, (kind, obj) in objects.items():
+            if kind != "shapes":
+                continue
+            for command in obj["commands"]:
+                by_atlas.setdefault(command["texture_index"], set()).add(obj["id"])
+        plan = {}
+        for index, shape_ids in by_atlas.items():
+            if index >= len(source.tables["Textures"]["textures"]):
+                continue
+            texture = source.tables["Textures"]["textures"][index]
+            # atlas_regions measures UVs against highres, so a texture without
+            # one (only lowres present) has no usable geometry to crop against.
+            if not texture.get("highres"):
+                continue
+            rects = [
+                region["rect"]
+                for region in source.atlas_regions(index)
+                if region["id"] in shape_ids
+            ]
+            if not rects:
+                continue
+            variants = {}
+            for variant in ("highres", "lowres"):
+                data = texture.get(variant)
+                if not data:
+                    continue
+                # atlas_regions reports highres pixels, and lowres is usually
+                # half size, so its rects must be scaled or it crops to the
+                # wrong region (too large, wasting exactly the space this is
+                # meant to save).
+                scaled = rects
+                highres = texture.get("highres")
+                if variant == "lowres" and highres and highres["width"]:
+                    ratio = data["width"] / highres["width"]
+                    scaled = [
+                        [x * ratio, y * ratio, w * ratio, h * ratio]
+                        for x, y, w, h in rects
+                    ]
+                try:
+                    crop = atlas_crop.crop_texture(data, scaled)
+                except atlas_crop.CropError:
+                    variants = {}
+                    break
+                if crop is None:
+                    variants = {}
+                    break
+                variants[variant] = crop
+            if variants:
+                plan[index] = variants
+        return plan
+
+    def _texture_for(self, source, tex, crops, cropped):
+        """Copy one atlas, cropped when it has a crop plan, and cache its result.
+
+        Returns ``(texture_index, offset, block, source_size, cropped_size)``,
+        where ``offset`` is None when the atlas was copied whole and the shape's
+        UVs must be left alone.
+        """
+        if tex in cropped:
+            return cropped[tex]
+        texture = copy.deepcopy(source.tables["Textures"]["textures"][tex])
+        for variant in ("highres", "lowres"):
+            data = texture.get(variant)
+            if data and data.get("external_texture"):
+                rel = data["external_texture"]
+                payload = source.sidecars.get(rel)
+                if payload is None:
+                    if source.path is None:
+                        raise ValueError(f"Missing external texture: {rel}")
+                    payload = (source.path.parent / rel).read_bytes()
+                unpacked = payload
+                if payload.startswith(b"\x28\xb5\x2f\xfd"):
+                    unpacked = zstandard.ZstdDecompressor().decompress(payload)
+                if unpacked.startswith(b"\xabKTX 11"):
+                    data["data"] = unpacked
+                    data["external_texture"] = None
+                    data["texture_format"] = 8
+                else:
+                    suffix = Path(rel).suffix or ".bin"
+                    name = (
+                        "import_" + hashlib.sha256(payload).hexdigest()[:24] + suffix
+                    )
+                    self.sidecars[name] = payload
+                    data["external_texture"] = name
+        crop = crops.get(tex)
+        source_size = cropped_size = None
+        block = offset = None
+        if crop:
+            for variant, values in crop.items():
+                texture[variant] = values["dict"]
+            # One crop geometry serves both variants, so take it from highres
+            # when present and fall back to whichever variant does exist.
+            lead_variant = "highres" if "highres" in crop else next(iter(crop))
+            lead = crop[lead_variant]
+            original = source.tables["Textures"]["textures"][tex][lead_variant]
+            source_size = (original["width"], original["height"])
+            cropped_size = (lead["width"], lead["height"])
+            block = lead["block"]
+            offset = lead["offset"]
+        target = self.tables["Textures"]["textures"]
+        existing = next(
+            (i for i, value in enumerate(target) if value == texture), None
+        )
+        index = existing if existing is not None else len(target)
+        if existing is None:
+            target.append(texture)
+            self.dirty.add("Textures")
+        result = (index, offset, block, source_size, cropped_size)
+        cropped[tex] = result
+        return result
+
     def _import(self, source, ids):
         pending = list(ids)
         objects = {}
@@ -701,6 +822,8 @@ class Document:
         mapping = {i: next(free) for i in objects}
         textures = {}
         banks = {}
+        crops = self._plan_crops(source, objects)
+        cropped = {}
         for old, (kind, obj) in objects.items():
             obj["id"] = mapping[old]
             used = set(n for values in self.names.values() for n in values)
@@ -718,50 +841,13 @@ class Document:
                 for c in obj["commands"]:
                     tex = c["texture_index"]
                     if tex not in textures:
-                        texture = copy.deepcopy(
-                            source.tables["Textures"]["textures"][tex]
+                        textures[tex] = self._texture_for(source, tex, crops, cropped)
+                    index, offset, block, source_size, cropped_size = textures[tex]
+                    c["texture_index"] = index
+                    if offset is not None:
+                        c["vertices"] = atlas_crop.remap_uv(
+                            c["vertices"], offset, block, source_size, cropped_size
                         )
-                        for variant in ("highres", "lowres"):
-                            data = texture.get(variant)
-                            if data and data.get("external_texture"):
-                                rel = data["external_texture"]
-                                payload = source.sidecars.get(rel)
-                                if payload is None:
-                                    if source.path is None:
-                                        raise ValueError(
-                                            f"Missing external texture: {rel}"
-                                        )
-                                    payload = (source.path.parent / rel).read_bytes()
-                                unpacked = payload
-                                if payload.startswith(b"\x28\xb5\x2f\xfd"):
-                                    unpacked = zstandard.ZstdDecompressor().decompress(
-                                        payload
-                                    )
-                                if unpacked.startswith(b"\xabKTX 11"):
-                                    data["data"] = unpacked
-                                    data["external_texture"] = None
-                                    data["texture_format"] = 8
-                                else:
-                                    suffix = Path(rel).suffix or ".bin"
-                                    name = (
-                                        "import_"
-                                        + hashlib.sha256(payload).hexdigest()[:24]
-                                        + suffix
-                                    )
-                                    self.sidecars[name] = payload
-                                    data["external_texture"] = name
-                        target = self.tables["Textures"]["textures"]
-                        existing = next(
-                            (i for i, value in enumerate(target) if value == texture),
-                            None,
-                        )
-                        textures[tex] = (
-                            existing if existing is not None else len(target)
-                        )
-                        if existing is None:
-                            target.append(texture)
-                            self.dirty.add("Textures")
-                    c["texture_index"] = textures[tex]
             elif kind == "movieclips":
                 for c in obj["children"]:
                     c["id"] = mapping[c["id"]]

@@ -72,7 +72,7 @@ Example: call `documents`, then `list_resources` with `kind="movieclips"`, inspe
 
 Import follows nested movieclips, shapes, textfields, mask modifiers, all frames, child names and blend flags, texture atlases including highres/lowres variants, scaling grids, matrices, color transforms, frame labels, font references and exports. It handles recursive graphs and shared dependencies, remaps object and texture IDs, compacts each clip's transform bank, renames conflicting exports with `_copy2`, `_copy3` and so on, and reuses identical atlases. External KTX/ZKTX textures are embedded; other external textures are copied under content-based filenames alongside the destination SC. Missing sidecars fail the import and roll back its document changes.
 
-This is graph import, not texture repacking: a clip occupying a small region of a large atlas brings that whole atlas when the destination lacks it.
+Each imported atlas is cropped to the region the imported shapes actually sample, and their UVs are rewritten to match. Cropping works on whole ASTC blocks, which store independently with no cross-block prediction, so the retained bytes are copied verbatim and the result decodes to exactly the same pixels as the source region — no re-encoding and no quality change. Raw-format textures crop the same way by rows. An atlas that cannot be cropped safely (an external sidecar, an unsupported encoding) is copied whole instead. On a large UI file this cut imported texture bytes by about 69% across 25 clips, and a clip drawing one small sprite from a 4096×4096 sheet imports a texture a few dozen pixels across.
 
 **Import an image into a movieclip**
 

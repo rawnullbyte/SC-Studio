@@ -93,17 +93,21 @@ Open an atlas from the texture list. Every draw command that samples it is outli
 Most commands in a real UI atlas are *zero-area* — all four corners sample a single texel, so there is no rectangle to outline. Those are drawn as small diamond markers over the texel they sample and are pickable and openable like any other region, which keeps shapes that would otherwise be invisible in the atlas reachable. Several shapes commonly share one texel, so a click can land on more than one; the innermost match opens and the rest stay available in the right-click menu. Atlas commands are also dense — a single sheet can hold tens of thousands — so the marker overlay is what makes atlas-wide browsing practical.
 **Keyframe animation**
 
-A keyframe strip sits under the preview, so a timeline is visible and editable while you work rather than living in the Frames tab. It shows every frame of the open movieclip with the keyframes for the selected placement marked as diamonds, and the current frame highlighted.
+A keyframe timeline sits under the preview, so the whole thing is done there rather than in the Frames tab. It shows every frame of the open movieclip, the keyframes of the selected placement as diamonds, a playhead, and a translucent band over the selected range of frames.
 
-- **Left click** a frame to go there; clicking a keyframe also arms a drag, so dragging it moves the key to another frame.
-- **Right click** a frame to add a keyframe on it, or remove the one already there.
-- Picking a different placement in the Elements list switches the strip to that placement's keys.
+- **Drag in the ruler** (the lower part) to select a range of frames. The same drag over either key selects the whole tween between them, which is the usual case.
+- **Drag a key** in the upper track to move it to another frame; **right-click a key** to remove it, jump to it, or extend the selection to it.
+- **Right-click the ruler** for frame actions (add, duplicate, delete) and to apply a curve to just that selection, including a submenu that picks how many frames to generate.
+- **Drag a band edge** to lengthen or shorten the selection.
+- Picking a different placement switches the strip to that placement's keys.
 
-A keyframe is the placement's transform on that frame. Adding one copies the transform the placement currently renders with, so creating a key never moves the object on screen. Keyframes are created in place — there is no need to duplicate frames by hand first.
+**Size, position, rotation and scale** are editable in the Animation tab's transform fields for the current frame. Applying them keys that frame, so editing here animates instead of changing a transform shared with other frames. Rotation is not limited to a dialog: the same fields carry it.
 
-**Between keyframes** chooses the curve used when filling the frames between two keys: Linear, Ease in, Ease out, Ease in-out, Smooth, Snap in, Snap out, Overshoot and Anticipate, drawn as a preview beside the list. **Bake tween** writes those in-between transforms as real frames; **Revert to keys** removes exactly the frames the last bake wrote, so keyframes you set yourself are never touched. The SC2 format stores one discrete transform per frame and has nowhere to record a curve, so a curve is an authoring choice that is baked into frames — the game reads ordinary frames.
+**Curve and how many keys.** Choose a curve (Linear, Ease in, Ease out, Ease in-out, Smooth, Snap in, Snap out, Overshoot, Anticipate, drawn as a preview), set **Keys to create** to the number of frames to write between each pair of keys, then **Apply curve to range**. The keys you set are kept exactly; only the frames between them are generated. **Undo curve** removes just the frames that curve wrote.
 
-Rotation interpolates by the shorter way round, and scale is kept positive through a turn, which a direct blend of the matrix components would not do.
+Frames can also be created from the animator directly — **Add frame**, **Duplicate**, **Delete frame** — so building a timeline does not mean switching tabs.
+
+The SC2 format stores one discrete transform per frame and has nowhere to record a curve, so a curve is an authoring choice that is baked into frames; the game reads ordinary frames. Rotation interpolates by the shorter way round and scale is kept positive through a turn, which a direct blend of the matrix components would not do.
 
 ## Interface
 

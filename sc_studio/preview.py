@@ -1,7 +1,7 @@
 from collections import OrderedDict
 import builtins
 import math
-from PyQt6.QtCore import Qt, QPointF, QRectF, pyqtSignal
+from PyQt6.QtCore import Qt, QPointF, QRectF, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QTransform,
     QImage,
@@ -150,18 +150,30 @@ class Container(QGraphicsItem):
 
 
 class KeyframeStrip(QWidget):
-    """A frame ruler with keyframe diamonds, sitting under the transport bar.
+    """A multi-select keyframe timeline, under the transport bar.
 
-    Shows and edits the whole timeline in place, so animating does not mean
-    switching to the Frames tab and duplicating frames by hand.
+    Shows every frame of the open movieclip with the selected placement's
+    keyframes, the playhead, and a translucent band over a range of frames so a
+    gap between two keys can be acted on directly. There is no keyboard
+    modifier: a plain drag across empty timeline selects a range, which is the
+    gesture an animator reaches for anyway.
     """
 
     framePicked = pyqtSignal(int)
-    keyToggled = pyqtSignal(int, int)  # frame, placement row
-    moveRequested = pyqtSignal(int, int)  # from frame, to frame
+    selectionChanged = pyqtSignal()
+    moveRequested = pyqtSignal(int, int)  # dragged key, frame it moved to
+    frameContext = pyqtSignal(object, object)  # frames, global position
+    keyContext = pyqtSignal(int, object)  # frame, global position
 
-    KEY_WIDTH = 16
+    EDGE = 6  # grab width for nudging the selection band's ends
     LABEL_HEIGHT = 13
+    KEY_ROW = 15  # height of the key track; below it is the ruler
+    REPEAT_MS = 130
+
+    @property
+    def ruler_top(self):
+        """Y where the ruler begins; above it is the draggable key track."""
+        return self.LABEL_HEIGHT + self.KEY_ROW
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -169,94 +181,155 @@ class KeyframeStrip(QWidget):
         self.current = 0
         self.keys = set()
         self.row = -1
+        self.band = None  # (anchor, pivot) frame indices
         self.dragging = None
-        self.setMinimumHeight(
-            self.KEY_WIDTH + self.LABEL_HEIGHT + 2 + self.fontMetrics().height()
-        )
+        self.marquee = None
+        self.resizing = None
+        self._repeat = None
+        self.width_per_frame = 16
+        self.setMinimumHeight(52)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self.setToolTip(
-            "Left click a frame to go there · click a keypoint to move it · "
-            "right click to add or remove a keypoint · double click to scrub"
+            "Drag in the ruler below to select a range of frames · drag a key "
+            "in the row above to move it · drag the band edge to lengthen or "
+            "shorten it · right click for key and frame actions"
         )
+
+    # --- geometry -----------------------------------------------------------
+
+    def width_for(self, count):
+        """Fit the timeline to the widget, with a readable floor per frame."""
+        available = max(1, self.width() - 8)
+        if count <= 0:
+            return 16
+        return max(6, min(26, available / count))
+
+    def x_for(self, frame):
+        return frame * self.width_per_frame + self.width_per_frame / 2
+
+    def frame_at(self, x):
+        frame = int(x // self.width_per_frame)
+        return max(0, min(frame, max(0, self.frame_count - 1)))
+
+    def selected_frames(self):
+        """Frames in the band, or an empty list when nothing is selected."""
+        if self.band is None:
+            return []
+        low, high = sorted(self.band)
+        return list(range(low, high + 1))
+
+    # --- state --------------------------------------------------------------
 
     def set_state(self, frame_count, current, keys, row):
         """Adopt a new timeline, repainting only when something changed."""
         keys = set(keys)
+        width = self.width_for(frame_count)
         if (
             frame_count == self.frame_count
             and current == self.current
             and keys == self.keys
             and row == self.row
+            and width == self.width_per_frame
         ):
             return
         self.frame_count = max(0, frame_count)
         self.current = max(0, min(current, max(0, self.frame_count - 1)))
         self.keys = keys
         self.row = row
+        self.width_per_frame = width
+        if self.band is not None:
+            low, high = sorted(self.band)
+            if low >= self.frame_count:
+                self.band = None
+            else:
+                self.band = (min(low, self.frame_count - 1),
+                             min(high, self.frame_count - 1))
         self.update()
 
-    def x_for(self, frame):
-        return frame * self.KEY_WIDTH + self.KEY_WIDTH / 2
+    def set_band(self, low, high):
+        """Select an inclusive range of frames."""
+        if self.frame_count <= 0:
+            return
+        clamped = (max(0, min(low, self.frame_count - 1)),
+                   max(0, min(high, self.frame_count - 1)))
+        if self.band != clamped:
+            self.band = clamped
+            self.selectionChanged.emit()
+            self.update()
 
-    def frame_at(self, x):
-        frame = int(x // self.KEY_WIDTH)
-        return max(0, min(frame, max(0, self.frame_count - 1)))
+    def clear_band(self):
+        if self.band is not None:
+            self.band = None
+            self.selectionChanged.emit()
+            self.update()
+
+    def select_keys(self):
+        """Select from the first to the last key, so a tween is one gesture."""
+        if self.keys:
+            self.set_band(min(self.keys), max(self.keys))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.width_per_frame = self.width_for(self.frame_count)
+        self.update()
+
+    # --- painting -----------------------------------------------------------
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        width = self.width()
         height = self.height()
         metrics = self.fontMetrics()
-        ruler_top = self.LABEL_HEIGHT + self.KEY_WIDTH + 2
-        painter.fillRect(0, 0, width, height, self.palette().window())
+        ruler_top = self.ruler_top
+        painter.fillRect(self.rect(), self.palette().window())
         if not self.frame_count:
             painter.setPen(self.palette().color(QPalette.ColorRole.PlaceholderText))
             painter.drawText(4, metrics.ascent() + 4, "Select a movieclip to animate")
             return
 
+        step = self.width_per_frame
         accent = self.palette().color(QPalette.ColorRole.Highlight)
         text = self.palette().color(QPalette.ColorRole.WindowText)
         muted = self.palette().color(QPalette.ColorRole.PlaceholderText)
-        current_color = QColor("#ff9d3a")
+        playhead = QColor("#ff9d3a")
 
-        # Ruler ticks, labelled at a spacing that stays readable when narrow.
-        step = 1
-        while step * self.KEY_WIDTH < 34:
-            step *= 5 if step % 2 else 2
-        painter.setPen(muted)
-        for frame in range(0, self.frame_count, step):
-            x = self.x_for(frame)
-            # drawLine has no float overload, so points go in as QPointF.
-            painter.drawLine(QPointF(x, ruler_top), QPointF(x, ruler_top + 5))
-            painter.drawText(
-                QPointF(x + 2, ruler_top + 4 + metrics.ascent()), str(frame + 1)
+        # Selection band first, so keys and the playhead stay legible on top.
+        if self.band is not None:
+            low, high = sorted(self.band)
+            shade = QColor(accent)
+            shade.setAlpha(48)
+            painter.fillRect(
+                QRectF(low * step, 0, (high - low + 1) * step, height), shade
             )
-        painter.drawLine(QPointF(0, ruler_top), QPointF(width, ruler_top))
+            pen = QPen(accent)
+            pen.setWidth(1)
+            painter.setPen(pen)
+            painter.drawLine(
+                QPointF(low * step, 0), QPointF(low * step, height)
+            )
+            painter.drawLine(
+                QPointF((high + 1) * step, 0), QPointF((high + 1) * step, height)
+            )
 
-        # The current frame's column, so the playhead is visible at a glance.
-        column = QRectF(
-            self.current * self.KEY_WIDTH,
-            0,
-            self.KEY_WIDTH,
-            height,
-        )
-        highlight = QColor(current_color)
-        highlight.setAlpha(46)
-        painter.fillRect(column, highlight)
-        pen = QPen(current_color)
-        pen.setWidth(2)
-        painter.setPen(pen)
-        playhead = self.current * self.KEY_WIDTH
-        painter.drawLine(QPointF(playhead, 0), QPointF(playhead, height))
+        label_step = 1
+        while label_step * step < 34:
+            label_step *= 5 if label_step % 2 else 2
+        painter.setPen(muted)
+        for frame in range(0, self.frame_count, label_step):
+            x = self.x_for(frame)
+            painter.drawLine(QPointF(x, ruler_top), QPointF(x, ruler_top + 5))
+            if step >= 10:
+                painter.drawText(
+                    QPointF(x + 2, ruler_top + 4 + metrics.ascent()), str(frame + 1)
+                )
+        painter.drawLine(QPointF(0, ruler_top), QPointF(self.width(), ruler_top))
 
-        # Keypoints on the row between the frame numbers and the ruler.
         top = self.LABEL_HEIGHT + 2
+        size = max(3.0, min(step / 2 - 1, 8.0))
         for frame in sorted(self.keys):
             if frame >= self.frame_count:
                 continue
             x = self.x_for(frame)
-            size = self.KEY_WIDTH / 2 - 2
             painter.setBrush(accent)
             painter.setPen(QPen(text, 1))
             painter.drawPolygon(
@@ -270,39 +343,143 @@ class KeyframeStrip(QWidget):
                 )
             )
 
+        play = self.current * step
+        highlight = QColor(playhead)
+        highlight.setAlpha(46)
+        painter.fillRect(QRectF(play, 0, step, height), highlight)
+        pen = QPen(playhead)
+        pen.setWidth(2)
+        painter.setPen(pen)
+        painter.drawLine(QPointF(play, 0), QPointF(play, height))
+
+        if self.marquee is not None:
+            low, high = sorted(self.marquee)
+            pen = QPen(text)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(
+                QRectF(low * step, top, (high - low + 1) * step, size * 2)
+            )
+
+        # A hint that the band edges can be dragged, only when a band exists.
+        if self.band is not None and step >= 8:
+            low, high = sorted(self.band)
+            painter.setPen(muted)
+            painter.drawText(
+                QPointF(low * step + 2, height - 3),
+                f"{len(self.selected_frames())} frames selected",
+            )
+
+    # --- interaction --------------------------------------------------------
+
+    def _stop_repeat(self):
+        if self._repeat is not None:
+            self._repeat.stop()
+            self._repeat = None
+
+    def _start_repeat(self, delta):
+        self._stop_repeat()
+        timer = QTimer(self)
+        timer.setInterval(self.REPEAT_MS)
+        timer.timeout.connect(lambda: self.framePicked.emit(
+            max(0, min(self.current + delta, self.frame_count - 1))
+        ))
+        timer.start()
+        self._repeat = timer
+
+    def _band_edges(self, x):
+        """True when x is on a band edge, with the side it belongs to."""
+        if self.band is None:
+            return None
+        low, high = sorted(self.band)
+        left, right = low * self.width_per_frame, (high + 1) * self.width_per_frame
+        if abs(x - left) <= self.EDGE:
+            return "low"
+        if abs(x - right) <= self.EDGE:
+            return "high"
+        return None
+
     def mousePressEvent(self, event):
         if not self.frame_count:
             return
-        frame = self.frame_at(event.position().x())
+        x = event.position().x()
+        frame = self.frame_at(x)
         if event.button() == Qt.MouseButton.RightButton:
-            self.keyToggled.emit(frame, self.row)
+            if frame in self.keys:
+                self.keyContext.emit(frame, event.globalPosition().toPoint())
+            else:
+                self.frameContext.emit(
+                    self.selected_frames() or [frame],
+                    event.globalPosition().toPoint(),
+                )
             return
-        if frame in self.keys:
-            # Clicking a keypoint both navigates to it and arms a drag, which is
-            # what animators normally do; dragging is what moves the key.
-            self.dragging = frame
-            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+        # The ruler selects a range and the key track moves keys, so a range
+        # spanning keyframes can be selected without having to aim between them.
+        on_ruler = event.position().y() >= self.ruler_top
+        if not on_ruler:
+            edge = self._band_edges(x)
+            if edge is not None:
+                self.resizing = edge
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+                return
+            if frame in self.keys:
+                self.dragging = frame
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                self.framePicked.emit(frame)
+                return
+        # Ruler, or the key track where there is no key: begin a band. A plain
+        # click is a one-frame band, so the same gesture covers both.
+        self.marquee = (frame, frame)
         self.framePicked.emit(frame)
 
     def mouseMoveEvent(self, event):
+        x = event.position().x()
+        if self.resizing is not None:
+            frame = self.frame_at(x)
+            low, high = sorted(self.band)
+            if self.resizing == "low":
+                self.set_band(min(frame, high), high)
+            else:
+                self.set_band(low, max(frame, low))
+            return
         if self.dragging is not None:
-            target = self.frame_at(event.position().x())
+            target = self.frame_at(x)
             if target != self.dragging:
                 self.moveRequested.emit(self.dragging, target)
                 self.dragging = target
+            return
+        if self.marquee is not None:
+            self.marquee = (self.marquee[0], self.frame_at(x))
+            self.update()
+            return
+        # Nudge cursor only when there is nothing else in progress.
+        prompting = (
+            event.position().y() < self.ruler_top and self._band_edges(x) is not None
+        )
+        self.setCursor(
+            Qt.CursorShape.SizeHorCursor
+            if prompting
+            else Qt.CursorShape.ArrowCursor
+        )
 
     def mouseReleaseEvent(self, event):
-        if self.dragging is not None:
-            self.dragging = None
-            self.unsetCursor()
+        if self.marquee is not None:
+            low, high = sorted(self.marquee)
+            self.marquee = None
+            self.set_band(low, high)
+            return
+        self._stop_repeat()
+        self.dragging = None
+        self.resizing = None
+        self.unsetCursor()
 
     def mouseDoubleClickEvent(self, event):
         if self.frame_count:
             self.framePicked.emit(self.frame_at(event.position().x()))
 
     def wheelEvent(self, event):
-        # Forwarding keeps the pointer over the strip a valid place to zoom the
-        # preview, matching the viewport it sits under.
         event.ignore()
 
 

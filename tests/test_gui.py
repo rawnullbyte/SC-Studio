@@ -1590,3 +1590,142 @@ def test_strip_survives_a_placement_absent_from_a_frame(window):
     e.bake_tween()                            # must skip frame 2, not crash
     assert 2 not in e.placement_keys(e.obj)
     assert e.doc.validate() == []
+
+
+def test_frame_creation_from_the_animator(window):
+    w = window
+    w.add_doc(animatable_clip(3))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    assert len(e.obj["frames"]) == 3
+    e.add_frame(False)
+    assert len(e.obj["frames"]) == 4
+    assert e.keyframes.frame_count == 4
+    e.add_frame(True)
+    assert len(e.obj["frames"]) == 5
+    e.remove_frame()
+    assert len(e.obj["frames"]) == 4
+
+
+def test_transform_fields_key_position_rotation_and_scale(window):
+    """The animator must be able to rotate, not just move."""
+    import math
+    from sc_studio import easing
+
+    w = window
+    w.add_doc(animatable_clip(4))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    e.frame.setValue(0)
+    application().processEvents()
+    assert set(e.key_fields) == {"X", "Y", "Rotation", "Scale X", "Scale Y"}
+    e.key_fields["X"].setValue(30.0)
+    e.key_fields["Rotation"].setValue(45.0)
+    e.key_fields["Scale X"].setValue(2.0)
+    e.key_fields["Scale Y"].setValue(2.0)
+    e.apply_animation_fields()
+    assert e.placement_keys(e.obj) == [0]
+    parts = easing.decompose(e.key_transforms(e.obj)[0][0])
+    assert parts["tx"] == pytest.approx(30.0, abs=0.01)
+    assert math.degrees(parts["rotation"]) == pytest.approx(45.0, abs=0.01)
+    assert parts["scale_x"] == pytest.approx(2.0, abs=0.01)
+    # Fields reload from the frame, so they follow the playhead.
+    e.frame.setValue(2)
+    application().processEvents()
+    assert e.key_fields["Rotation"].value() == pytest.approx(0.0, abs=0.01)
+
+
+def test_strip_band_selects_a_range_including_keys(window):
+    w = window
+    w.add_doc(animatable_clip(6))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    strip = e.keyframes
+    assert strip.selected_frames() == []
+    # A band over the first and last key, which is what a tween needs.
+    strip.set_band(0, 5)
+    assert strip.selected_frames() == [0, 1, 2, 3, 4, 5]
+    assert strip.band == (0, 5)
+    strip.clear_band()
+    assert strip.selected_frames() == []
+    # select_keys spans the keys themselves.
+    e.frame.setValue(1)
+    e.toggle_keypoint_at(1, 0)
+    e.frame.setValue(4)
+    e.toggle_keypoint_at(4, 0)
+    e.select_all_keys()
+    assert strip.band == (1, 4)
+
+
+def test_apply_curve_to_selected_range_creates_keys(window):
+    import math
+    from sc_studio import easing
+
+    w = window
+    w.add_doc(animatable_clip(11))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    e.frame.setValue(0)
+    application().processEvents()
+    e.key_fields["X"].setValue(0.0)
+    e.apply_animation_fields()
+    e.frame.setValue(10)
+    application().processEvents()
+    e.key_fields["X"].setValue(200.0)
+    e.key_fields["Rotation"].setValue(90.0)
+    e.apply_animation_fields()
+    assert sorted(e.placement_keys(e.obj)) == [0, 10]
+
+    e.keyframes.set_band(0, 10)
+    e.key_density.setValue(10)
+    e.curve.setCurrentText("Ease in-out")
+    e.apply_curve_to_range()
+
+    keys = sorted(e.placement_keys(e.obj))
+    assert keys[0] == 0 and keys[-1] == 10
+    assert len(keys) > 2, "the curve should have created intermediate keys"
+    found = e.key_transforms(e.obj)
+    xs = [easing.decompose(found[k][0])["tx"] for k in keys]
+    # Ease in-out is slow at both ends, so the first step is smaller than a
+    # straight line's would be.
+    assert (xs[1] - xs[0]) < (200.0 / (len(keys) - 1))
+    assert xs == sorted(xs)
+    assert math.degrees(
+        easing.decompose(found[keys[-1]][0])["rotation"]
+    ) == pytest.approx(90.0, abs=0.5)
+    assert e.doc.validate() == []
+    # Undo curve removes only what the curve wrote.
+    e.revert_tween()
+    assert sorted(e.placement_keys(e.obj)) == [0, 10]
+
+
+def test_key_density_controls_how_many_keys_are_created(window):
+    w = window
+    w.add_doc(animatable_clip(21))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    e.frame.setValue(0)
+    application().processEvents()
+    for frame, value in ((0, 0.0), (20, 100.0)):
+        e.frame.setValue(frame)
+        application().processEvents()
+        e.key_fields["X"].setValue(value)
+        e.apply_animation_fields()
+    e.keyframes.set_band(0, 20)
+    e.curve.setCurrentText("Linear")
+    e.key_density.setValue(20)
+    e.apply_curve_to_range()
+    dense = len(e.placement_keys(e.obj))
+    e.revert_tween()
+    e.key_density.setValue(4)
+    e.apply_curve_to_range()
+    sparse = len(e.placement_keys(e.obj))
+    assert sparse < dense, f"sparse {sparse} should be fewer than dense {dense}"
+    assert sparse >= 3

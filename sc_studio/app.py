@@ -311,8 +311,10 @@ class Editor(QWidget):
         # editable while previewing, instead of living in the Frames tab.
         self.keyframes = KeyframeStrip()
         self.keyframes.framePicked.connect(self.goto_frame)
-        self.keyframes.keyToggled.connect(self.toggle_keypoint_at)
         self.keyframes.moveRequested.connect(self.move_keypoint)
+        self.keyframes.frameContext.connect(self.keyframe_context_menu)
+        self.keyframes.keyContext.connect(self.keypoint_context_menu)
+        self.keyframes.selectionChanged.connect(self.keyframe_selection_changed)
         cv.addWidget(self.keyframes)
         self.notice = QLabel("Select a resource to preview and edit.")
         self.notice.setWordWrap(True)
@@ -369,6 +371,26 @@ class Editor(QWidget):
                 "that frame; frames between keys are baked from the curve."
             )
         )
+        anim_layout.addWidget(QLabel("Frames"))
+        frame_row = QHBoxLayout()
+        for title, fn, tip in [
+            (
+                "Add frame",
+                lambda: self.add_frame(False),
+                "Append a frame after the current one",
+            ),
+            (
+                "Duplicate",
+                lambda: self.add_frame(True),
+                "Copy the current frame, including its placements",
+            ),
+            ("Delete frame", self.remove_frame, "Remove the current frame"),
+        ]:
+            button = QPushButton(title)
+            button.setToolTip(tip)
+            button.clicked.connect(fn)
+            frame_row.addWidget(button)
+        anim_layout.addLayout(frame_row)
         anim_layout.addWidget(QLabel("Keypoints"))
         self.keypoints = table(["Frame", "Position", "Rotation", "Scale"])
         anim_layout.addWidget(self.keypoints)
@@ -382,13 +404,46 @@ class Editor(QWidget):
             button.clicked.connect(fn)
             key_row.addWidget(button)
         anim_layout.addLayout(key_row)
-        anim_layout.addWidget(QLabel("Between keypoints"))
+        anim_layout.addWidget(QLabel("Transform on this frame"))
+        # The same fields the viewer's Size / position dialog offers, so a
+        # placement can be animated without leaving the animator.
+        self.key_fields = {}
+        transform = QFormLayout()
+        for name, low, high in (
+            ("X", -1e6, 1e6),
+            ("Y", -1e6, 1e6),
+            ("Rotation", -3600.0, 3600.0),
+            ("Scale X", -1000.0, 1000.0),
+            ("Scale Y", -1000.0, 1000.0),
+        ):
+            box = QDoubleSpinBox()
+            box.setDecimals(2)
+            box.setRange(low, high)
+            box.setValue(0.0 if name in ("X", "Y", "Rotation") else 1.0)
+            transform.addRow(name, box)
+            self.key_fields[name] = box
+        anim_layout.addLayout(transform)
+        apply_row = QHBoxLayout()
+        self.apply_animation_button = QPushButton("Apply to this frame")
+        self.apply_animation_button.setToolTip(
+            "Key the transform below on the current frame, so changing it here "
+            "animates rather than editing a shared transform"
+        )
+        self.apply_animation_button.clicked.connect(self.apply_animation_fields)
+        apply_row.addWidget(self.apply_animation_button)
+        nudge_clear = QPushButton("Reset")
+        nudge_clear.setToolTip("Reset the fields to the placement's current transform")
+        nudge_clear.clicked.connect(self.load_animation_fields)
+        apply_row.addWidget(nudge_clear)
+        anim_layout.addLayout(apply_row)
+        self.animation_hint = QLabel("")
+        self.animation_hint.setWordWrap(True)
+        anim_layout.addWidget(self.animation_hint)
+        anim_layout.addWidget(QLabel("Curve"))
         curve_row = QHBoxLayout()
         self.curve = QComboBox()
         self.curve.addItems(easing.PRESETS)
-        self.curve.setToolTip(
-            "Shape applied while baking the frames between two keypoints"
-        )
+        self.curve.setToolTip("Shape applied to the selected range of frames")
         curve_row.addWidget(self.curve, 1)
         self.curve_preview = QLabel()
         self.curve_preview.setMinimumHeight(34)
@@ -396,22 +451,40 @@ class Editor(QWidget):
         self.curve_preview.setToolTip("Curve shape, drawn left to right over time")
         curve_row.addWidget(self.curve_preview)
         anim_layout.addLayout(curve_row)
-        bake_row = QHBoxLayout()
-        self.bake_info = QLabel("")
-        self.bake_info.setWordWrap(True)
-        self.bake_button = QPushButton("Bake tween")
-        self.bake_button.setToolTip(
-            "Fill the frames between each pair of keys with the curve's transforms"
+        density_row = QHBoxLayout()
+        density_row.addWidget(QLabel("Keys to create"))
+        self.key_density = QSpinBox()
+        self.key_density.setRange(1, 60)
+        self.key_density.setValue(6)
+        self.key_density.setToolTip(
+            "How many frames to write between each pair of keys. Fewer keys "
+            "means a coarser, smaller animation."
         )
-        self.bake_button.clicked.connect(self.bake_tween)
+        density_row.addWidget(self.key_density)
+        density_row.addStretch()
+        anim_layout.addLayout(density_row)
+        bake_row = QHBoxLayout()
+        self.bake_button = QPushButton("Apply curve to range")
+        self.bake_button.setToolTip(
+            "Write the curve into the frames selected on the timeline"
+        )
+        self.bake_button.clicked.connect(self.apply_curve_to_range)
         bake_row.addWidget(self.bake_button)
-        bake_clear = QPushButton("Revert to keys")
+        select_button = QPushButton("Select keys")
+        select_button.setToolTip("Select from the first key to the last")
+        select_button.clicked.connect(self.select_all_keys)
+        bake_row.addWidget(select_button)
+        anim_layout.addLayout(bake_row)
+        undo_row = QHBoxLayout()
+        bake_clear = QPushButton("Undo curve")
         bake_clear.setToolTip(
-            "Drop baked frames, keeping only the frames where a key was set"
+            "Remove only the frames the last curve wrote, keeping your keys"
         )
         bake_clear.clicked.connect(self.revert_tween)
-        bake_row.addWidget(bake_clear)
-        anim_layout.addLayout(bake_row)
+        undo_row.addWidget(bake_clear)
+        anim_layout.addLayout(undo_row)
+        self.bake_info = QLabel("")
+        self.bake_info.setWordWrap(True)
         anim_layout.addWidget(self.bake_info)
         self.curve.currentTextChanged.connect(self.draw_curve)
         animation_page.setObjectName("animationPage")
@@ -1125,11 +1198,13 @@ class Editor(QWidget):
                 self.frames.selectRow(min(old_frame, max(0, len(obj["frames"]) - 1)))
                 self.show_elements()
                 self.refresh_keyframe_strip()
+                self.load_animation_fields()
             else:
                 fill_table(self.children, [])
                 fill_table(self.frames, [])
                 fill_table(self.elements, [])
                 self.refresh_keyframe_strip()
+                self.load_animation_fields()
         except Exception as e:
             self.error(e)
         finally:
@@ -1201,6 +1276,8 @@ class Editor(QWidget):
             or "Click / drag a placement to move · Drag empty space to pan · Wheel to zoom"
         )
         self.refresh_keyframe_strip()
+        # The transform fields belong to the current frame, so they follow it.
+        self.load_animation_fields()
 
     def tick(self):
         # One frame per tick, at the clip's own rate. Deriving the frame from
@@ -1296,6 +1373,237 @@ class Editor(QWidget):
             self.toggle_play()
         maximum = self.frame.maximum()
         self.frame.setValue(max(0, min(index, maximum)))
+
+    def keyframe_selection_changed(self):
+        """Keep the tween controls in step with the strip's selected range."""
+        frames = self.keyframes.selected_frames()
+        if frames:
+            self.bake_button.setText(f"Apply curve to {len(frames)} frames")
+        else:
+            self.bake_button.setText("Apply curve to range")
+        self.update_curve_info(frames)
+
+    def update_curve_info(self, frames=None):
+        """Describe what applying the curve would affect, next to the button."""
+        if not self.animatable():
+            self.bake_info.setText("Select a movieclip placement to tween it.")
+            return
+        keys = self.placement_keys(self.obj)
+        if len(keys) < 2:
+            self.bake_info.setText(
+                "Set a keyframe on another frame to tween between them."
+            )
+            return
+        if frames is None:
+            frames = self.keyframes.selected_frames()
+        low, high = min(keys), max(keys)
+        dense = self.key_density.value()
+        if frames:
+            inside = [k for k in keys if frames[0] <= k <= frames[-1]]
+            if len(inside) >= 2:
+                low, high = inside[0], inside[-1]
+            scope = f"selected frames {frames[0] + 1}-{frames[-1] + 1}"
+        else:
+            scope = "the whole clip"
+        span = high - low
+        step = max(1, round(span / dense)) if dense else 1
+        estimate = max(0, span // step) if span else 0
+        self.bake_info.setText(
+            f"{len(keys)} keys. Applying '{self.curve.currentText()}' to {scope} "
+            f"writes about {estimate} frames between {low + 1} and {high + 1}, "
+            f"keeping your keys."
+        )
+
+    def selected_key_range(self):
+        """The keyed frames inside the strip's selection, in order."""
+        if self.selected not in self.doc.index:
+            return []
+        keys = self.placement_keys(self.obj)
+        frames = self.keyframes.selected_frames()
+        if frames:
+            keys = [k for k in keys if k in set(frames)]
+        return sorted(keys)
+
+    def apply_curve_to_range(self):
+        """Bake the chosen curve across the selected range, at the chosen density.
+
+        The selected range may span the whole clip, one gap between two keys, or
+        nothing at all; the endpoints come from the keys that bound it and the
+        intermediate keys the author already set are preserved.
+        """
+        if not self.animatable() or not self.resolve_drafts():
+            return
+        clip = self.doc.resource(self.selected)
+        row = self.placement_row()
+        found = self.key_transforms(clip)
+        if len(found) < 2:
+            self.window().statusBar().showMessage(
+                "Set at least two keyframes to tween between", 5000
+            )
+            return
+        frames = self.keyframes.selected_frames()
+        if frames:
+            inside = [k for k in sorted(found) if frames[0] <= k <= frames[-1]]
+            if len(inside) < 2:
+                self.window().statusBar().showMessage(
+                    "Select a range containing at least two keyframes", 5000
+                )
+                return
+            low, high = inside[0], inside[-1]
+        else:
+            low, high = min(found), max(found)
+            inside = [k for k in sorted(found) if low <= k <= high]
+        if high - low < 2:
+            self.window().statusBar().showMessage(
+                "The selected keyframes are on adjacent frames", 5000
+            )
+            return
+
+        points = easing.curve_for(self.curve.currentText())
+        wanted = self.key_density.value()
+        written = set()
+        for start, end in zip(inside, inside[1:]):
+            span = end - start
+            if span < 2:
+                continue
+            # The first and last key are kept exactly; only the frames between
+            # them are written, at the interval the density asks for.
+            step = max(1, round(span / wanted)) if wanted else 1
+            offset = 1
+            while offset < span:
+                index = start + offset
+                if index < end and index < len(clip["frames"]):
+                    if row < len(clip["frames"][index]["elements"]):
+                        progress = offset / span
+                        eased = easing.bezier(progress, *points)
+                        element = clip["frames"][index]["elements"][row]
+                        element[1] = self.intern_matrix(
+                            clip,
+                            easing.interpolate_matrix(
+                                found[start][0], found[end][0], eased
+                            ),
+                        )
+                        written.add(index)
+                offset += step
+        if not written:
+            self.window().statusBar().showMessage(
+                "No frames in the selection needed filling", 5000
+            )
+            return
+        if self.mutate(lambda: self.bake_and_compact(clip, row)):
+            self.baked = (self.selected, row, written)
+            self.refresh()
+            self.elements.selectRow(row)
+            self.window().statusBar().showMessage(
+                f"Applied '{self.curve.currentText()}' to {len(written)} frames"
+                f" ({low + 1}-{high + 1}), keeping {len(inside)} keys",
+                6000,
+            )
+
+    def keypoint_context_menu(self, index, position):
+        """Actions for one keyframe."""
+        menu = QMenu(self)
+        menu.addAction("Remove this keypoint").triggered.connect(
+            lambda: self.toggle_keypoint_at(index, self.placement_row())
+        )
+        menu.addAction("Go to this frame").triggered.connect(
+            lambda: self.goto_frame(index)
+        )
+        menu.addAction("Select up to this key").triggered.connect(
+            lambda: self.keyframes.set_band(
+                min(self.placement_keys(self.obj) or [index]), index
+            )
+        )
+        menu.addAction("Delete this frame").triggered.connect(
+            lambda: self.remove_frame_at(index)
+        )
+        menu.exec(position)
+
+    def keyframe_context_menu(self, frames, position):
+        """Frame and tween operations for the selected range of frames."""
+        if self.selected not in self.doc.index:
+            return
+        frames = list(frames) or [self.frame.value()]
+        menu = QMenu(self)
+        keyed = [f for f in frames if f in self.placement_keys(self.doc.resource(self.selected))]
+        if keyed:
+            menu.addAction(f"Remove {len(keyed)} keypoint(s)").triggered.connect(
+                lambda: self.remove_keypoints(keyed)
+            )
+        else:
+            menu.addAction("Add keypoint here").triggered.connect(
+                lambda: self.toggle_keypoint_at(frames[0], self.placement_row())
+            )
+        if len(frames) > 1:
+            menu.addAction("Select these frames").triggered.connect(
+                lambda: self.keyframes.set_band(frames[0], frames[-1])
+            )
+        menu.addSeparator()
+        tween = menu.addMenu("Apply curve to selection")
+        for name in easing.PRESETS:
+            tween.addAction(name).triggered.connect(
+                lambda checked=False, value=name: self.apply_curve_named(value, frames)
+            )
+        menu.addSeparator()
+        menu.addAction("Go to first frame").triggered.connect(
+            lambda: self.goto_frame(frames[0])
+        )
+        menu.addAction("Add frame after").triggered.connect(
+            lambda: self.add_frame_at(frames[0], False)
+        )
+        menu.addAction("Duplicate this frame").triggered.connect(
+            lambda: self.add_frame_at(frames[0], True)
+        )
+        count = len(self.obj.get("frames") or [])
+        remove = menu.addAction("Delete this frame")
+        remove.setEnabled(count > 1)
+        remove.triggered.connect(lambda: self.remove_frame_at(frames[0]))
+        menu.exec(position)
+
+    def apply_curve_named(self, name, frames):
+        """Apply a named curve to a range, from the strip's context menu."""
+        self.curve.setCurrentText(name)
+        self.keyframes.set_band(frames[0], frames[-1])
+        self.apply_curve_to_range()
+
+    def remove_keypoints(self, frames):
+        """Drop keys on the given frames for the selected placement."""
+        if not self.resolve_drafts() or self.selected not in self.doc.index:
+            return
+        clip = self.doc.resource(self.selected)
+        row = self.placement_row()
+        removed = 0
+        for index in frames:
+            if not 0 <= index < len(clip["frames"]):
+                continue
+            if row >= len(clip["frames"][index]["elements"]):
+                continue
+            element = clip["frames"][index]["elements"][row]
+            if element[1] == 65535 and element[2] == 65535:
+                continue
+            element[1] = 65535
+            element[2] = 65535
+            removed += 1
+        if not removed:
+            return
+        if self.mutate(lambda: self.doc.update("movieclips", clip)):
+            self.refresh()
+            self.elements.selectRow(row)
+            self.window().statusBar().showMessage(f"Removed {removed} keys", 4000)
+
+    def select_all_keys(self):
+        """Select from the first to the last key, so a whole tween is one gesture."""
+        if self.selected in self.doc.index:
+            self.keyframes.select_keys()
+
+    def add_frame_at(self, index, duplicate):
+        """Insert a frame after ``index``, keeping the playhead on the original."""
+        self.goto_frame(index)
+        self.add_frame(duplicate)
+
+    def remove_frame_at(self, index):
+        self.goto_frame(index)
+        self.remove_frame()
 
     def toggle_keypoint_at(self, index, row):
         """Add a keypoint on a frame, or remove the one already there."""
@@ -1419,13 +1727,81 @@ class Editor(QWidget):
             found[index] = (matrix, colour)
         return found
 
+    def load_animation_fields(self):
+        """Show the placement's transform on this frame in the editor fields."""
+        enabled = self.animatable()
+        for box in self.key_fields.values():
+            box.setEnabled(enabled)
+        self.apply_animation_button.setEnabled(enabled)
+        if not enabled:
+            self.animation_hint.setText(
+                "Select a movieclip placement to animate it."
+            )
+            return
+        clip = self.obj
+        element = clip["frames"][self.frame.value()]["elements"][
+            self.placement_row()
+        ]
+        matrix = self.effective_matrix(clip, element)
+        parts = easing.decompose(matrix)
+        values = {
+            "X": parts["tx"],
+            "Y": parts["ty"],
+            "Rotation": math.degrees(parts["rotation"]),
+            "Scale X": parts["scale_x"],
+            "Scale Y": parts["scale_y"],
+        }
+        with QSignalBlocker(self.key_fields["X"]):
+            pass
+        for name, value in values.items():
+            with QSignalBlocker(self.key_fields[name]):
+                self.key_fields[name].setValue(value)
+        keyed = element[1] != 65535
+        self.animation_hint.setText(
+            f"Frame {self.frame.value() + 1}: "
+            + ("already has a key." if keyed else "no key yet; applying creates one.")
+        )
+
+    def apply_animation_fields(self):
+        """Key the edited transform on the current frame.
+
+        Editing the transform of a placement that shares a matrix with other
+        frames would change those frames too, so this always gives the frame its
+        own key rather than reusing the shared one.
+        """
+        if not self.animatable() or not self.resolve_drafts():
+            return
+        clip = self.doc.resource(self.selected)
+        row = self.placement_row()
+        index = self.frame.value()
+        element = clip["frames"][index]["elements"][row]
+        matrix = easing.compose(
+            {
+                "tx": self.key_fields["X"].value(),
+                "ty": self.key_fields["Y"].value(),
+                "rotation": math.radians(self.key_fields["Rotation"].value()),
+                "scale_x": self.key_fields["Scale X"].value(),
+                "scale_y": self.key_fields["Scale Y"].value(),
+            }
+        )
+
+        def change():
+            element[1] = self.intern_matrix(clip, matrix)
+
+        if self.mutate(lambda: (change(), self.doc.update("movieclips", clip))[1]):
+            self.refresh()
+            self.elements.selectRow(row)
+            self.preview.selected_placement = row
+            self.window().statusBar().showMessage(
+                f"Key set on frame {index + 1}", 4000
+            )
+
     def refresh_keypoints(self):
         """Rebuild the keypoint table and the curve preview for the selection."""
         self.draw_curve(self.curve.currentText())
-        self.bake_info.setText("")
         if not self.animatable():
             fill_table(self.keypoints, [])
-            self.bake_info.setText("Select a placement in the Placements list.")
+            self.update_curve_info()
             return
         clip = self.obj
         if not 0 <= self.frame.value() < len(clip["frames"]):
@@ -1445,16 +1821,9 @@ class Editor(QWidget):
                 ]
             )
         fill_table(self.keypoints, rows)
-        if len(found) < 2:
-            self.bake_info.setText(
-                "Set a key on another frame to enable baking between them."
-            )
-        else:
-            span = max(found) - min(found)
-            self.bake_info.setText(
-                f"{len(found)} keys spanning {span + 1} frames · "
-                f"curve '{self.curve.currentText()}' applies between them"
-            )
+        # The description is owned by update_curve_info, so the two never fight
+        # over the same label.
+        self.update_curve_info()
 
     def animatable(self):
         """Whether the current frame holds a placement the strip can key."""
@@ -1556,56 +1925,9 @@ class Editor(QWidget):
             self.window().statusBar().showMessage(f"Cleared {len(keys)} keys", 4000)
 
     def bake_tween(self):
-        """Fill the frames between each pair of keys using the chosen curve."""
-        if not self.animatable() or not self.resolve_drafts():
-            return
-        clip = self.doc.resource(self.selected)
-        row = self.placement_row()
-        found = self.key_transforms(clip)
-        if len(found) < 2:
-            self.window().statusBar().showMessage("Need at least two keys to bake", 5000)
-            return
-        points = easing.curve_for(self.curve.currentText())
-        # Every frame the curve writes needs its own matrix, so the whole clip
-        # is rebuilt rather than patched in place.
-        written = set()
-        ordered = sorted(found)
-        for start, end in zip(ordered, ordered[1:]):
-            if end - start < 2:
-                continue
-            first, first_colour = found[start]
-            last, last_colour = found[end]
-            for index in range(start + 1, end):
-                # A placement can be absent from a frame in the middle of a run.
-                # The keyframes on either side still bound the animation, but
-                # there is nothing to write where the placement does not exist.
-                if row >= len(clip["frames"][index]["elements"]):
-                    continue
-                progress = (index - start) / (end - start)
-                eased = easing.bezier(progress, *points)
-                element = clip["frames"][index]["elements"][row]
-                matrix = easing.interpolate_matrix(first, last, eased)
-                element[1] = self.intern_matrix(clip, matrix)
-                if first_colour is not None and last_colour is not None:
-                    element[2] = self.intern_color(
-                        clip, easing.interpolate_color(first_colour, last_colour, eased)
-                    )
-                written.add(index)
-        if not written:
-            self.window().statusBar().showMessage(
-                "No frames between the keys to fill", 5000
-            )
-            return
-        if self.mutate(lambda: self.bake_and_compact(clip, row)):
-            # Remember exactly which frames the curve produced. Undoing a bake
-            # by guessing would delete keyframes the author set by hand, since a
-            # densely keyed clip looks identical to a baked one.
-            self.baked = (self.selected, row, written)
-            self.refresh()
-            self.elements.selectRow(row)
-            self.window().statusBar().showMessage(
-                f"Baked {len(written)} frames with '{self.curve.currentText()}'", 5000
-            )
+        """Curve the whole key range, ignoring the strip's current selection."""
+        self.keyframes.clear_band()
+        self.apply_curve_to_range()
 
     def bake_and_compact(self, clip, row):
         """Compact the baked bank once, then store the clip."""

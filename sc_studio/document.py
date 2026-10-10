@@ -888,7 +888,15 @@ class Document:
             self.update(kind, obj)
         return mapping
 
-    def validate(self):
+    def validate(self, only=None):
+        """Structural errors in the document.
+
+        ``only`` restricts the per-resource sweep to that set of ids, which the
+        editor uses for single-resource edits: the full sweep is O(resources)
+        and a large file makes it the dominant cost of every edit. The whole
+        file is still validated on save, so this is a latency optimisation and
+        never the last line of defence.
+        """
         errors = []
         if self.external:
             n = struct.unpack_from("<I", self.external)[0]
@@ -916,6 +924,8 @@ class Document:
             }
         elements = self.storage["movieclips_frame_elements"]
         for id, (kind, raw) in self.index.items():
+            if only is not None and id not in only:
+                continue
             if kind == "movieclips":
                 for child in raw["children_ids"]:
                     if child not in self.index:

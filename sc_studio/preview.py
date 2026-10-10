@@ -120,10 +120,8 @@ class Triangle(QGraphicsItem):
     def paint(self, painter, option, widget=None):
         if self.transform_image:
             painter.save()
-            from PyQt6.QtGui import QPainter
-
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            # Antialiasing and SmoothPixmapTransform are both set on the view, so
+            # magnified art shows its texels instead of a blur.
             painter.setClipPath(self.path)
             painter.setTransform(self.transform_image, True)
             painter.drawImage(0, 0, self.image)
@@ -541,6 +539,15 @@ class Preview(QGraphicsView):
                 "PyQt6.QtGui", fromlist=["QPainter"]
             ).QPainter.RenderHint.Antialiasing
         )
+        # Nearest-neighbour sampling, so zooming in shows the stored texels
+        # rather than an interpolated blur. This governs every image and pixmap
+        # the view draws, including the triangle shapes.
+        self.setRenderHint(
+            __import__(
+                "PyQt6.QtGui", fromlist=["QPainter"]
+            ).QPainter.RenderHint.SmoothPixmapTransform,
+            False,
+        )
         self.cache = OrderedDict()
         self.resource_cache = OrderedDict()
         self.shape_cache = OrderedDict()
@@ -603,7 +610,10 @@ class Preview(QGraphicsView):
         self.instances.clear()
         self.scene_key = None
         image = self.atlas(index)
-        self.scene().addPixmap(QPixmap.fromImage(image))
+        atlas_item = self.scene().addPixmap(QPixmap.fromImage(image))
+        # The view already samples nearest-neighbour; an item-level mode would
+        # override it and blur a magnified sheet.
+        atlas_item.setTransformationMode(Qt.TransformationMode.FastTransformation)
         self.content_rect = QRectF(0, 0, image.width(), image.height())
         self.scene().setSceneRect(self.content_rect)
         self.fit_content()
@@ -899,7 +909,7 @@ class Preview(QGraphicsView):
                         image.setPixmap(pixmap)
                     image.set_bounds(width * scale, height * scale)
                     image.setTransformationMode(
-                        Qt.TransformationMode.SmoothTransformation
+                        Qt.TransformationMode.FastTransformation
                     )
                     image.setPos(left, top)
                     image.setScale(1 / scale)

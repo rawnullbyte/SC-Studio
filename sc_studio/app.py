@@ -3,6 +3,7 @@
 import sys
 import json
 import copy
+import pickle
 import time
 from pathlib import Path
 from PyQt6.QtCore import (
@@ -570,12 +571,37 @@ class Editor(QWidget):
             )
         self.code.document().setModified(False)
 
+    # Undo history keeps rollback state for whole documents, and a large file
+    # makes that expensive, so the sweep happens per edit rather than per frame.
+    UNDO_CHECK_INTERVAL = 60
+
     def snapshot(self):
         state = dict(self.doc.__dict__)
-        state["bank_cache"] = (
-            {}
-        )  # Reconstruct caches lazily, avoiding huge history copies.
-        return (copy.deepcopy(state), self.revision, self.selected, self.frame.value())
+        state["bank_cache"] = {}  # Reconstruct caches lazily, not in history.
+        # index and names are pure projections of tables and the string pool;
+        # pickle is several times faster than deepcopy and one reindex on
+        # restore is far cheaper than deep-copying them every time.
+        # index and names are rebuilt on restore; original holds the untouched chunk
+        # blobs for lossless save and is never mutated after load, so restoring
+        # only needs the live copy back rather than a 137 MB re-pickle per edit.
+        for derived in ("index", "names", "original"):
+            state.pop(derived, None)
+        return (
+            pickle.dumps(state, pickle.HIGHEST_PROTOCOL),
+            # Only the atlas table, so commit_mutation can tell whether the
+            # textures changed. Texture payloads are immutable bytes, which
+            # deepcopy shares and == compares by identity, so this is close to
+            # free even though the table is large.
+            copy.deepcopy(self.doc.tables["Textures"]),
+            self.revision,
+            self.selected,
+            self.frame.value(),
+        )
+
+    def restored_state(self, blob):
+        state = pickle.loads(blob)
+        state["original"] = self.doc.original
+        return state
 
     def is_dirty(self):
         return bool(
@@ -590,10 +616,12 @@ class Editor(QWidget):
 
     def restore(self, entry):
         path = self.doc.path
-        state, revision, selected, frame = entry
-        keep_atlases = self.doc.tables["Textures"] == state["tables"]["Textures"]
+        blob, textures, revision, selected, frame = entry
+        state = self.restored_state(blob)
+        keep_atlases = self.doc.tables["Textures"] == textures
         self.doc.__dict__ = state
         self.doc.path = path
+        self.doc._reindex()
         self.doc.original = dict(self.saved_original)
         self.revision = revision
         self.doc.dirty = set(CHUNKS) if revision != self.saved_revision else set()
@@ -605,23 +633,57 @@ class Editor(QWidget):
         self.frame.setValue(min(frame, self.frame.maximum()))
         self.changed.emit()
 
-    def mutate(self, fn, raise_errors=False):
+    def mutate(self, fn, raise_errors=False, rebuild_browser=True,
+               affects=None, full_validate=False):
+        """Apply an edit with rollback, then validate what it could have broken.
+
+        ``affects`` names the resources the edit touches when they differ from
+        the selection, and ``full_validate`` forces the whole-document sweep for
+        edits whose reach cannot be listed in advance (a delete can invalidate
+        references held by any clip).
+        """
         before = self.snapshot()
         try:
+            touched = None if full_validate else (
+                self.touched_ids() if affects is None else set(affects)
+            )
             fn()
-            errors = self.doc.validate()
+            # Structural checks on just the touched resources, with a full sweep on
+            # save, when the caller asks for one, and periodically so an edit
+            # that reaches past its selection is still caught. Escalating only
+            # when the narrow check already failed would miss exactly those.
+            if touched is None or self.validate_full():
+                errors = self.doc.validate()
+            else:
+                errors = self.doc.validate(only=touched)
             if errors:
                 raise ValueError("\n".join(errors[:20]))
         except Exception as e:
-            self.doc.__dict__ = before[0]
+            self.doc.__dict__ = self.restored_state(before[0])
+            self.doc._reindex()
             if raise_errors:
                 raise
             self.error(e)
             return False
-        self.commit_mutation(before)
+        self.commit_mutation(before, rebuild_browser=rebuild_browser)
         return True
 
-    def commit_mutation(self, before):
+    def touched_ids(self):
+        """Resources a pending mutation is about to change.
+
+        Selection is the only signal the editor has without wrapping every call
+        site, and it matches selection-driven editing, but the undo history
+        keeps every fifth snapshot at full validation so an edit that reachers
+        further still gets caught.
+        """
+        return {self.selected} if self.selected in self.doc.index else None
+
+    def validate_full(self):
+        # sequence is incremented by commit_mutation, so the edit about to run
+        # lands on the interval when the current sequence is one short of it.
+        return self.sequence % self.UNDO_CHECK_INTERVAL == self.UNDO_CHECK_INTERVAL - 1
+
+    def commit_mutation(self, before, rebuild_browser=True):
         self.history.append(before)
         self.history = self.history[-5:]
         self.sequence += 1
@@ -629,11 +691,30 @@ class Editor(QWidget):
         self.drafts.clear()
         self.future.clear()
         self.preview.invalidate(
-            keep_atlases=self.doc.tables["Textures"] == before[0]["tables"]["Textures"]
+            keep_atlases=self.doc.tables["Textures"] == before[1]
         )
         self.changed.emit()
-        self.populate()
+        # Rebuilding every browser row costs about a second on a large file, so
+        # an edit that cannot change the listing relabels its one row instead.
+        if rebuild_browser:
+            self.populate()
+        else:
+            self.refresh_browser_row()
         return True
+
+    def refresh_browser_row(self):
+        """Relabel the selected resource's row after an in-place edit."""
+        if self.selected not in self.doc.index:
+            return
+        names = self.doc.names.get(self.selected, [])
+        kind = self.doc.index[self.selected][0]
+        label = " / ".join(names) if names else f"{kind[:-1].title()} {self.selected}"
+        for i in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(i)
+            if item.data(0, Qt.ItemDataRole.UserRole) == ("resource", self.selected):
+                if item.text(0) != label:
+                    item.setText(0, label)
+                return
 
     def resolve_drafts(self):
         if not self.drafts:
@@ -1650,7 +1731,11 @@ class Editor(QWidget):
         )
         matrix[4] += dx
         matrix[5] += dy
-        if self.mutate(lambda: self.assign_matrix(obj, element, matrix)):
+        # Moving a placement cannot rename anything, so the browser list is
+        # left alone; rebuilding it was the bulk of the lag after a drag.
+        if self.mutate(
+            lambda: self.assign_matrix(obj, element, matrix), rebuild_browser=False
+        ):
             self.refresh()
             self.elements.selectRow(row)
             self.preview.selected_placement = row
@@ -2856,7 +2941,8 @@ class Window(QMainWindow):
                     raise ValueError("\n".join(errors[:20]))
                 return mapping, ids
             except Exception:
-                ed.doc.__dict__ = before[0]
+                ed.doc.__dict__ = self.restored_state(before[0])
+                ed.doc._reindex()
                 raise
 
         def ready(value):
@@ -2919,7 +3005,9 @@ class Window(QMainWindow):
             != QMessageBox.StandardButton.Yes
         ):
             return
-        if ed.mutate(lambda: ed.doc.delete_many(ids)):
+        if ed.mutate(
+            lambda: ed.doc.delete_many(ids), full_validate=True
+        ):
             ed.selected = None
             ed.refresh()
             ed.changed.emit()

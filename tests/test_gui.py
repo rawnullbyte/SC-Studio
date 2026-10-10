@@ -1,4 +1,5 @@
 import os
+from collections import deque
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import time
@@ -1290,3 +1291,97 @@ def test_shift_wheel_scrolls_table_horizontally(window):
     )
     application().sendEvent(e.children.viewport(), event)
     assert bar.value() > before
+
+
+def test_named_themes_apply_and_are_readable(window):
+    from sc_studio import themes as schemes
+    from PyQt6.QtGui import QPalette
+
+    w = window
+    w.new()
+    assert len(schemes.names()) >= 12, "expected a broad set of schemes"
+    assert any(schemes.is_dark(n) for n in schemes.names())
+    assert any(not schemes.is_dark(n) for n in schemes.names())
+    seen = {}
+    for name in schemes.names():
+        w.set_theme(name)
+        palette = application().palette()
+        window_color = palette.color(QPalette.ColorRole.Window)
+        base = palette.color(QPalette.ColorRole.Base)
+        text = palette.color(QPalette.ColorRole.WindowText)
+        accent = palette.color(QPalette.ColorRole.Highlight)
+        # Text has to stay legible on the window, and content areas distinct
+        # from the chrome around them.
+        assert abs(text.lightness() - window_color.lightness()) > 60, name
+        assert window_color != base, name
+        seen[name] = (window_color.name(), accent.name())
+        assert w.settings.value("theme") == name
+    # Each scheme must actually differ, or the menu would be misleading.
+    assert len(set(seen.values())) == len(seen)
+
+
+def test_theme_falls_back_to_system_for_unknown_names(window):
+    w = window
+    w.new()
+    w.set_theme("No Such Scheme")
+    assert w.theme == "system"
+    assert w.theme_actions["system"].isChecked()
+
+
+def test_built_in_themes_still_selectable(window):
+    from PyQt6.QtGui import QPalette
+
+    w = window
+    w.new()
+    w.set_theme("dark")
+    dark = application().palette().color(QPalette.ColorRole.Base).lightness()
+    w.set_theme("light")
+    light = application().palette().color(QPalette.ColorRole.Base).lightness()
+    assert light > dark
+    assert w.theme_actions["dark"].isChecked() is False
+
+
+def test_performance_dialog_opens_before_anything_is_rendered(window, monkeypatch):
+    """Help > Performance must not depend on a prior render.
+
+    items_count only appeared once a resource had been drawn, so opening the
+    dialog on a fresh window raised AttributeError.
+    """
+    from PyQt6.QtWidgets import QDialog, QTableWidget
+
+    w = window
+    captured = {}
+
+    def fake_exec(dialog):
+        captured["rows"] = dialog.findChild(QTableWidget).rowCount()
+        return 0
+
+    monkeypatch.setattr(QDialog, "exec", fake_exec)
+    w.performance()  # no document at all
+    assert captured["rows"] == 4
+    w.add_doc(populated())
+    e = w.current()
+    e.selected = None
+    w.performance()  # document open, nothing drawn yet
+    assert captured["rows"] == 4
+    e.go_to(7)
+    w.performance()  # after a render, with real samples
+    assert captured["rows"] == 4
+
+
+def test_timings_are_recorded_for_edits_and_frames(window):
+    w = window
+    w.add_doc(populated())
+    e = w.current()
+    e.go_to(7)
+    # Selecting already renders once, so only the edit stages start empty.
+    assert all(e.timings[name] == deque() for name in ("snapshot", "validate", "commit"))
+    assert len(e.timings["render"]) >= 1
+    e.frame.setValue(1)          # another render
+    assert len(e.timings["render"]) >= 2
+    obj = e.doc.resource(7)
+    obj["framerate"] = 24
+    assert e.mutate(lambda: e.doc.update("movieclips", obj))
+    for stage in ("snapshot", "validate", "commit"):
+        assert len(e.timings[stage]) == 1, stage
+        assert e.timings[stage][0] >= 0

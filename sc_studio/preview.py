@@ -557,6 +557,10 @@ class Preview(QGraphicsView):
         self.atlas_regions = None
         self.atlas_borders = []
         self.atlas_marks = []
+        # Objects drawn for the current frame, reported by Help > Performance.
+        # Reset in __init__ as well as per draw, since that dialog can be opened
+        # before anything has been rendered.
+        self.items_count = 0
         self.show_atlas_outlines = True
         self.hidden_children = set()
         self.matrix_override = None

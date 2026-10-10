@@ -7,6 +7,7 @@ from zipfile import ZipFile, ZIP_STORED
 from PyQt6.QtCore import QMimeData, QByteArray, Qt
 from PyQt6.QtGui import QPalette, QColor
 from PyQt6.QtWidgets import QApplication, QFileDialog
+from . import themes
 from .document import Document
 
 CLIP_MIME = "application/x-sc-studio-resource-graph"
@@ -37,8 +38,38 @@ def configure_theme(app, mode, system_palette, scheme=None):
         mode = "dark" if scheme == Qt.ColorScheme.Dark else "light"
     apply_style(app, "Fusion")
     p = app.style().standardPalette()
-    dark = mode == "dark"
-    colors = {
+    scheme = themes.SCHEMES.get(mode)
+    if scheme is not None:
+        colors = themes.role_colors(mode)
+        dark = themes.is_dark(mode)
+    else:
+        dark = mode == "dark"
+        colors = _builtin_colors(dark)
+    disabled = colors.pop("disabled_text", None) if scheme is not None else None
+    for name, value in colors.items():
+        for group in (
+            QPalette.ColorGroup.Active,
+            QPalette.ColorGroup.Inactive,
+            QPalette.ColorGroup.Disabled,
+        ):
+            p.setColor(group, getattr(QPalette.ColorRole, name), QColor(value))
+    for role in (
+        QPalette.ColorRole.Text,
+        QPalette.ColorRole.WindowText,
+        QPalette.ColorRole.ButtonText,
+    ):
+        p.setColor(
+            QPalette.ColorGroup.Disabled,
+            role,
+            QColor(disabled or ("#737e90" if dark else "#939aa6")),
+        )
+    app.setPalette(p)
+    app.setStyleSheet(stylesheet())
+
+
+def _builtin_colors(dark):
+    """The default Light and Dark palettes, used when no scheme is chosen."""
+    return {
         "Window": "#252931" if dark else "#f2f3f5",
         "WindowText": "#e8eaf0" if dark else "#20242b",
         "Base": "#1d2128" if dark else "#ffffff",
@@ -60,23 +91,11 @@ def configure_theme(app, mode, system_palette, scheme=None):
         "Dark": "#15181d" if dark else "#89929f",
         "Shadow": "#0d1015" if dark else "#636b77",
     }
-    for name, value in colors.items():
-        for group in (
-            QPalette.ColorGroup.Active,
-            QPalette.ColorGroup.Inactive,
-            QPalette.ColorGroup.Disabled,
-        ):
-            p.setColor(group, getattr(QPalette.ColorRole, name), QColor(value))
-    for role in (
-        QPalette.ColorRole.Text,
-        QPalette.ColorRole.WindowText,
-        QPalette.ColorRole.ButtonText,
-    ):
-        p.setColor(
-            QPalette.ColorGroup.Disabled, role, QColor("#737e90" if dark else "#939aa6")
-        )
-    app.setPalette(p)
-    app.setStyleSheet(
+
+
+def stylesheet():
+    """The small stylesheet that fills gaps the palette alone cannot express."""
+    return (
         "QLabel#sectionTitle { font-size: 10px; font-weight: 700; padding: 5px 3px; color: palette(placeholder-text); } "
         "QLabel#previewHeading { font-weight: 600; padding: 6px 4px; } "
         "QLabel#previewNotice, QLabel#browserCount { color: palette(placeholder-text); padding: 4px; font-size: 11px; } "

@@ -78,6 +78,7 @@ from .workspace import (
 )
 from .preview import Preview
 from . import textures
+from . import themes as theme_schemes
 
 
 def save_picker(parent, title, initial="", filters=""):
@@ -2612,6 +2613,29 @@ class Window(QMainWindow):
             themes.addAction(action)
             action.triggered.connect(lambda checked, value=mode: self.set_theme(value))
             self.theme_actions[mode] = action
+        themes.addSeparator()
+        # Named schemes from sc_studio.themes, grouped so a long list stays
+        # navigable. Each is a plain palette swap, so switching is instant.
+        for group, entries in (
+            (
+                "Dark schemes",
+                [n for n in theme_schemes.names() if theme_schemes.is_dark(n)],
+            ),
+            (
+                "Light schemes",
+                [n for n in theme_schemes.names() if not theme_schemes.is_dark(n)],
+            ),
+        ):
+            submenu = themes.addMenu(group)
+            for name in entries:
+                action = QAction(name, self)
+                action.setCheckable(True)
+                self.theme_group.addAction(action)
+                submenu.addAction(action)
+                action.triggered.connect(
+                    lambda checked, value=name: self.set_theme(value)
+                )
+                self.theme_actions[name] = action
         self.set_theme(str(self.settings.value("theme", "system")))
         self.action(
             resource,
@@ -2736,7 +2760,7 @@ class Window(QMainWindow):
             )
 
     def set_theme(self, mode):
-        if mode not in ("system", "light", "dark"):
+        if mode not in ("system", "light", "dark") and mode not in theme_schemes.SCHEMES:
             mode = "system"
         configure_theme(QApplication.instance(), mode, self.system_palette)
         self.theme_actions[mode].setChecked(True)
@@ -3470,27 +3494,29 @@ class Window(QMainWindow):
     def performance(self):
         """Report where editing and playback time goes on the open document."""
         editor = self.current()
+        # Every stage gets a row whether or not it has run yet, so the dialog
+        # looks the same on a fresh window as on a busy one.
+        stats = editor.timings if editor is not None else {}
         rows = []
-        if editor is not None:
-            stats = editor.timings
-            for label in ("snapshot", "validate", "commit", "render"):
-                samples = stats[label]
-                if not samples:
-                    rows.append((label.title(), "no samples yet", ""))
-                    continue
-                ordered = sorted(samples)
-                last = samples[-1] * 1000
-                mean = sum(samples) / len(samples) * 1000
-                worst = ordered[-1] * 1000
-                p95 = ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))] * 1000
-                rows.append(
-                    (
-                        label.title(),
-                        f"{last:8.1f} ms",
-                        f"mean {mean:7.1f} · p95 {p95:7.1f} · worst {worst:7.1f} ms "
-                        f"({len(samples)} samples)",
-                    )
+        for label in ("snapshot", "validate", "commit", "render"):
+            samples = stats.get(label) or []
+            if not samples:
+                rows.append((label.title(), "not measured yet", "no samples"))
+                continue
+            ordered = sorted(samples)
+            last = samples[-1] * 1000
+            mean = sum(samples) / len(samples) * 1000
+            worst = ordered[-1] * 1000
+            p95 = ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))] * 1000
+            rows.append(
+                (
+                    label.title(),
+                    f"{last:8.1f} ms",
+                    f"mean {mean:7.1f} · p95 {p95:7.1f} · worst {worst:7.1f} ms "
+                    f"({len(samples)} samples)",
                 )
+            )
+        if editor is not None:
             document = editor.doc
             summary = (
                 f"{len(document.index):,} resources · "

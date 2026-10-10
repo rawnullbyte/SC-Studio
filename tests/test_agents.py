@@ -450,3 +450,312 @@ def test_agent_animation_refuses_bad_requests(window, tmp_path):
         assert gateway.execute("validate", {})["errors"] == []
     finally:
         gateway.stop()
+
+
+def test_agent_can_edit_geometry_children_and_textures(window, tmp_path):
+    """Geometry, child management, export names and atlases are all reachable."""
+    from PIL import Image
+
+    doc = populated()
+    window.add_doc(doc)
+    gateway = AgentGateway(window, tmp_path / "connection.json")
+    gateway.start()
+    try:
+        # Geometry: vertices are [x, y, u, v], with u/v as 16-bit fractions.
+        shape = gateway.execute("get_shape", {"resource_id": 3})
+        assert shape["command_count"] == 1
+        assert shape["size"] == [20.0, 20.0]
+        assert shape["commands"][0]["vertices"] == [
+            [0.0, 0.0, 0, 0], [20.0, 0.0, 65535, 0], [0.0, 20.0, 0, 65535]]
+        resized = gateway.execute("set_vertices", {
+            "resource_id": 3, "command_index": 0,
+            "vertices": [[0, 0, 0, 0], [30, 0, 65535, 0], [0, 30, 0, 65535]]})
+        assert resized["size"] == [30.0, 30.0]
+        with pytest.raises(ValueError):
+            gateway.execute("set_vertices", {"resource_id": 3, "command_index": 0,
+                                             "vertices": [[0, 0, 0, 0]]})
+        added = gateway.execute("edit_commands", {"resource_id": 3, "action": "add",
+                                                  "atlas_index": 0})
+        assert added["command_index"] == 1
+        gateway.execute("edit_commands", {"resource_id": 3, "action": "remove",
+                                          "command_index": 1})
+        # A shape cannot be left with no commands.
+        with pytest.raises(ValueError):
+            gateway.execute("edit_commands", {"resource_id": 3, "action": "remove",
+                                              "command_index": 0})
+
+        # Children: rename, duplicate, reorder.
+        renamed = gateway.execute("edit_children", {
+            "movieclip_id": 7, "action": "rename", "child_index": 0, "name": "panel"})
+        assert renamed["name"] == "panel"
+        duplicated = gateway.execute("edit_children", {
+            "movieclip_id": 7, "action": "duplicate", "child_index": 0})
+        assert duplicated["child_index"] == 2
+        # The duplicate shares the definition and is only added to the list.
+        clip = doc.resource(7)
+        assert clip["children"][2]["id"] == clip["children"][0]["id"]
+        assert clip["children"][2]["name"] == "panel_copy"
+        gateway.execute("edit_children", {
+            "movieclip_id": 7, "action": "reorder", "child_index": 0,
+            "to_front": True, "frame": 0})
+        assert doc.resource(7)["frames"][0]["elements"][-1][0] == 0
+
+        # Export names, with a clash refused rather than reassigned.
+        assert gateway.execute("set_exports", {
+            "resource_id": 7, "exports": ["screen"]})["exports"] == ["screen"]
+        # set_exports replaces the set outright, so the fixture's own name goes.
+        assert doc.names[7] == ["screen"] and doc.resource(7)["exports"] == ["screen"]
+        with pytest.raises(ValueError):
+            gateway.execute("set_exports", {"resource_id": 3, "exports": ["screen"]})
+        gateway.execute("set_exports", {"resource_id": 7, "exports": []})
+        assert 7 not in doc.names
+
+        # Atlases: add from a PNG, then replace; export one back out.
+        image = tmp_path / "art.png"
+        Image.new("RGBA", (48, 24), (5, 90, 160, 255)).save(image)
+        before = len(doc.tables["Textures"]["textures"])
+        added_atlas = gateway.execute("edit_textures", {"action": "add",
+                                                        "path": str(image)})
+        assert added_atlas["atlas_index"] == before
+        assert (added_atlas["width"], added_atlas["height"]) == (48, 24)
+        assert len(doc.tables["Textures"]["textures"]) == before + 1
+        replaced = gateway.execute("edit_textures", {
+            "action": "replace", "atlas_index": 0, "path": str(image)})
+        assert (replaced["width"], replaced["height"]) == (48, 24)
+        written = tmp_path / "out.png"
+        exported = gateway.execute("export_texture", {"atlas_index": 0,
+                                                      "path": str(written)})
+        assert exported["width"] == 48 and written.exists()
+
+        assert gateway.execute("validate", {})["errors"] == []
+    finally:
+        gateway.stop()
+
+
+def test_agent_can_find_usages_search_and_read_the_guide(window, tmp_path):
+    doc = populated()
+    clip = doc.resource(7)
+    label = doc.resource(4)
+    label["text"] = "Join"
+    doc.update("textfields", label)
+    clip["children"][1]["name"] = "code_txt"
+    doc.update("movieclips", clip)
+    window.add_doc(doc)
+    gateway = AgentGateway(window, tmp_path / "connection.json")
+    gateway.start()
+    try:
+        # Usages: who places this, through which child slot, under what name.
+        usages = gateway.execute("find_usages", {"resource_id": 3})
+        assert usages["count"] == 1
+        row = usages["usages"][0]
+        assert row["id"] == 7 and row["name"] == "sprite"
+        assert row["parent_exports"] == ["demo"]
+
+        # Search reaches text and instance names, which list_resources cannot.
+        by_name = gateway.execute("search", {"query": "code"})
+        assert [(m["id"], m["where"]) for m in by_name["matches"]] == [(7, "child")]
+        assert by_name["matches"][0]["child_name"] == "code_txt"
+        by_text = gateway.execute("search", {"query": "join"})
+        assert [(m["id"], m["where"]) for m in by_text["matches"]] == [(4, "textfield")]
+        by_export = gateway.execute("search", {"query": "demo"})
+        assert [(m["id"], m["matched"]) for m in by_export["matches"]] == [(7, ["export"])]
+        assert gateway.execute("search", {"query": "nothing-here"})["count"] == 0
+        with pytest.raises(ValueError):
+            gateway.execute("search", {"query": ""})
+        with pytest.raises(ValueError):
+            gateway.execute("search", {"query": "x", "kinds": ["widgets"]})
+        # The kind filter narrows without breaking the match.
+        text_only = gateway.execute("search", {"query": "join", "kinds": ["textfields"]})
+        assert text_only["count"] == 1
+
+        # The guide states the model and its traps without reading the source.
+        guide = gateway.execute("guide", {})
+        assert {"document", "movieclip", "placement", "matrix_bank",
+                "shape", "textfield"} <= set(guide["model"])
+        traps = " ".join(guide["traps"])
+        assert "child_index is an index into the clip's children list" in traps
+        assert "nearest earlier key" in traps
+        assert "no nine-slice flag" in traps
+    finally:
+        gateway.stop()
+
+
+def test_agent_can_export_a_standalone_graph(window, tmp_path):
+    doc = populated()
+    window.add_doc(doc)
+    gateway = AgentGateway(window, tmp_path / "connection.json")
+    gateway.start()
+    try:
+        target = tmp_path / "standalone.sc"
+        written = gateway.execute("export_graph", {"path": str(target),
+                                                   "resource_ids": [7]})
+        assert written["resource_count"] == 1
+        assert target.exists() and written["file_size"] > 0
+        # It reloads as a valid, self-contained document with its dependencies.
+        reloaded = Document.load(target)
+        assert reloaded.validate() == []
+        # Import remaps IDs into the new document, so the graph is checked by
+        # shape: one clip whose child is the shape it drew, plus the textfield.
+        kinds = sorted(kind for kind, _ in reloaded.index.values())
+        assert kinds == ["movieclips", "shapes", "textfields"]
+        clip = next(reloaded.resource(id) for id, (kind, _) in reloaded.index.items()
+                    if kind == "movieclips")
+        assert len(clip["children"]) == 2
+        assert clip["children"][0]["name"] == "sprite"
+        with pytest.raises(ValueError):
+            gateway.execute("export_graph", {"path": str(target), "resource_ids": [999]})
+    finally:
+        gateway.stop()
+
+
+def test_batch_runs_a_sequence_in_one_call(window, tmp_path):
+    """A build-up costs one round trip and reports which step failed."""
+    doc = populated()
+    clip = doc.resource(7)
+    clip["children"] = [{"id": 3, "name": "sprite", "blend": 0}]
+    clip["frames"] = [{"label": "", "elements": [[0, 65535, 65535]]} for _ in range(20)]
+    doc.update("movieclips", clip)
+    window.add_doc(doc)
+    gateway = AgentGateway(window, tmp_path / "connection.json")
+    gateway.start()
+    try:
+        built = gateway.execute("batch", {"operations": [
+            {"operation": "set_keys", "arguments": {
+                "movieclip_id": 7, "row": 0, "frames": [0],
+                "transform": {"x": 0}}},
+            {"operation": "set_keys", "arguments": {
+                "movieclip_id": 7, "row": 0, "frames": [19],
+                "transform": {"x": 400}}},
+            {"operation": "tween", "arguments": {
+                "movieclip_id": 7, "row": 0, "keys": [[0, 0], [19, 0]],
+                "curve": "Overshoot", "key_density": 19}},
+        ]})
+        assert built["completed"] == 3 and built["failed"] == []
+        # The whole 20 frames are keyed in one call, and the curve overshoots.
+        clip = doc.resource(7)
+        bank = doc.bank(clip["matrix_bank_index"])
+        xs = [bank["matrices"][f["elements"][0][1]][4] for f in clip["frames"]]
+        assert all(value is not None for value in xs)
+        assert max(xs) > 400.0 and xs[0] == 0.0 and xs[-1] == 400.0
+
+        # A failure names the step and where it stopped.
+        stopped = gateway.execute("batch", {"operations": [
+            {"operation": "set_keys", "arguments": {
+                "movieclip_id": 7, "row": 0, "frames": [1],
+                "transform": {"x": 9}, "overwrite": True}},
+            {"operation": "set_exports", "label": "bad id",
+             "arguments": {"resource_id": 999, "exports": ["x"]}},
+            {"operation": "set_keys", "label": "never runs", "arguments": {
+                "movieclip_id": 7, "row": 0, "frames": [2],
+                "transform": {"x": 10}}},
+        ]})
+        assert stopped["completed"] == 1
+        assert stopped["stopped_at"] == 1
+        assert stopped["failed"][0]["label"] == "bad id"
+        assert "does not exist" in stopped["failed"][0]["error"]
+
+        # continue_on_error records the failure and keeps going, and a step
+        # that would be a no-op is a failure rather than a silent success.
+        # The tween above keyed every frame, so the "already keyed" step fails
+        # and the batch carries on to the one that does work.
+        carried = gateway.execute("batch", {"continue_on_error": True, "operations": [
+            {"operation": "set_exports", "label": "bad",
+             "arguments": {"resource_id": 999, "exports": ["x"]}},
+            {"operation": "set_keys", "label": "already keyed", "arguments": {
+                "movieclip_id": 7, "row": 0, "frames": [3],
+                "transform": {"x": 11}}},
+            {"operation": "clear_keys", "label": "free a frame", "arguments": {
+                "movieclip_id": 7, "row": 0, "frames": [4]}},
+            {"operation": "set_keys", "label": "good", "arguments": {
+                "movieclip_id": 7, "row": 0, "frames": [4],
+                "transform": {"x": 11}}},
+        ]})
+        assert carried["completed"] == 2
+        assert [f["label"] for f in carried["failed"]] == ["bad", "already keyed"]
+        pose = gateway.execute("get_timeline", {
+            "movieclip_id": 7, "row": 0, "frames": [4]})["poses"][0]
+        assert pose["keyed"] is True and pose["matrix"][4] == 11.0
+
+        # Bad batches are refused rather than half-run.
+        with pytest.raises(ValueError):
+            gateway.execute("batch", {"operations": []})
+        with pytest.raises(ValueError):
+            gateway.execute("batch", {"operations": [{"arguments": {}}]})
+        with pytest.raises(ValueError):
+            gateway.execute("batch", {"operations": [{"operation": "batch"}]})
+        assert gateway.execute("validate", {})["errors"] == []
+    finally:
+        gateway.stop()
+
+
+def test_a_tween_can_fill_every_frame_of_a_long_gap(window, tmp_path):
+    """Asking for as many steps as the gap has frames writes every frame.
+
+    The key-density ceiling used to be 64, so a request to fill a longer gap was
+    silently spaced out again and the tween looked like it had ignored the ask.
+    """
+    doc = populated()
+    clip = doc.resource(7)
+    clip["children"] = [{"id": 3, "name": "sprite", "blend": 0}]
+    clip["frames"] = [{"label": "", "elements": [[0, 65535, 65535]]} for _ in range(120)]
+    doc.update("movieclips", clip)
+    window.add_doc(doc)
+    gateway = AgentGateway(window, tmp_path / "connection.json")
+    gateway.start()
+    try:
+        calls = lambda **kw: gateway.execute("set_keys", kw)
+        calls(movieclip_id=7, row=0, frames=[0], transform={"x": 0})
+        calls(movieclip_id=7, row=0, frames=[119], transform={"x": 1190})
+        written = gateway.execute("tween", {
+            "movieclip_id": 7, "row": 0, "keys": [[0, 0], [119, 0]],
+            "curve": "Linear", "key_density": 119})
+        assert len(written["written"]) == 118
+        clip = doc.resource(7)
+        bank = doc.bank(clip["matrix_bank_index"])
+        xs = [bank["matrices"][f["elements"][0][1]][4] for f in clip["frames"]]
+        # Every frame holds its own value, evenly spaced.
+        assert all(x is not None for x in xs)
+        assert xs[60] == pytest.approx(600.0, abs=15.0)
+    finally:
+        gateway.stop()
+
+
+def test_per_frame_transforms_make_a_computed_animation_one_call(window, tmp_path):
+    """A spiral is one call, not one call per frame."""
+    doc = populated()
+    clip = doc.resource(7)
+    clip["children"] = [{"id": 3, "name": "sprite", "blend": 0}]
+    clip["frames"] = [{"label": "", "elements": [[0, 65535, 65535]]} for _ in range(72)]
+    doc.update("movieclips", clip)
+    window.add_doc(doc)
+    gateway = AgentGateway(window, tmp_path / "connection.json")
+    gateway.start()
+    try:
+        import math as maths
+
+        frames = list(range(72))
+        spiral = [
+            {"x": 280 * maths.cos(i * 0.18) * (1 - i / 72),
+             "y": 280 * maths.sin(i * 0.18) * (1 - i / 72),
+             "rotation": i * 5.0}
+            for i in frames
+        ]
+        result = gateway.execute("set_keys", {
+            "movieclip_id": 7, "row": 0, "frames": frames, "transforms": spiral})
+        assert result["key_count"] == 72
+        clip = doc.resource(7)
+        bank = doc.bank(clip["matrix_bank_index"])
+        xs = [bank["matrices"][f["elements"][0][1]][4] for f in clip["frames"]]
+        bs = [bank["matrices"][f["elements"][0][1]][1] for f in clip["frames"]]
+        # Each frame holds its own position and its own rotation.
+        assert len(set(round(x, 3) for x in xs)) > 60
+        # rotation is stored as b = sin(theta), so it repeats each full turn;
+        # the positions are what show every frame got its own pose.
+        assert len(set(round(b, 3) for b in bs)) > 30
+        with pytest.raises(ValueError):
+            gateway.execute("set_keys", {
+                "movieclip_id": 7, "row": 0, "frames": [0, 1],
+                "transforms": [{"x": 1}]})
+        assert gateway.execute("validate", {})["errors"] == []
+    finally:
+        gateway.stop()

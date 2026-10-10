@@ -333,12 +333,16 @@ class Editor(QWidget):
         controls_row.addWidget(QLabel("Keys"))
         self.key_density = QSpinBox()
         # How many pieces each gap is cut into, so the setting means the same
-        # thing whether the gap is ten frames or sixty: 58 over a two-frame gap
-        # would ask for finer spacing than a frame, which no frame can hold.
-        self.key_density.setRange(1, 64)
+        # thing whether the gap is ten frames or sixty. Asking for more pieces
+        # than the gap has frames fills every frame, so the ceiling is only
+        # there to keep the number meaningful: capping it below the length of a
+        # long gap silently spaced the frames out again, which read as the
+        # tween ignoring the request.
+        self.key_density.setRange(1, 4000)
         self.key_density.setValue(6)
         self.key_density.setToolTip(
-            "How many steps to write between each pair of keys"
+            "How many steps to write between each pair of keys; as many as the "
+            "gap has frames writes every frame"
         )
         # The description next to the button says how many frames will be
         # written, so it has to follow the number.
@@ -768,6 +772,11 @@ class Editor(QWidget):
             self.error(e)
             return False
         validated = time.perf_counter()
+        # The index and names are projections of the tables, so an edit that
+        # changed them (a new resource, a renamed export) has to rebuild them
+        # here; otherwise reads answer from the state before the edit and a
+        # resource keeps the name it no longer has.
+        self.doc._reindex()
         self.commit_mutation(before, rebuild_browser=rebuild_browser)
         self.record_timing("snapshot", snapped - mark)
         self.record_timing("validate", validated - snapped)
@@ -1628,6 +1637,7 @@ class Editor(QWidget):
         # undoing the curve leaves it in place rather than deleting it.
         keys = set(found)
         gaps = 0
+        pending = []
         for start_frame, end_frame in zip(frames, frames[1:]):
             span = end_frame - start_frame
             if span < 2:
@@ -1666,15 +1676,21 @@ class Editor(QWidget):
                         continue
                     progress = offset / span
                     eased = easing.bezier(progress, *points)
-                    element = clip["frames"][index]["elements"][row]
-                    element[1] = self.intern_matrix(
-                        clip,
+                    # Collected first and interned in one batch below: appending
+                    # one matrix per frame rewrites the whole bank each time,
+                    # which is quadratic in the length of the tween.
+                    pending.append((
+                        index,
                         easing.interpolate_matrix(
                             found[start_frame][0], found[end_frame][0], eased
                         ),
-                    )
+                    ))
                     written.add(index)
                 offset += step
+        if pending:
+            indices, rows = self.intern_matrices(clip, [m for _, m in pending])
+            for (index, _), position in zip(pending, indices):
+                clip["frames"][index]["elements"][row][1] = position
         if not gaps:
             self.window().statusBar().showMessage(
                 f"{len(frames)} keys selected, with no frames to tween between",
@@ -3134,6 +3150,25 @@ class Editor(QWidget):
             self.frames.selectRow(fi)
             self.elements.selectRow(self.elements.rowCount() - 1)
             self.render_frame(fit=True)
+
+    def intern_matrices(self, clip, matrices):
+        """Append several matrices at once and return their local indices.
+
+        Appending one at a time rewrites the whole bank per append, which makes
+        writing a long tween quadratic in its length. The bank is grown once
+        here, and the clip's bank is registered a single time.
+        """
+        bank = self.clip_bank(clip)
+        rows = list(bank.get("matrices") or [])
+        first = len(rows)
+        rows.extend([float(v) for v in matrix] for matrix in matrices)
+        clip["matrix_bank_index"] = self.doc.add_bank(
+            rows, list(bank.get("colors") or [])
+        )
+        fresh = self.doc.bank(clip["matrix_bank_index"])["matrices"]
+        # add_bank may collapse an identical bank, so the indices are read back
+        # rather than assumed: the clip may already hold these transforms.
+        return [first + i for i in range(len(matrices))], fresh
 
     def intern_matrix(self, clip, matrix):
         """Append a matrix to the clip's bank and return its new local index.

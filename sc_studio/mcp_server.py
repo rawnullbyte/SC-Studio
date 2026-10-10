@@ -40,6 +40,34 @@ def create_server(connection):
         return call("documents")
 
     @server.tool()
+    def batch(operations: list[dict], document_id: str | None = None,
+              continue_on_error: bool = False, undo_on_error: bool = False) -> dict:
+        """Run several operations in one call, in order, so a sequence costs one round trip.
+
+        Each entry is {"operation": "...", "arguments": {...}} and may carry a
+        "label" for identifying it if it fails. Use this for anything that would
+        otherwise be a run of calls: keying many placements, building a screen
+        from a dozen pieces, or a build-up you want to be one undo step.
+
+        Stops at the first failure by default and reports the step index, its
+        label and the error. continue_on_error records failures and carries on;
+        undo_on_error rolls the whole batch back when a step fails. A step may
+        name its own document_id, so one batch can span tabs.
+        """
+        return call("batch", document_id=document_id, operations=operations,
+                    continue_on_error=continue_on_error, undo_on_error=undo_on_error)
+
+    @server.tool()
+    def guide() -> dict:
+        """The data model and its traps: what a placement is, why child_index is not a resource ID, how inheritance resolves a frame, where draw order lives, how nine-slice art is sized, and the order to call things in.
+
+        Read this once before editing an unfamiliar document. It states what
+        would otherwise only be discoverable by reading the source or by making
+        a wrong edit, and it costs one call.
+        """
+        return call("guide")
+
+    @server.tool()
     def document_summary(document_id: str | None = None) -> dict:
         """Everything about a document in one call: counts per resource kind, every atlas with its pixel size, the exported entry points, and the authoring conventions (nine-slice, sizing, text styles, naming, units).
 
@@ -128,6 +156,31 @@ def create_server(connection):
     def references(resource_id: int, document_id: str | None = None) -> dict:
         """Complete reverse-reference graph to all roots; shared/cyclic edges are retained without recursion."""
         return call("references", document_id=document_id, resource_id=resource_id)
+
+    @server.tool()
+    def find_usages(resource_id: int, indirect: bool = False,
+                    document_id: str | None = None) -> dict:
+        """Who places this resource: each parent clip, the child slot, the instance name it gives it, and the parent's exports.
+
+        This is the direct answer to "what would break if I change this".
+        `references` answers the transitive graph instead, which is much larger
+        for a shared asset. indirect=true walks up through parents of parents.
+        """
+        return call("find_usages", document_id=document_id,
+                    resource_id=resource_id, indirect=indirect)
+
+    @server.tool()
+    def search(query: str, kinds: list[str] | None = None, limit: int = 100,
+               document_id: str | None = None) -> dict:
+        """Search the whole document: resource IDs, export names, textfield text and font names, child instance names, and child exports.
+
+        Use this to find things by what they say or how they are wired, which
+        list_resources cannot do — it only matches IDs and export names. Each
+        match says where it matched (export, id, text, font_name, child_name,
+        child_export) so a hit can be judged without fetching the resource.
+        """
+        return call("search", document_id=document_id, query=query,
+                    kinds=kinds, limit=limit)
 
     @server.tool()
     def atlas_regions(atlas_index: int, offset: int = 0, limit: int = 1000,
@@ -291,6 +344,103 @@ together. Use this when you are walking an atlas's commands in bulk.
         """
         return call("remove_child", document_id=document_id,
                     movieclip_id=movieclip_id, child_index=child_index)
+
+    @server.tool()
+    def get_shape(resource_id: int, document_id: str | None = None) -> dict:
+        """A shape's draw commands: each one's atlas, its vertices as [x,y,u,v], and the resolved pixel size.
+
+        Call this before editing geometry. x and y are pixels; u and v are texel
+        coordinates scaled to 0..65535 against the atlas, not pixels. A command
+        is a triangle strip drawn in vertex order, so a four-vertex sprite is two
+        triangles, and the shape's commands draw in order.
+        """
+        return call("get_shape", document_id=document_id, resource_id=resource_id)
+
+    @server.tool()
+    def set_vertices(resource_id: int, command_index: int, vertices: list[list[float]],
+                     document_id: str | None = None) -> dict:
+        """Replace one command's vertices, each [x, y, u, v]; at least three are needed.
+
+        This is how a sprite is resized by its geometry rather than by scaling
+        its placement, and how a nine-slice's cut lines are moved. x and y are
+        pixels; u and v are texel coordinates on 0..65535.
+        """
+        return call("set_vertices", document_id=document_id, resource_id=resource_id,
+                    command_index=command_index, vertices=vertices)
+
+    @server.tool()
+    def edit_commands(resource_id: int, action: str, command_index: int = 0,
+                      atlas_index: int = 0, vertices: list[list[float]] | None = None,
+                      unk1: int = 0, document_id: str | None = None) -> dict:
+        """Add or remove a shape's draw commands.
+
+        action is "add" or "remove". add defaults to the whole atlas as a quad
+        when no `vertices` are given, so there is something visible to edit, and
+        returns the new command_index. remove refuses to leave a shape with no
+        commands.
+        """
+        return call("edit_commands", document_id=document_id, resource_id=resource_id,
+                    action=action, command_index=command_index, atlas_index=atlas_index,
+                    vertices=vertices, unk1=unk1)
+
+    @server.tool()
+    def edit_children(movieclip_id: int, action: str, child_index: int = 0,
+                      name: str = "", suffix: str = "_copy", frame: int = 0,
+                      to_front: bool = False, document_id: str | None = None) -> dict:
+        """Rename, duplicate or reorder a movieclip's child instances.
+
+        action is "rename" (`name` is the slot the game looks up), "duplicate"
+        (shares the same definition and is only added to the child list, so it
+        does not change what any frame draws until it is placed) or "reorder"
+        (`to_front` raises the child to the top of the frame's draw order).
+        Use add_child to place a child in a frame and remove_child to drop one.
+        """
+        return call("edit_children", document_id=document_id, movieclip_id=movieclip_id,
+                    action=action, child_index=child_index, name=name, suffix=suffix,
+                    frame=frame, to_front=to_front)
+
+    @server.tool()
+    def edit_textures(action: str, path: str = "", atlas_index: int = 0,
+                      document_id: str | None = None) -> dict:
+        """Add or replace a texture atlas from a PNG/JPEG/WebP/BMP file.
+
+        action is "add" (appends a new atlas, returning its index) or "replace"
+        (`atlas_index` is overwritten). Shapes that sample a replaced atlas keep
+        their UVs, which are fractions of the sheet, so replacing a sheet with
+        one of the same layout leaves the art in place.
+        """
+        return call("edit_textures", document_id=document_id, action=action,
+                    path=path, atlas_index=atlas_index)
+
+    @server.tool()
+    def export_texture(atlas_index: int, path: str,
+                       document_id: str | None = None) -> dict:
+        """Write one atlas out as a PNG at `path`, for inspecting the source art."""
+        return call("export_texture", document_id=document_id,
+                    atlas_index=atlas_index, path=path)
+
+    @server.tool()
+    def set_exports(resource_id: int, exports: list[str],
+                    document_id: str | None = None) -> dict:
+        """Set a resource's export names — the names the game looks up to find it.
+
+        Passing an empty list removes the export. A name already used by another
+        resource is refused rather than silently reassigned.
+        """
+        return call("set_exports", document_id=document_id, resource_id=resource_id,
+                    exports=exports)
+
+    @server.tool()
+    def export_graph(path: str, resource_ids: list[int] | None = None,
+                     document_id: str | None = None) -> dict:
+        """Write a standalone SC file containing the named resources and their whole dependency graph, for shipping or handing to another tool.
+
+        With no `resource_ids`, everything in the document is exported. New and
+        exported documents use SC6 and are self-contained: imported atlases are
+        cropped and their UVs rewritten, and external textures are embedded.
+        """
+        return call("export_graph", document_id=document_id, path=path,
+                    resource_ids=resource_ids)
 
     @server.tool()
     def get_placement(movieclip_id: int, placement_index: int, frame: int = 0,

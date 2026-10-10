@@ -745,8 +745,10 @@ def test_children_tab_duplicate_delete_and_layer_order(window, monkeypatch):
     e = window.current()
     e.go_to(7)
     e.select_placement(0)
-    assert e.inspector_mode.tabText(e.inspector_mode.currentIndex()) == "Children"
-    assert not e.panel_picker.isVisible()
+    # Children is a panel_picker entry, so the picker stays usable on it.
+    assert e.active_panel == 5
+    assert e.panel_picker.currentText() == "Children"
+    assert e.panel_picker.isVisible()
     e.children.selectRow(0)
     e.duplicate_child()
     obj = d.resource(7)

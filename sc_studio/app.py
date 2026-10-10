@@ -31,7 +31,6 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QWidget,
     QTabWidget,
-    QTabBar,
     QCheckBox,
     QVBoxLayout,
     QHBoxLayout,
@@ -307,11 +306,8 @@ class Editor(QWidget):
         inspector_label = QLabel("INSPECTOR")
         inspector_label.setObjectName("sectionTitle")
         iv.addWidget(inspector_label)
-        self.inspector_mode = QTabBar()
-        self.inspector_mode.addTab("Inspector")
-        self.inspector_mode.addTab("Children")
-        self.inspector_mode.currentChanged.connect(self.switch_inspector_mode)
-        iv.addWidget(self.inspector_mode)
+        # Children is one of the panel_picker entries, so it needs no separate
+        # tab bar; the picker stays visible on every panel, including Children.
         iv.addWidget(self.panel_picker)
         self.tabs = QTabWidget()
         self.tabs.tabBar().hide()
@@ -682,14 +678,12 @@ class Editor(QWidget):
             self.view_selection_atlas()
             return
         self.active_panel = index
-        self.update_inspector_mode()
         self.tabs.setCurrentIndex(index)
         if index == 2 and hasattr(self, "pending_json"):
             self.update_code(self.pending_json)
 
     def sync_panel(self, index):
         self.active_panel = index
-        self.update_inspector_mode()
         with QSignalBlocker(self.panel_picker):
             self.panel_picker.setCurrentIndex(index)
 
@@ -921,7 +915,6 @@ class Editor(QWidget):
             self.tabs.setTabEnabled(1, kind == "movieclips")
             self.tabs.setTabEnabled(5, kind == "movieclips")
             self.panel_picker.model().item(5).setEnabled(kind == "movieclips")
-            self.inspector_mode.setTabEnabled(1, kind == "movieclips")
             self.tabs.setTabEnabled(4, kind == "shapes")
             self.panel_picker.model().item(1).setEnabled(kind == "movieclips")
             self.panel_picker.model().item(4).setEnabled(kind == "shapes")
@@ -1476,18 +1469,6 @@ class Editor(QWidget):
         for label, fn in actions:
             menu.addAction(label).triggered.connect(fn)
         menu.exec(position)
-
-    def switch_inspector_mode(self, index):
-        self.set_panel(5 if index == 1 else getattr(self, "detail_panel", 0))
-        self.update_inspector_mode()
-
-    def update_inspector_mode(self):
-        children = self.active_panel == 5
-        if not children:
-            self.detail_panel = self.active_panel
-        with QSignalBlocker(self.inspector_mode):
-            self.inspector_mode.setCurrentIndex(1 if children else 0)
-        self.panel_picker.setVisible(not children)
 
     def children_selection_changed(self):
         if (
@@ -2238,7 +2219,6 @@ class Editor(QWidget):
     def show_texture(self):
         self.import_image_btn.setEnabled(False)
         self.resize_image_btn.setEnabled(False)
-        self.inspector_mode.setTabEnabled(1, False)
         self.play.setEnabled(False)
         self.frame.setEnabled(False)
         self.preview_resource = None

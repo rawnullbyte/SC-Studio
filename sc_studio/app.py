@@ -332,9 +332,17 @@ class Editor(QWidget):
         controls_row.addWidget(self.curve_preview)
         controls_row.addWidget(QLabel("Keys"))
         self.key_density = QSpinBox()
-        self.key_density.setRange(1, 60)
+        # How many pieces each gap is cut into, so the setting means the same
+        # thing whether the gap is ten frames or sixty: 58 over a two-frame gap
+        # would ask for finer spacing than a frame, which no frame can hold.
+        self.key_density.setRange(1, 64)
         self.key_density.setValue(6)
-        self.key_density.setToolTip("Frames to write between each pair of keys")
+        self.key_density.setToolTip(
+            "How many steps to write between each pair of keys"
+        )
+        # The description next to the button says how many frames will be
+        # written, so it has to follow the number.
+        self.key_density.valueChanged.connect(self.update_curve_info)
         controls_row.addWidget(self.key_density)
         self.bake_button = QPushButton("Apply to range")
         self.bake_button.clicked.connect(self.apply_curve_to_range)
@@ -1483,17 +1491,33 @@ class Editor(QWidget):
         span_keys = chosen if len(chosen) >= 2 else sorted(keys)
         dense = self.key_density.value()
         low, high = span_keys[0], span_keys[-1]
-        span = high - low
-        step = max(1, round(span / dense)) if dense else 1
-        estimate = max(0, span // step) if span else 0
+        # Counted the same way the bake writes, gap by gap, so the number here
+        # is the number of frames that will actually be filled rather than an
+        # approximation that drifts from it.
+        estimate = 0
+        gaps = 0
+        for start, end in zip(span_keys, span_keys[1:]):
+            span = end - start
+            if span < 2:
+                continue
+            gaps += 1
+            step = max(1, min(span - 1, round(span / dense) if dense else 1))
+            estimate += len(range(1, span, step))
         scope = (
             f"the {len(chosen)} keys you picked"
             if len(chosen) >= 2
             else f"all {len(keys)} keys"
         )
+        if not gaps:
+            self.curve_info.setText(
+                f"The {len(span_keys)} keys are on adjacent frames, so there is "
+                "no room to tween between them."
+            )
+            return
         self.curve_info.setText(
-            f"Curve '{self.curve.currentText()}' between {scope} writes about "
-            f"{estimate} frames across {low + 1}-{high + 1}."
+            f"Curve '{self.curve.currentText()}' between {scope} writes "
+            f"{estimate} frame{'' if estimate == 1 else 's'} across "
+            f"{low + 1}-{high + 1}{'' if gaps == 1 else f' in {gaps} gaps'}."
         )
 
     def selected_key_range(self):
@@ -1553,7 +1577,10 @@ class Editor(QWidget):
                 # which is not the same as the curve having nothing to do.
                 continue
             gaps += 1
-            step = max(1, round(span / wanted)) if wanted else 1
+            # A step longer than the gap would write nothing at all, leaving
+            # the frames between the keys holding the start pose; the gap is
+            # filled instead, at one step per frame.
+            step = max(1, min(span - 1, round(span / wanted) if wanted else 1))
             offset = 1
             while offset < span:
                 index = start_frame + offset
@@ -1595,7 +1622,7 @@ class Editor(QWidget):
             self.elements.selectRow(row)
             self.window().statusBar().showMessage(
                 f"Applied '{self.curve.currentText()}' between {len(frames)} keys, "
-                f"writing {len(written)} frames "
+                f"writing {len(written)} frame{'s' if len(written) != 1 else ''} "
                 f"({frames[0] + 1}-{frames[-1] + 1})",
                 6000,
             )

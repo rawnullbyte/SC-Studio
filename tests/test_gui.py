@@ -2445,3 +2445,62 @@ def test_reapplying_a_curve_says_the_gaps_are_already_filled(window):
     e.apply_curve_to_range()
     application().processEvents()
     assert "writing" in window.statusBar().currentMessage()
+
+
+def test_the_key_count_follows_the_density_setting(window):
+    """The "Keys" box is how many steps each gap is cut into, and is honoured."""
+    w = window
+    w.add_doc(animatable_clip(62))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    key_at(e, 0, 0.0)
+    key_at(e, 59, 590.0)
+    e.keyframes.picked_keys = {(0, 0), (59, 0)}
+    e.keyframe_selection_changed()
+    application().processEvents()
+    # The description next to the button has to follow the box, which it did
+    # not: the number was read from a value that was never re-read on change.
+    for density, expected in ((6, 6), (58, 58), (1, 1)):
+        e.key_density.setValue(density)
+        application().processEvents()
+        assert f"writes {expected} frame" in e.curve_info.text(), (
+            density,
+            e.curve_info.text(),
+        )
+        e.apply_curve_to_range()
+        application().processEvents()
+        clip = e.obj
+        filled = sum(
+            1 for i in range(1, 59) if clip["frames"][i]["elements"][0][1] != 65535
+        )
+        assert filled == expected
+        assert f"writing {expected} frame" in window.statusBar().currentMessage()
+        e.revert_tween()
+        application().processEvents()
+
+
+def test_a_density_finer_than_the_gap_still_fills_it(window):
+    """Asking for more steps than there are frames fills every frame."""
+    w = window
+    w.add_doc(animatable_clip(10))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    key_at(e, 0, 0.0)
+    key_at(e, 5, 50.0)
+    e.keyframes.picked_keys = {(0, 0), (5, 0)}
+    e.keyframe_selection_changed()
+    e.key_density.setValue(60)
+    application().processEvents()
+    e.apply_curve_to_range()
+    application().processEvents()
+    clip = e.obj
+    # A step longer than the gap used to write nothing, leaving the frames
+    # between the keys showing the start pose.
+    assert all(
+        clip["frames"][i]["elements"][0][1] != 65535 for i in range(1, 5)
+    )
+    assert "writing 4 frames" in window.statusBar().currentMessage()

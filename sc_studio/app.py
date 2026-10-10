@@ -3,6 +3,7 @@
 import sys
 import json
 import copy
+from collections import deque
 import pickle
 import time
 from pathlib import Path
@@ -168,6 +169,13 @@ class Editor(QWidget):
         self.property_widgets = {}
         self.drafts = set()
         self.revision = self.saved_revision = self.sequence = 0
+        # Rolling cost of the last edits and frames, shown by Help > Performance.
+        # A perf_counter call costs tens of nanoseconds, so this is always on and
+        # the menu needs no restart or environment variable to be useful.
+        self.timings = {
+            name: deque(maxlen=60)
+            for name in ("snapshot", "validate", "commit", "render")
+        }
         self.saved_original = dict(doc.original)
         self.active_panel = 0
         self.geometry_row = -1
@@ -263,24 +271,18 @@ class Editor(QWidget):
         self.preview.atlasContext.connect(self.atlas_context_menu)
         self.preview.atlasShapeOpened.connect(self.open_atlas_shape)
         cv.addWidget(self.preview)
-        image_controls = QHBoxLayout()
-        self.import_image_btn = QPushButton("Import image…")
-        self.import_image_btn.setToolTip(
-            "Add an image as a child in the current movieclip frame · Ctrl+Alt+I"
-        )
-        self.import_image_btn.clicked.connect(self.import_image)
-        self.resize_image_btn = QPushButton("Size / position…")
-        self.resize_image_btn.setToolTip(
-            "Select a placement in Timeline, then change its size and position"
-        )
-        self.resize_image_btn.clicked.connect(self.resize_placement)
-        image_controls.addWidget(self.import_image_btn)
-        image_controls.addWidget(self.resize_image_btn)
-        image_controls.addStretch()
-        cv.addLayout(image_controls)
-
         controls = QHBoxLayout()
         self.play = QPushButton("▶ Play")
+        # The label swaps between Play and Pause, and those two glyphs measure
+        # differently, so both dimensions are pinned to the larger of the two.
+        # Otherwise the button changes size under the cursor on every toggle.
+        self.play.setMinimumWidth(96)
+        # Measure the taller of the two labels through the widget itself, then
+        # pin the height: a minimum would not stop the Pause glyph from growing
+        # the button, and the button growing moves the whole transport row.
+        self.play.setText("⏸ Pause")
+        self.play.setFixedHeight(self.play.sizeHint().height())
+        self.play.setText("▶ Play")
         self.frame = QSlider(Qt.Orientation.Horizontal)
         self.frame.setRange(0, 0)
         self.frame_label = QLabel("Frame 1 / 1")
@@ -289,7 +291,12 @@ class Editor(QWidget):
         controls.addWidget(self.frame, 1)
         controls.addWidget(self.frame_label)
         controls.addWidget(fit)
-        cv.addLayout(controls)
+        # The transport lives in its own fixed-height panel so the row below it
+        # cannot shift the slider or the buttons while a clip plays.
+        transport = QWidget()
+        transport.setLayout(controls)
+        transport.setFixedHeight(transport.sizeHint().height())
+        cv.addWidget(transport)
         self.notice = QLabel("Select a resource to preview and edit.")
         self.notice.setWordWrap(True)
         self.notice.setObjectName("previewNotice")
@@ -642,7 +649,9 @@ class Editor(QWidget):
         edits whose reach cannot be listed in advance (a delete can invalidate
         references held by any clip).
         """
+        mark = time.perf_counter()
         before = self.snapshot()
+        snapped = time.perf_counter()
         try:
             touched = None if full_validate else (
                 self.touched_ids() if affects is None else set(affects)
@@ -659,14 +668,22 @@ class Editor(QWidget):
             if errors:
                 raise ValueError("\n".join(errors[:20]))
         except Exception as e:
+            self.record_timing("snapshot", snapped - mark)
             self.doc.__dict__ = self.restored_state(before[0])
             self.doc._reindex()
             if raise_errors:
                 raise
             self.error(e)
             return False
+        validated = time.perf_counter()
         self.commit_mutation(before, rebuild_browser=rebuild_browser)
+        self.record_timing("snapshot", snapped - mark)
+        self.record_timing("validate", validated - snapped)
+        self.record_timing("commit", time.perf_counter() - validated)
         return True
+
+    def record_timing(self, name, seconds):
+        self.timings[name].append(seconds)
 
     def touched_ids(self):
         """Resources a pending mutation is about to change.
@@ -948,8 +965,6 @@ class Editor(QWidget):
             obj = self.preview.resource(self.selected)
             kind = self.doc.index[self.selected][0]
             self.obj = obj
-            self.import_image_btn.setEnabled(kind == "movieclips")
-            self.resize_image_btn.setEnabled(kind == "movieclips")
             self.update_code(obj)
             label = (
                 " / ".join(obj.get("exports", []))
@@ -1099,41 +1114,35 @@ class Editor(QWidget):
         count = self.frame.maximum() + 1
         self.frame_label.setText(f"Frame {self.frame.value()+1} / {count}")
         self.preview.hidden_children = self.child_visibility.get(self.selected, set())
+        started = time.perf_counter()
         message = self.preview.show_resource(
             self.doc, self.selected, self.frame.value(), fit=fit or value is None
         )
+        self.record_timing("render", time.perf_counter() - started)
         self.notice.setText(
             message
             or "Click / drag a placement to move · Drag empty space to pan · Wheel to zoom"
         )
 
     def tick(self):
-        elapsed = time.monotonic() - self.play_started
-        target = (self.play_first_frame + int(elapsed * self.play_fps)) % (
-            self.frame.maximum() + 1
-        )
-        self.frame.setValue(target)
+        # One frame per tick, at the clip's own rate. Deriving the frame from
+        # wall-clock time made a slow frame (a heavy clip, or a large document)
+        # drop the animation forward by dozens of frames, so the rate is now set
+        # by the timer and rendering latency can only slow playback, not skip it.
+        self.frame.setValue((self.frame.value() + 1) % (self.frame.maximum() + 1))
 
     def toggle_play(self):
         if self.timer.isActive():
             self.timer.stop()
+            self.preview.play_rect = None
             self.play.setText("▶ Play")
             self.show_elements()
         elif self.selected in self.doc.index:
-            self.play_started = time.monotonic()
-            self.play_first_frame = self.frame.value()
-            self.play_fps = max(
-                1, self.doc.index[self.selected][1].get("framerate", 30)
-            )
-            self.timer.start(
-                max(
-                    16,
-                    int(
-                        1000
-                        / max(1, self.doc.index[self.selected][1].get("framerate", 30))
-                    ),
-                )
-            )
+            fps = max(1, self.doc.index[self.selected][1].get("framerate", 30))
+            # Lock the scrollable area for the whole playthrough before the
+            # first frame change, so the camera holds still while it runs.
+            self.preview.play_rect = self.preview.content_rect
+            self.timer.start(max(16, int(1000 / fps)))
             self.play.setText("⏸ Pause")
 
     def frame_index(self):
@@ -2302,8 +2311,6 @@ class Editor(QWidget):
             self.error(e)
 
     def show_texture(self):
-        self.import_image_btn.setEnabled(False)
-        self.resize_image_btn.setEnabled(False)
         self.play.setEnabled(False)
         self.frame.setEnabled(False)
         self.preview_resource = None
@@ -2649,6 +2656,7 @@ class Window(QMainWindow):
             "Ctrl+Return",
         )
         self.action(help_menu, "shortcuts", "Keyboard shortcuts", self.shortcuts, "F1")
+        self.action(help_menu, "performance", "Performance…", self.performance)
         self.action(help_menu, "about", "Support and limitations", self.about)
         # Delete is confined to the resource browser, not text or table cell editing.
         self.delete_shortcut = QAction(self)
@@ -3457,6 +3465,64 @@ class Window(QMainWindow):
                 "Copy/paste/undo follow focus: text, table cells, or resource graph.\nDelete applies to resources only when the browser has focus."
             )
         )
+        dialog.exec()
+
+    def performance(self):
+        """Report where editing and playback time goes on the open document."""
+        editor = self.current()
+        rows = []
+        if editor is not None:
+            stats = editor.timings
+            for label in ("snapshot", "validate", "commit", "render"):
+                samples = stats[label]
+                if not samples:
+                    rows.append((label.title(), "no samples yet", ""))
+                    continue
+                ordered = sorted(samples)
+                last = samples[-1] * 1000
+                mean = sum(samples) / len(samples) * 1000
+                worst = ordered[-1] * 1000
+                p95 = ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))] * 1000
+                rows.append(
+                    (
+                        label.title(),
+                        f"{last:8.1f} ms",
+                        f"mean {mean:7.1f} · p95 {p95:7.1f} · worst {worst:7.1f} ms "
+                        f"({len(samples)} samples)",
+                    )
+                )
+            document = editor.doc
+            summary = (
+                f"{len(document.index):,} resources · "
+                f"{len(document.tables['Textures']['textures'])} atlases · "
+                f"{editor.preview.items_count:,} preview objects this frame · "
+                f"textures decoded into cache: {len(editor.preview.cache)}"
+            )
+        else:
+            summary = "No document open."
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Performance")
+        dialog.resize(680, 380)
+        layout = QVBoxLayout(dialog)
+        intro = QLabel(
+            "Rolling cost of the last 60 operations. snapshot and validate run "
+            "once per edit, commit rebuilds the browser, and render runs for "
+            "every animated frame."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        grid = table(["Stage", "Latest", "Distribution"])
+        fill_table(grid, rows)
+        grid.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        grid.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(grid)
+        detail = QLabel(summary)
+        detail.setWordWrap(True)
+        layout.addWidget(detail)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        buttons.accepted.connect(dialog.accept)
+        layout.addWidget(buttons)
         dialog.exec()
 
     def about(self):

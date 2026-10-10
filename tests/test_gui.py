@@ -536,6 +536,79 @@ def test_animation_reuses_scene_and_does_not_decode_each_frame(window, monkeypat
     assert e.preview.shape_cache
 
 
+def test_playback_advances_one_frame_per_tick(window):
+    """A slow frame must slow playback down, never skip frames.
+
+    Deriving the frame from wall-clock time dropped the animation forward by
+    dozens of frames whenever rendering took long, which is what made a frame
+    jump from 5 to 80.
+    """
+    window.add_doc(populated())
+    e = window.current()
+    e.go_to(7)
+    assert e.frame.maximum() >= 1
+    e.toggle_play()
+    e.timer.stop()  # advance by hand, so only tick() moves the frame
+    count = e.frame.maximum() + 1
+    seen = []
+    for _ in range(count * 2):
+        e.tick()
+        seen.append(e.frame.value())
+    expected = [(seen[0] + i) % count for i in range(count * 2)]
+    assert seen == expected, f"{seen} != {expected}"
+    e.toggle_play()
+
+
+def test_playback_holds_the_camera_still(window):
+    window.add_doc(populated())
+    e = window.current()
+    e.go_to(7)
+    assert e.preview.play_rect is None
+
+    def visible():
+        rect = e.preview.mapToScene(e.preview.viewport().rect()).boundingRect()
+        return (round(rect.x(), 2), round(rect.y(), 2))
+
+    e.toggle_play()
+    e.timer.stop()
+    assert e.preview.play_rect is not None
+    seen = [visible()]
+    locked = []
+    for _ in range(6):
+        e.tick()
+        application().processEvents()
+        seen.append(visible())
+        locked.append(e.preview.sceneRect() == e.preview.play_rect)
+    # The scrollable area stays the locked one, and the view within it holds
+    # still. Scroll positions are whole pixels, so allow sub-pixel rounding.
+    assert all(locked), "scene rect stopped tracking the locked play area"
+    xs = [v[0] for v in seen]
+    ys = [v[1] for v in seen]
+    assert max(xs) - min(xs) < 1 and max(ys) - min(ys) < 1, f"camera moved: {seen}"
+
+    # toggle_play reads its state from the timer, which the manual ticks above
+    # stopped, so restart it to exercise the real stop path.
+    e.timer.start()
+    e.toggle_play()
+    assert e.preview.play_rect is None
+    # A different resource must not inherit the locked area.
+    e.preview.play_rect = e.preview.content_rect
+    e.go_to(3)
+    assert e.preview.play_rect is None
+
+
+def test_play_button_keeps_its_width(window):
+    window.add_doc(populated())
+    e = window.current()
+    e.go_to(7)
+    width = e.play.minimumWidth()
+    e.toggle_play()
+    assert e.play.text() == "⏸ Pause"
+    assert e.play.minimumWidth() == width
+    e.toggle_play()
+    assert e.play.text() == "▶ Play"
+
+
 def test_f2_rename_preserves_aliases_and_undo(window, monkeypatch):
     from PyQt6.QtWidgets import QInputDialog
 

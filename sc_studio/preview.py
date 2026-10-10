@@ -560,12 +560,15 @@ class Preview(QGraphicsView):
         self.show_atlas_outlines = True
         self.hidden_children = set()
         self.matrix_override = None
+        # Scrollable area held fixed while a clip plays; None when not playing.
+        self.play_rect = None
         self.setMouseTracking(True)
 
     def invalidate(self, keep_atlases=False):
         self.atlas_regions = None
         self.atlas_borders = []
         self.atlas_marks = []
+        self.play_rect = None
         self.matrix_override = None
         if not keep_atlases:
             self.cache.clear()
@@ -772,6 +775,10 @@ class Preview(QGraphicsView):
         self.doc = doc
         self.editable = doc.index[id][0] == "movieclips"
         key = (builtins.id(doc), id, builtins.id(doc.index[id][1]))
+        if key != self.scene_key:
+            # A different resource: drop any area locked by a previous
+            # playthrough, or the next view would keep scrolling inside it.
+            self.play_rect = None
         if (
             len(self.instances) > 6000
             or key != self.scene_key
@@ -796,7 +803,15 @@ class Preview(QGraphicsView):
         if rect.isEmpty():
             rect = QRectF(-100, -100, 200, 200)
         self.content_rect = rect.adjusted(-30, -30, 30, 30)
-        if getattr(self, "dragged", None) is None:
+        if self.play_rect is not None:
+            # Playback keeps one scrollable area covering every frame of the
+            # clip. Following the current frame instead moved the camera
+            # whenever an animation shifted the scene, which read as the view
+            # drifting while the clip played. Only playback freezes it; the
+            # interactive path below is left exactly as it was.
+            self.play_rect = self.play_rect.united(self.content_rect)
+            self.scene().setSceneRect(self.play_rect)
+        elif getattr(self, "dragged", None) is None:
             camera = self.mapToScene(self.viewport().rect()).boundingRect()
             self.scene().setSceneRect(
                 self.content_rect if fit else self.content_rect.united(camera)

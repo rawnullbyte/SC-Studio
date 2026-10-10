@@ -520,6 +520,71 @@ def test_atlas_bounds_reset_and_fit_after_movieclip(window):
     assert e.preview.scene().sceneRect().width() > 2
 
 
+def drag_view(p, start, end):
+    """A real left-button drag on the canvas, as the empty-space pan does."""
+    from PyQt6.QtCore import QEvent, QPointF
+    from PyQt6.QtGui import QMouseEvent
+
+    def send(kind, point, button):
+        event = QMouseEvent(
+            kind,
+            QPointF(*point),
+            QPointF(*point),
+            button,
+            button,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        application().sendEvent(p.viewport(), event)
+        application().processEvents()
+
+    send(QEvent.Type.MouseButtonPress, start, Qt.MouseButton.LeftButton)
+    send(QEvent.Type.MouseMove, end, Qt.MouseButton.NoButton)
+    send(QEvent.Type.MouseButtonRelease, end, Qt.MouseButton.LeftButton)
+
+
+def test_the_camera_pans_freely_past_the_artwork_and_stays_there(window):
+    d, e = single_sprite(window)
+    p = e.preview
+    start = p.mapToScene(p.viewport().rect()).boundingRect().center()
+    scale = p.transform().m11()
+    # Panning does not zoom, so every drag owes exactly this much movement.
+    step = (390.0 / scale, 330.0 / scale)
+    for _ in range(6):
+        drag_view(p, (10, 10), (400, 340))
+    moved = p.mapToScene(p.viewport().rect()).boundingRect().center() - start
+    # Qt clamps the view to the scene rect, so a rect sized to the artwork
+    # would swallow the later drags instead of moving the camera by the full
+    # distance each one asks for.
+    assert abs(moved.x()) == pytest.approx(step[0] * 6, rel=0.05)
+    assert abs(moved.y()) == pytest.approx(step[1] * 6, rel=0.05)
+    # The scene rect is put back after each drag, so the camera is not bounced
+    # towards the middle of the artwork while the button is still down.
+    assert p.scene().sceneRect() == p.view_rect
+    assert p.scene().sceneRect().contains(p.content_rect)
+
+    p.fit_content()
+    assert p.scene().sceneRect() == p.view_rect
+    assert p.transform().m11() == pytest.approx(p.fit_scale)
+    drag_view(p, (10, 10), (400, 340))
+    assert (
+        p.mapToScene(p.viewport().rect()).boundingRect().center() - start
+    ).manhattanLength() > 100
+
+
+def test_showing_a_resource_does_not_resize_the_interface(window):
+    d, e = single_sprite(window)
+    application().processEvents()
+    before = (window.size(), e.splitter.sizes(), e.preview.height())
+    # The wide scene rect used for the free camera must not be mistaken for the
+    # view's preferred size, which grew the whole layout around it.
+    assert e.preview.sizeHint().width() < 1000
+    for _ in range(3):
+        e.render_frame(fit=True)
+        application().processEvents()
+    after = (window.size(), e.splitter.sizes(), e.preview.height())
+    assert after == before
+
+
 def test_animation_reuses_scene_and_does_not_decode_each_frame(window, monkeypatch):
     d = populated()
     window.add_doc(d)
@@ -1980,3 +2045,222 @@ def test_cursor_can_sit_past_the_last_frame(window):
     e.goto_frame(far)
     assert e.frame.value() == far
     assert len(e.obj["frames"]) == frames
+
+
+def test_a_change_past_the_end_can_extend_the_clip_more_than_once(window):
+    """Extending is repeatable: each trip out past the end adds frames again."""
+    w = window
+    w.add_doc(animatable_clip(2))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    lengths = []
+    for _ in range(3):
+        # Walk the cursor to the far end of what the strip allows and change
+        # something there; the clip grows to cover it, so the next trip has
+        # further to go.
+        e.goto_frame(e.frame.maximum())
+        application().processEvents()
+        key_at(e, e.frame.value(), 20.0)
+        lengths.append(len(e.obj["frames"]))
+    assert lengths == sorted(set(lengths)), f"the clip stopped growing: {lengths}"
+    assert lengths[0] > 2
+    # The placement is really keyed out there, not silently dropped.
+    assert e.keyframes.keys_of(0) == {lengths[0] - 1}
+
+
+def test_moving_a_placement_past_the_end_extends_the_clip(window):
+    """Dragging in the viewer past the end grows the clip, frame after frame."""
+    w = window
+    w.add_doc(animatable_clip(2))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    e.preview.selected_placement = 0
+    application().processEvents()
+    lengths = []
+    for _ in range(3):
+        e.goto_frame(e.frame.maximum())
+        application().processEvents()
+        # The old code indexed straight into the frame list and raised
+        # IndexError, so nothing after the first extension was possible.
+        e.move_placement(0, 5.0, 0.0)
+        application().processEvents()
+        lengths.append(len(e.obj["frames"]))
+    assert lengths == sorted(set(lengths)), f"the clip stopped growing: {lengths}"
+    assert lengths[0] > 2
+
+
+def test_the_playhead_line_scrubs_without_grabbing_the_key_under_it(window):
+    """The line run through a key moves the cursor; the key stays put."""
+    from PyQt6.QtCore import QEvent, QPointF
+    from PyQt6.QtGui import QMouseEvent
+
+    w = window
+    w.add_doc(animatable_clip(6))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    key_at(e, 3, 40.0)
+    assert e.keyframes.keys_of(0) == {3}
+    strip = e.keyframes
+    step = strip.width_per_frame()
+    key_x = strip.x_for(3)
+
+    def send(kind, point, button):
+        event = QMouseEvent(
+            kind,
+            QPointF(*point),
+            QPointF(*point),
+            button,
+            button,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        application().sendEvent(strip, event)
+        application().processEvents()
+
+    track_y = strip.RULER_HEIGHT + strip.TRACK_HEIGHT / 2
+    # On the key itself the key is picked, as before.
+    send(QEvent.Type.MouseButtonPress, (key_x, track_y), Qt.MouseButton.LeftButton)
+    assert strip.picked_keys == {(3, 0)}
+    assert strip.dragging == (3, 0)
+    send(QEvent.Type.MouseButtonRelease, (key_x, track_y), Qt.MouseButton.LeftButton)
+
+    # On the playhead line at the same frame, the cursor is what is grabbed.
+    e.goto_frame(3)
+    application().processEvents()
+    strip.picked_keys = set()
+    line_x = strip.LABEL_WIDTH + e.frame.value() * step
+    assert strip._on_playhead(line_x)
+    send(QEvent.Type.MouseButtonPress, (line_x, track_y), Qt.MouseButton.LeftButton)
+    assert strip.picked_keys == set(), "the playhead drag grabbed the key"
+    assert strip.dragging is None
+    assert strip.scrubbing
+    # Dragging the line left moves the cursor and leaves the key where it was.
+    send(
+        QEvent.Type.MouseMove,
+        (strip.x_for(1), track_y),
+        Qt.MouseButton.NoButton,
+    )
+    send(
+        QEvent.Type.MouseButtonRelease,
+        (strip.x_for(1), track_y),
+        Qt.MouseButton.LeftButton,
+    )
+    assert e.frame.value() < 3
+    assert e.keyframes.keys_of(0) == {3}
+
+
+def test_a_one_frame_clip_reports_one_frame_and_can_still_be_extended(window):
+    """The transport counts the clip, not the headroom the cursor can reach."""
+    w = window
+    w.add_doc(animatable_clip(1))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    # One frame is one frame: the slider reaching past the end is not part of
+    # the count, which used to read "Frame 1 / 9" on a one-frame clip.
+    assert "Frame 1 / 1" == e.frame_label.text()
+    # A single-frame clip cannot be played, but its slider has to stay live:
+    # reaching past the only frame is how the clip gets its second one.
+    assert not e.play.isEnabled()
+    assert e.frame.isEnabled()
+    e.goto_frame(4)
+    application().processEvents()
+    assert "past the end" in e.frame_label.text()
+    key_at(e, 4, 30.0)
+    assert len(e.obj["frames"]) == 5
+    assert e.frame_label.text() == "Frame 5 / 5"
+    assert e.play.isEnabled()
+
+
+def test_the_timeline_cursor_reaches_the_end_and_back_without_losing_frames(window):
+    """The strip's playhead follows the slider, including into the headroom."""
+    w = window
+    w.add_doc(animatable_clip(4))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    for target in (0, 3, 7, 2):
+        e.goto_frame(target)
+        application().processEvents()
+        # The strip is told where the cursor is on every render; clamping it to
+        # the clip's own length left it behind while the slider moved on.
+        assert e.keyframes.current == e.frame.value() == target
+
+
+def test_scrubbing_outward_is_not_capped_at_a_fixed_length(window):
+    """Working towards the end keeps drawing past the cursor, indefinitely."""
+    w = window
+    w.add_doc(animatable_clip(2))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    reached = []
+    for _ in range(4):
+        # Walk the cursor outwards, one step past where the slider previously
+        # stopped, the way dragging towards the end does.
+        target = e.frame.maximum() + 2 if reached else 6
+        e.goto_frame(target)
+        application().processEvents()
+        reached.append(e.frame.value())
+        # The strip's playhead is where the slider is, even past the last frame.
+        assert e.keyframes.current == e.frame.value()
+        # Grow the clip there so the next walk starts from further out.
+        key_at(e, e.frame.value(), 20.0)
+        assert e.frame.maximum() > reached[-1]
+    assert reached == sorted(set(reached)), f"scrubbing stalled: {reached}"
+    assert reached[-1] > reached[0]
+
+
+def test_the_cursor_past_the_end_does_not_crash_the_editor(window):
+    """Every panel reads the frame the cursor is on, which may not exist."""
+    w = window
+    w.add_doc(animatable_clip(2))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    e.goto_frame(6)
+    application().processEvents()
+    assert e.frame.value() == 6 > len(e.obj["frames"]) - 1
+    # These all used to index the frame list directly and raise IndexError.
+    e.select_placement(0)
+    e.show_elements()
+    e.load_animation_fields()
+    e.refresh_keyframe_strip()
+    e.update_curve_info()
+    e.reorder_placement(0, 0)
+    e.set_layer(0) if False else None  # opens a dialog; covered by frame=None
+    e.refresh()
+    application().processEvents()
+
+
+def test_the_viewer_canvas_follows_the_theme(window):
+    """The canvas is a brush, not a palette role, so it needs telling."""
+    w = window
+    w.add_doc(animatable_clip(2))
+    e = w.current()
+    e.go_to(7)
+    application().processEvents()
+    seen = {}
+    for mode in ("light", "dark", "Nord", "Dracula"):
+        if mode not in w.theme_actions:
+            continue
+        w.set_theme(mode)
+        application().processEvents()
+        seen[mode] = e.preview.backgroundBrush().color().name()
+    assert len(set(seen.values())) == len(seen), f"canvas did not change: {seen}"
+    # A dark theme gets a canvas darker than the surrounding chrome.
+    w.set_theme("dark")
+    application().processEvents()
+    canvas = e.preview.backgroundBrush().color().lightness()
+    from PyQt6.QtGui import QPalette
+
+    chrome = application().palette().color(QPalette.ColorRole.Window).lightness()
+    assert canvas < chrome

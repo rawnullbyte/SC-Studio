@@ -1,7 +1,7 @@
 from collections import OrderedDict
 import builtins
 import math
-from PyQt6.QtCore import Qt, QPointF, QRectF, QTimer, pyqtSignal
+from PyQt6.QtCore import QSize, Qt, QPointF, QRectF, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QTransform,
     QImage,
@@ -15,6 +15,7 @@ from PyQt6.QtGui import (
     QPainter,
 )
 from PyQt6.QtWidgets import (
+    QApplication,
     QGraphicsView,
     QGraphicsScene,
     QGraphicsItem,
@@ -214,7 +215,15 @@ class AnimatorTimeline(QWidget):
         The cursor has to be able to sit beyond the last frame so a change made
         there can extend the clip; it must not be pushed there by scrubbing.
         """
-        return self.frame_count + (self.HEADROOM if self.frame_count else 0)
+        if not self.frame_count:
+            return 0
+        # The headroom is measured from wherever the cursor is, not from the
+        # end of the clip. A fixed band beyond the clip would run out after a
+        # drag or two, which is what capped how far the timeline could be
+        # worked: scrubbing is bounded by what is drawn, so drawing past the
+        # cursor is what lets the cursor keep going.
+        anchor = max(self.current, 0)
+        return self.frame_count + self.HEADROOM + max(0, anchor + 1 - self.frame_count)
 
     def frame_at(self, x):
         step = self.width_per_frame()
@@ -273,8 +282,12 @@ class AnimatorTimeline(QWidget):
         ):
             return
         self.frame_count = max(0, frame_count)
-        self.current = max(0, min(current, max(0, self.frame_count - 1)))
+        # Clamped to the drawn range, not the clip's own length: the cursor is
+        # meant to sit out in the headroom past the end, and clamping it to the
+        # last real frame would leave the playhead stuck there while the slider
+        # moved on without it.
         self.tracks = normalised
+        self.current = max(0, current)
         self.row = row
         if self.band is not None:
             low, high = sorted(self.band)
@@ -514,17 +527,28 @@ class AnimatorTimeline(QWidget):
         if track is not None:
             self.trackPicked.emit(track["row"])
         frame = self.frame_at(x)
-        # A key is the only thing a plain drag grabs; everywhere else the cursor
-        # moves freely, in the ruler and across the tracks alike. Ctrl and shift
-        # apply to keys when a key was hit, and to frame ranges otherwise.
-        if track is None or frame not in track["keys"]:
-            if shift_or_ctrl:
-                # Shift extends a range from the last frame touched, ctrl
-                # toggles a single frame.
-                self.pick_frame(frame, modifiers)
-                self.framePicked.emit(frame)
-                return
-        if track is not None and frame in track["keys"]:
+        # The playhead line takes precedence over the keys it runs through: it
+        # is stroked down the whole widget, so grabbing a key by the few pixels
+        # of that line is a mis-click, not a selection. Scrubbing it moves only
+        # the cursor, never a key.
+        # The ruler belongs to the playhead. It has no track of its own, so the row
+        # under it answers for a track and would hand back the key sitting at
+        # that frame: dragging the ruler would move a key instead of the cursor.
+        # A key is only grabbable on a track row, never from the ruler.
+        on_playhead = self._on_playhead(x) or y < self.RULER_HEIGHT
+        if not on_playhead:
+            # A key is the only thing a plain drag grabs; everywhere else the
+            # cursor moves freely, across the tracks as well as the ruler. Ctrl
+            # and shift apply to keys when a key was hit, and to frame ranges
+            # otherwise.
+            if track is None or frame not in track["keys"]:
+                if shift_or_ctrl:
+                    # Shift extends a range from the last frame touched, ctrl
+                    # toggles a single frame.
+                    self.pick_frame(frame, modifiers)
+                    self.framePicked.emit(frame)
+                    return
+        if not on_playhead and track is not None and frame in track["keys"]:
             # Clicking a key selects that keypoint, which is a finer selection
             # than a frame range. Ctrl adds or removes one, shift extends from
             # the last key touched, and a plain click replaces the selection.
@@ -835,9 +859,17 @@ class Preview(QGraphicsView):
                     return
             self.selected_placement = None
             self.viewport().update()
+        # A drag on empty space pans the view. Qt rewrites the scene rect as it
+        # scrolls, so the free area has to be restored on every move, while the
+        # button is still held; a repair after release comes too late.
+        self.panning = not (
+            getattr(self, "dragged", None) is not None or self.resize_handle
+        )
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self.panning and getattr(self, "dragged", None) is None:
+            self.keep_free()
         if getattr(self, "dragged", None) is not None:
             if self.resize_handle:
                 self.preview_transform(
@@ -923,6 +955,8 @@ class Preview(QGraphicsView):
             event.accept()
             return
         super().mouseReleaseEvent(event)
+        self.panning = False
+        self.keep_free()
 
     def drawForeground(self, painter, rect):
         if self.atlas_regions is not None and self.show_atlas_outlines:
@@ -986,12 +1020,26 @@ class Preview(QGraphicsView):
         self.scene().setItemIndexMethod(QGraphicsScene.ItemIndexMethod.NoIndex)
         self.instances = {}
         self.scene_key = None
-        self.setBackgroundBrush(QColor("#202733"))
+        self.apply_theme()
         self.setDragMode(self.DragMode.ScrollHandDrag)
         self.setTransformationAnchor(self.ViewportAnchor.NoAnchor)
         self.setResizeAnchor(self.ViewportAnchor.NoAnchor)
+        # Repaint the whole viewport on every update rather than only the
+        # changed region. The selection outline and its handles are drawn in
+        # the foreground, outside the scene's own item tracking, so a partly
+        # repainted viewport leaves the handles where they used to be instead
+        # of clearing them.
+        self.setViewportUpdateMode(
+            QGraphicsView.ViewportUpdateMode.FullViewportUpdate
+        )
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # True while a pan drag is in progress. Qt reads the scene rect during
+        # the drag, so it has to be repaired while the mouse is still down.
+        self.panning = False
+        # Off for a sheet fitted to the view, so keep_free() never widens the
+        # browsable area away from the image.
+        self.free_camera = True
         self.content_rect = QRectF(-100, -100, 200, 200)
         self.setRenderHints(
             __import__(
@@ -1027,6 +1075,32 @@ class Preview(QGraphicsView):
         self.view_rect = None
         self.setMouseTracking(True)
 
+    def apply_theme(self):
+        """Colour the canvas from the current theme.
+
+        Derived from the palette rather than a fixed colour, so every scheme
+        recolours it. The window colour is used for the near-part: a canvas
+        matching the surrounding chrome makes the artwork read as being on top
+        of the interface rather than in a separate place.
+        """
+        # Read the application palette rather than this widget's: the theme is
+        # installed there, and a widget's own copy is only refreshed once Qt
+        # re-polishes it, which has not happened yet at this point.
+        window = QApplication.instance().palette().color(
+            QPalette.ColorRole.Window
+        )
+        if window.lightness() < 128:
+            # Darker than the chrome on a dark theme, so the canvas still reads
+            # as a distinct surface, and the default for game art, which is
+            # drawn to be seen against a dark backdrop.
+            back = window.darker(140)
+        else:
+            # On a light theme the artwork needs to sit on something quieter
+            # than the chrome, or the whole window is one flat white.
+            back = window.darker(112)
+        self.setBackgroundBrush(back)
+        self.viewport().update()
+
     def invalidate(self, keep_atlases=False):
         self.atlas_regions = None
         self.atlas_borders = []
@@ -1041,25 +1115,86 @@ class Preview(QGraphicsView):
         self.scene_key = None
         self.scene().clear()
 
-    def fit_content(self):
-        """Fit the current content, keeping the scrollable area free.
+    # Half-extent of the pannable area, in scene units. Large enough that the
+    # view never runs into an edge while working, so the camera is effectively
+    # free rather than boxed into the artwork's bounds.
+    PAN_MARGIN = 20000.0
 
-        The area is deliberately not shrunk to the content here. Narrowing it
-        makes Qt recentre the view on the objects' bounds, which is the camera
-        following the artwork that this is meant to avoid.
+    def free_rect(self):
+        """A wide, symmetric area around the content, used while editing.
+
+        Qt clamps the view to the scene rect, so a rect sized to the artwork
+        would stop the camera at the artwork's edge. Anchoring a much larger
+        rect on the content leaves room to pan in any direction.
         """
-        if self.view_rect is not None:
-            self.scene().setSceneRect(self.view_rect)
-        else:
-            self.scene().setSceneRect(self.content_rect)
+        rect = self.content_rect
+        if rect.isEmpty():
+            rect = QRectF(-100, -100, 200, 200)
+        if not self.free_camera:
+            # A sheet fitted to the view (an atlas) is browsed by zooming and
+            # scrolling around the image itself, so it keeps an area that
+            # matches the sheet exactly instead of the wide editing one.
+            return QRectF(rect)
+        center = rect.center()
+        return QRectF(
+            center.x() - self.PAN_MARGIN,
+            center.y() - self.PAN_MARGIN,
+            self.PAN_MARGIN * 2,
+            self.PAN_MARGIN * 2,
+        )
+
+    def fit_content(self):
+        """Frame the content without narrowing the pannable area to it."""
+        self.view_rect = self.free_rect()
+        self.scene().setSceneRect(self.view_rect)
         self.resetTransform()
         self.fitInView(self.content_rect, Qt.AspectRatioMode.KeepAspectRatio)
         self.fit_scale = self.transform().m11()
+        # fitInView refits the scene rect around the content, undoing the line
+        # above; the free area is restored so the camera stays unconstrained.
+        self.keep_free()
+
+    def keep_free(self):
+        """Put the wide scrollable area back after Qt rewrites it.
+
+        ``fitInView`` and ``centerOn`` both fit the scene rect around what they
+        are showing, which would narrow the pannable area back onto the artwork
+        and lock the camera to it. The area is therefore re-applied immediately
+        after every such call, and once more from the paint event, since that is
+        where the camera has its final say before anything is drawn.
+        """
+        if self.view_rect is None:
+            return
+        scene = self.scene().sceneRect()
+        # An open atlas is zoomed around freely and needs an area that follows
+        # the camera out, so it only ever widens; elsewhere the area is put back
+        # exactly, since that is the whole point of the free camera.
+        wanted = (
+            scene.united(self.view_rect) if not self.free_camera else self.view_rect
+        )
+        if scene != wanted:
+            self.scene().setSceneRect(wanted)
+
+    def sizeHint(self):
+        """Prevent the scene rect from dictating the view's preferred size.
+
+        A view's stock hint is taken from its scene, so the wide pannable area
+        would advertise a forty-thousand-pixel canvas and the layout would grow
+        to match — every pane re-flowing the moment a resource was shown. The
+        view is sized by the splitter it sits in, so a modest hint is enough.
+        """
+        return QSize(480, 320)
+
+    def paintEvent(self, event):
+        self.keep_free()
+        super().paintEvent(event)
 
     def show_atlas(self, doc, index):
         # The atlas is a flat sheet fitted to the view, so any scrollable area
-        # kept for a movieclip must not carry over to it.
+        # kept for a movieclip must not carry over to it, and the area it does
+        # get is the sheet itself rather than the wide editing one.
         self.view_rect = None
+        self.free_camera = False
         self.atlas_regions = [
             {**region, "bounds": QRectF(*region["rect"])}
             for region in doc.atlas_regions(index)
@@ -1122,13 +1257,14 @@ class Preview(QGraphicsView):
             w, h = (self.viewport().width() + 16) / scale, (
                 self.viewport().height() + 16
             ) / scale
+            # Growing the area only when it is actually needed is what keeps a
+            # pan away from the artwork's edge working: reclaiming the scene
+            # rect first would bounce the camera back, one scroll at a time.
             camera = QRectF(target.x() - w / 2, target.y() - h / 2, w, h)
-            # Grow the area if the zoom needs it, never shrink to the content,
-            # or the scrollbars would re-anchor and the camera would move.
-            base = self.view_rect or self.content_rect
-            self.view_rect = base.united(camera)
-            self.scene().setSceneRect(self.view_rect)
+            if not self.scene().sceneRect().contains(camera):
+                self.scene().setSceneRect(self.scene().sceneRect().united(camera))
             self.centerOn(target)
+            self.keep_free()
             event.accept()
             return
         # Zoom relative to fit: 10% to 64x, with panning around the mouse.
@@ -1158,11 +1294,12 @@ class Preview(QGraphicsView):
         camera = QRectF(
             target.x() - half_w, target.y() - half_h, half_w * 2, half_h * 2
         )
-        # Extra camera space prevents Qt's small-scene alignment from cancelling the anchor.
-        base = self.view_rect or self.content_rect
-        self.view_rect = base.united(camera)
-        self.scene().setSceneRect(self.view_rect)
+        # Zoom-out needs to be able to pan to whatever is being shown; the area
+        # grows to meet it, never shrinking back towards the artwork.
+        if not self.scene().sceneRect().contains(camera):
+            self.scene().setSceneRect(self.scene().sceneRect().united(camera))
         self.centerOn(target)
+        self.keep_free()
         # Scrollbars store integer pixels; retain the remaining subpixel offset in the transform.
         residual = self.mapToScene(event.position().toPoint()) - anchor
         self.translate(residual.x(), residual.y())
@@ -1253,6 +1390,7 @@ class Preview(QGraphicsView):
 
     def show_resource(self, doc, id, frame=0, fit=True):
         self.atlas_regions = None
+        self.free_camera = True
         self.doc = doc
         self.editable = doc.index[id][0] == "movieclips"
         key = (builtins.id(doc), id, builtins.id(doc.index[id][1]))
@@ -1286,17 +1424,11 @@ class Preview(QGraphicsView):
         if fit or self.view_rect is None:
             # The scrollable area is set once for the resource and left alone
             # afterwards, so scrubbing and playback never move the camera even
-            # though each frame has different bounds. A generous margin keeps
-            # off-centre artwork reachable without the area following it.
+            # though each frame has different bounds. It is anchored on the
+            # content but far larger than it, so the camera stays free to pan
+            # anywhere rather than stopping at the artwork's edge.
             camera = self.mapToScene(self.viewport().rect()).boundingRect()
-            margin = max(
-                400.0,
-                self.content_rect.width() * 0.5,
-                self.content_rect.height() * 0.5,
-            )
-            self.view_rect = self.content_rect.adjusted(
-                -margin, -margin, margin, margin
-            ).united(camera)
+            self.view_rect = self.free_rect().united(camera)
             self.scene().setSceneRect(self.view_rect)
         if getattr(self, "dragged", None) is None and self.view_rect is not None:
             # Panning may leave the visible area outside the stored rect; grow

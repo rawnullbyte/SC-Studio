@@ -30,6 +30,10 @@ from . import textures
 # them and the radius they answer picks at, so drawn markers stay clickable.
 ATLAS_MARKER_RADIUS = 3.0
 
+# The transform a placement starts from when nothing earlier in the clip has
+# set one; the same value the editor uses for a placement with no key at all.
+IDENTITY_MATRIX = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+
 
 def grid_coordinate(value, low, high, inner_low, inner_high, scale):
     """Stretch the center and keep edge dimensions, in pre-transform coordinates."""
@@ -1467,6 +1471,39 @@ class Preview(QGraphicsView):
         self.last = (doc, id, frame)
         return "; ".join(dict.fromkeys(self.messages))
 
+    def inherited_matrix(self, clip, frame, row):
+        """The transform a frame with no key of its own renders with.
+
+        The engine resolves an unset placement by carrying the last transform
+        that was set forward, so a frame between two keys holds the earlier one
+        rather than snapping back to no transform at all. Identity is only the
+        answer when nothing earlier in the clip has set anything, which is also
+        why removing the first key of a clip is what makes it read as origin.
+
+        The bank is read here rather than passed in: the caller skips loading it
+        for a frame whose own elements are all unset, which is exactly the frame
+        that needs the earlier values looked up.
+        """
+        frames = clip["frames"]
+        index = clip.get("matrix_bank_index")
+        banks = self.doc.storage["matrix_banks"]
+        matrices = (
+            self.doc.bank(index)["matrices"]
+            if index is not None and index < len(banks)
+            else []
+        )
+        start = min(frame, len(frames) - 1)
+        for earlier in range(start, -1, -1):
+            elements = frames[earlier]["elements"]
+            if row >= len(elements):
+                continue
+            matrix_index = elements[row][1]
+            if matrix_index != 65535:
+                if matrix_index < len(matrices):
+                    return matrices[matrix_index]
+                return list(IDENTITY_MATRIX)
+        return list(IDENTITY_MATRIX)
+
     def draw(self, id, frame, parent, stack, path, incoming=None, deformation=None):
         if id in stack:
             self.messages.append(f"Cycle at {id} omitted from preview")
@@ -1520,7 +1557,13 @@ class Preview(QGraphicsView):
                 if not path and ci in self.hidden_children:
                     continue
                 child = obj["children"][ci]
-                matrix = bank["matrices"][mi] if mi != 65535 else [1, 0, 0, 1, 0, 0]
+                # A frame that sets no transform of its own inherits the
+                # nearest earlier one, exactly as the engine resolves it. Only
+                # a placement with no earlier key at all falls back to identity.
+                if mi != 65535:
+                    matrix = bank["matrices"][mi]
+                else:
+                    matrix = self.inherited_matrix(obj, frame, i)
                 if not path and self.matrix_override and self.matrix_override[0] == i:
                     matrix = self.matrix_override[1]
                 # The common SC nine-slice asset is a clip with identity shape children

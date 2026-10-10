@@ -2504,3 +2504,75 @@ def test_a_density_finer_than_the_gap_still_fills_it(window):
         clip["frames"][i]["elements"][0][1] != 65535 for i in range(1, 5)
     )
     assert "writing 4 frames" in window.statusBar().currentMessage()
+
+
+def rendered_x(e, frames, key=((0,), 3)):
+    """The X each frame actually renders the child at, through the renderer."""
+    out = []
+    for frame in frames:
+        e.frame.setValue(frame)
+        e.render_frame()
+        application().processEvents()
+        instance = e.preview.instances.get(key)
+        out.append(
+            None if instance is None else round(instance[0].transform().dx(), 1)
+        )
+    return out
+
+
+def test_a_frame_without_its_own_key_holds_the_earlier_pose(window):
+    """Unset placements inherit, in the renderer as well as in the timeline."""
+    w = window
+    w.add_doc(animatable_clip(8))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    key_at(e, 0, 10.0)
+    key_at(e, 5, 50.0)
+    assert rendered_x(e, range(8)) == [10.0] * 5 + [50.0] * 3
+    # Removing the later key returns the clip to the earlier pose everywhere,
+    # rather than leaving the frames after it at no transform at all.
+    e.frame.setValue(5)
+    e.toggle_keypoint_at(5, 0)
+    application().processEvents()
+    assert e.keys_on_row(e.obj, 0) == [0]
+    assert rendered_x(e, range(8)) == [10.0] * 8
+
+
+def test_removing_the_only_key_falls_back_to_no_transform(window):
+    """With nothing earlier to inherit there is nothing to carry forward."""
+    w = window
+    w.add_doc(animatable_clip(4))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    key_at(e, 2, 70.0)
+    assert rendered_x(e, range(4)) == [0.0, 0.0, 70.0, 70.0]
+    e.frame.setValue(2)
+    e.toggle_keypoint_at(2, 0)
+    application().processEvents()
+    assert rendered_x(e, range(4)) == [0.0, 0.0, 0.0, 0.0]
+
+
+def test_frame_elements_report_what_was_added(window):
+    """A frame's placement count follows the decoded list, not the descriptor."""
+    w = window
+    w.add_doc(animatable_clip(3))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    d = e.doc
+    clip = d.resource(7)
+    original = len(clip["children"])
+    # Add a child and place it on the current frame, the way the editor does.
+    e.place_child(3, "extra")
+    application().processEvents()
+    clip = d.resource(7)
+    assert len(clip["children"]) == original + 1
+    # The new placement has to be visible in the frame's element list, which
+    # read its length from the file's descriptor instead of the decoded list.
+    assert len(clip["frames"][0]["elements"]) == original + 1
+    assert len(list(clip["frames"][0]["elements"])) == original + 1

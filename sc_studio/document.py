@@ -40,7 +40,11 @@ class FrameElements:
         self.frames, self.index = frames, index
 
     def __len__(self):
-        return self.frames.descriptors[self.index]["used_transform"]
+        # The decoded placements, not the descriptor's count: the two agree for
+        # a frame read straight from the file, but an edit appends to the
+        # decoded list without touching the descriptor, and a length taken from
+        # there would hide everything that was added.
+        return len(self.frames.elements(self.index))
 
     def __iter__(self):
         return iter(self.frames.elements(self.index))

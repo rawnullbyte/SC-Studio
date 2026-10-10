@@ -1494,6 +1494,11 @@ class Editor(QWidget):
         # Counted the same way the bake writes, gap by gap, so the number here
         # is the number of frames that will actually be filled rather than an
         # approximation that drifts from it.
+        # A frame that is already a key is one the curve will pass through but
+        # not write, so it is not counted; the description then says how many
+        # frames are left to fill, which is what the button reports afterwards
+        # rather than the size of the gap.
+        existing = set(keys)
         estimate = 0
         gaps = 0
         for start, end in zip(span_keys, span_keys[1:]):
@@ -1502,7 +1507,11 @@ class Editor(QWidget):
                 continue
             gaps += 1
             step = max(1, min(span - 1, round(span / dense) if dense else 1))
-            estimate += len(range(1, span, step))
+            estimate += sum(
+                1
+                for index in range(1, span, step)
+                if start + index not in existing
+            )
         scope = (
             f"the {len(chosen)} keys you picked"
             if len(chosen) >= 2

@@ -2264,3 +2264,66 @@ def test_the_viewer_canvas_follows_the_theme(window):
 
     chrome = application().palette().color(QPalette.ColorRole.Window).lightness()
     assert canvas < chrome
+
+
+def tween_x(e, row=0):
+    """The X of every frame's placement, or None where it inherits."""
+    clip = e.obj
+    bank = e.clip_bank(clip)
+    return [
+        None
+        if frame["elements"][row][1] == 65535
+        else round(bank["matrices"][frame["elements"][row][1]][4], 1)
+        for frame in clip["frames"]
+    ]
+
+
+def test_a_curve_fills_the_gap_without_touching_the_end_key(window):
+    """The keys are kept exactly; only the frames between them are written."""
+    w = window
+    w.add_doc(animatable_clip(12))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    key_at(e, 0, 0.0)
+    key_at(e, 10, 100.0)
+    e.keyframes.picked_keys = {(0, 0), (10, 0)}
+    e.keyframe_selection_changed()
+    e.curve.setCurrentText("Linear")
+    e.apply_curve_to_range()
+    application().processEvents()
+    values = tween_x(e)
+    # Between the keys the values rise, and no frame falls back to the start.
+    written = [(i, v) for i, v in enumerate(values) if v is not None]
+    assert written[0] == (0, 0.0)
+    assert written[-1] == (10, 100.0)
+    assert all(b > a for (_, a), (_, b) in zip(written, written[1:])), written
+    # The end key is the author's, so undoing the curve leaves it in place.
+    e.revert_tween()
+    application().processEvents()
+    assert tween_x(e)[10] == 100.0
+    assert tween_x(e)[0] == 0.0
+    # Everything the curve wrote between them is gone again.
+    assert all(v is None for v in tween_x(e)[1:10])
+
+
+def test_delete_removes_every_selected_key(window):
+    """A picked range of keys goes in one press, and comes back on undo."""
+    w = window
+    w.add_doc(animatable_clip(12))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    for frame, value in ((0, 0.0), (3, 30.0), (6, 60.0), (9, 90.0)):
+        key_at(e, frame, value)
+    assert e.keyframes.keys_of(0) == {0, 3, 6, 9}
+    e.keyframes.picked_keys = {(0, 0), (3, 0), (6, 0)}
+    assert e.delete_selected_keys()
+    application().processEvents()
+    assert e.keyframes.keys_of(0) == {9}
+    assert e.keyframes.selected_keys() == set()
+    e.undo()
+    application().processEvents()
+    assert e.keyframes.keys_of(0) == {0, 3, 6, 9}

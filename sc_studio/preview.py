@@ -769,12 +769,25 @@ class Preview(QGraphicsView):
                 return name
         return None
 
+    def snap_to_pixel(self, point):
+        """Round a scene point onto the device pixel grid.
+
+        Dragging works in whole screen pixels, so a placement lands on the grid
+        the artwork was authored against instead of on a fraction of one, which
+        reads as a soft edge the moment the view is not aligned to it.
+        """
+        view = self.transform().map(point)
+        inverse = self.transform().inverted()[0]
+        return inverse.map(QPointF(round(view.x()), round(view.y())))
+
     def resize_matrix(self, point, shift=False):
         r, m, handle = self.resize_rect, self.drag_matrix, self.resize_handle
         inv, valid = m.inverted()
         if not valid or r.width() <= 0 or r.height() <= 0:
             return m
-        local = inv.map(point)
+        # The handle is dragged in whole pixels, so the edge it moves lands on
+        # the pixel grid rather than between two of them.
+        local = inv.map(self.snap_to_pixel(point))
         ax = (
             r.right()
             if "w" in handle
@@ -880,16 +893,19 @@ class Preview(QGraphicsView):
                 )
                 event.accept()
                 return
-            delta = self.mapToScene(event.position().toPoint()) - self.drag_start
             m = self.drag_matrix
+            # The drag offset is already whole pixels: both ends are
+            # mapToScene() of an integer device point, so the difference is a
+            # whole number of screen pixels and the move is locked to the grid.
+            moved = self.mapToScene(event.position().toPoint()) - self.drag_start
             self.dragged.setTransform(
                 QTransform(
                     m.m11(),
                     m.m12(),
                     m.m21(),
                     m.m22(),
-                    m.dx() + delta.x(),
-                    m.dy() + delta.y(),
+                    m.dx() + moved.x(),
+                    m.dy() + moved.y(),
                 )
             )
             self.viewport().update()
@@ -947,6 +963,8 @@ class Preview(QGraphicsView):
                     self.show_resource(*self.last, fit=False)
                 event.accept()
                 return
+            # A press and release with no movement between them is not a move, so it
+            # never extends the clip: only a real drag does.
             delta = self.mapToScene(event.position().toPoint()) - self.drag_start
             row = self.selected_placement
             self.dragged = None

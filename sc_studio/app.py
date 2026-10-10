@@ -1553,15 +1553,20 @@ class Editor(QWidget):
                     if row < len(clip["frames"][index]["elements"]):
                         progress = offset / span
                         eased = easing.bezier(progress, *points)
-                        clip["frames"][index]["elements"][row][1] = (
-                            self.intern_matrix(
-                                clip,
-                                easing.interpolate_matrix(
-                                    found[start_frame][0], found[end_frame][0], eased
-                                ),
-                            )
+                        element = clip["frames"][index]["elements"][row]
+                        key = self.intern_matrix(
+                            clip,
+                            easing.interpolate_matrix(
+                                found[start_frame][0], found[end_frame][0], eased
+                            ),
                         )
-                        written.add(index)
+                        # The last step of a gap lands on the key ending it. The
+                        # matrix is identical, so the key is only marked as
+                        # written when the frame was not already a key: it is
+                        # the author's, and undoing the curve must not take it.
+                        if element[1] == 65535:
+                            written.add(index)
+                        element[1] = key
                 offset += step
         if not written:
             self.window().statusBar().showMessage(
@@ -1675,6 +1680,44 @@ class Editor(QWidget):
         """Select from the first to the last key, so a whole tween is one gesture."""
         if self.selected in self.doc.index:
             self.keyframes.select_keys()
+
+    def delete_selected_keys(self):
+        """Delete every key the timeline has selected; True if any were.
+
+        The selection can be keys picked one at a time or a range dragged out
+        along a track, so this reads the selection rather than the cursor: one
+        press removes the lot, on every track that was touched.
+        """
+        if not (
+            self.selected in self.doc.index
+            and self.doc.index[self.selected][0] == "movieclips"
+        ):
+            return False
+        picked = self.keyframes.selected_keys()
+        if not picked:
+            return False
+        clip = self.doc.resource(self.selected)
+        removed = 0
+        for index, row in sorted(picked):
+            if not 0 <= index < len(clip["frames"]):
+                continue
+            if row >= len(clip["frames"][index]["elements"]):
+                continue
+            element = clip["frames"][index]["elements"][row]
+            if element[1] == 65535 and element[2] == 65535:
+                continue
+            element[1] = 65535
+            element[2] = 65535
+            removed += 1
+        if not removed:
+            return False
+        if self.mutate(lambda: self.doc.update("movieclips", clip)):
+            self.keyframes.picked_keys = set()
+            self.refresh()
+            self.window().statusBar().showMessage(
+                f"Removed {removed} key{'s' if removed != 1 else ''}", 4000
+            )
+        return True
 
     def add_frame_at(self, index, duplicate):
         """Insert a frame after ``index``, keeping the playhead on the original."""
@@ -2029,8 +2072,16 @@ class Editor(QWidget):
         self.apply_curve_to_range()
 
     def bake_and_compact(self, clip, row):
-        """Compact the baked bank once, then store the clip."""
-        element = clip["frames"][self.frame.value()]["elements"][row]
+        """Compact the baked bank once, then store the clip.
+
+        The last real frame is the one compacted: the cursor may be sitting out
+        in the space past the end, where there is no frame to refresh.
+        """
+        index = min(self.frame.value(), len(clip["frames"]) - 1)
+        if index < 0 or row >= len(clip["frames"][index]["elements"]):
+            self.doc.update("movieclips", clip)
+            return
+        element = clip["frames"][index]["elements"][row]
         self.assign_matrix(clip, element, self.effective_matrix(clip, element))
 
     def revert_tween(self):
@@ -3791,7 +3842,7 @@ class Window(QMainWindow):
         self.info.setText(f"SC{ed.doc.version} · {len(ed.doc.index):,} objects")
         self.actions["browser"].setChecked(not ed.splitter.widget(0).isHidden())
         self.actions["inspector"].setChecked(not ed.splitter.widget(2).isHidden())
-        for grid in (ed.tree,):
+        for grid in (ed.tree, ed.keyframes):
             if self.delete_shortcut not in grid.actions():
                 grid.addAction(self.delete_shortcut)
 
@@ -4025,6 +4076,11 @@ class Window(QMainWindow):
     def delete_selection(self):
         ed = self.current()
         if ed is None or not ed.resolve_drafts():
+            return
+        # Delete belongs to whatever has the keyboard. With the timeline
+        # focused it removes the picked keys, not the selected resources, so a
+        # range of keys can be cleared in one gesture.
+        if ed.keyframes.hasFocus() and ed.delete_selected_keys():
             return
         ids = ed.selected_ids()
         if not ids:

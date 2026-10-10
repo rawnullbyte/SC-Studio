@@ -2,6 +2,7 @@
 
 import sys
 import json
+import math
 import copy
 from collections import deque
 import pickle
@@ -21,7 +22,11 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import (
     QAction,
     QActionGroup,
+    QColor,
     QKeySequence,
+    QPainter,
+    QPainterPath,
+    QPen,
     QPixmap,
     QImage,
     QPalette,
@@ -76,8 +81,9 @@ from .workspace import (
     clipboard_unpack,
     set_graph_clipboard,
 )
-from .preview import Preview
+from .preview import KeyframeStrip, Preview
 from . import textures
+from . import easing
 from . import themes as theme_schemes
 
 
@@ -178,6 +184,9 @@ class Editor(QWidget):
             for name in ("snapshot", "validate", "commit", "render")
         }
         self.saved_original = dict(doc.original)
+        # Frames the last bake wrote for a placement, so reverting removes only
+        # those and never a keyframe the author set by hand.
+        self.baked = None
         self.active_panel = 0
         self.geometry_row = -1
         self.child_visibility = {}
@@ -298,6 +307,13 @@ class Editor(QWidget):
         transport.setLayout(controls)
         transport.setFixedHeight(transport.sizeHint().height())
         cv.addWidget(transport)
+        # A keyframe ruler under the transport bar: the timeline is visible and
+        # editable while previewing, instead of living in the Frames tab.
+        self.keyframes = KeyframeStrip()
+        self.keyframes.framePicked.connect(self.goto_frame)
+        self.keyframes.keyToggled.connect(self.toggle_keypoint_at)
+        self.keyframes.moveRequested.connect(self.move_keypoint)
+        cv.addWidget(self.keyframes)
         self.notice = QLabel("Select a resource to preview and edit.")
         self.notice.setWordWrap(True)
         self.notice.setObjectName("previewNotice")
@@ -345,6 +361,60 @@ class Editor(QWidget):
         placements_page = QWidget()
         placements_layout = QVBoxLayout(placements_page)
         self.timeline_pages.addTab(placements_page, "Placements")
+        animation_page = QWidget()
+        anim_layout = QVBoxLayout(animation_page)
+        anim_layout.addWidget(
+            QLabel(
+                "Keypoints for the selected placement. A key is the transform on "
+                "that frame; frames between keys are baked from the curve."
+            )
+        )
+        anim_layout.addWidget(QLabel("Keypoints"))
+        self.keypoints = table(["Frame", "Position", "Rotation", "Scale"])
+        anim_layout.addWidget(self.keypoints)
+        key_row = QHBoxLayout()
+        for title, fn in [
+            ("Set key here", self.set_keypoint),
+            ("Delete key", self.delete_keypoint),
+            ("Clear all keys", self.clear_keypoints),
+        ]:
+            button = QPushButton(title)
+            button.clicked.connect(fn)
+            key_row.addWidget(button)
+        anim_layout.addLayout(key_row)
+        anim_layout.addWidget(QLabel("Between keypoints"))
+        curve_row = QHBoxLayout()
+        self.curve = QComboBox()
+        self.curve.addItems(easing.PRESETS)
+        self.curve.setToolTip(
+            "Shape applied while baking the frames between two keypoints"
+        )
+        curve_row.addWidget(self.curve, 1)
+        self.curve_preview = QLabel()
+        self.curve_preview.setMinimumHeight(34)
+        self.curve_preview.setMinimumWidth(110)
+        self.curve_preview.setToolTip("Curve shape, drawn left to right over time")
+        curve_row.addWidget(self.curve_preview)
+        anim_layout.addLayout(curve_row)
+        bake_row = QHBoxLayout()
+        self.bake_info = QLabel("")
+        self.bake_info.setWordWrap(True)
+        self.bake_button = QPushButton("Bake tween")
+        self.bake_button.setToolTip(
+            "Fill the frames between each pair of keys with the curve's transforms"
+        )
+        self.bake_button.clicked.connect(self.bake_tween)
+        bake_row.addWidget(self.bake_button)
+        bake_clear = QPushButton("Revert to keys")
+        bake_clear.setToolTip(
+            "Drop baked frames, keeping only the frames where a key was set"
+        )
+        bake_clear.clicked.connect(self.revert_tween)
+        bake_row.addWidget(bake_clear)
+        anim_layout.addLayout(bake_row)
+        anim_layout.addWidget(self.bake_info)
+        self.curve.currentTextChanged.connect(self.draw_curve)
+        animation_page.setObjectName("animationPage")
         self.children = table(["Resource ID", "Instance name", "Blend", "Visible"])
         instances_layout.addWidget(QLabel("Resources used by this movieclip"))
         instances_layout.addWidget(self.children)
@@ -403,6 +473,7 @@ class Editor(QWidget):
             b.clicked.connect(fn)
             er.addWidget(b)
         placements_layout.addLayout(er)
+        self.timeline_pages.addTab(animation_page, "Animation")
         self.tabs.addTab(timeline, "Timeline")
         advanced = QWidget()
         av = QVBoxLayout(advanced)
@@ -524,6 +595,9 @@ class Editor(QWidget):
         self.frames.cellChanged.connect(self.timeline_changed)
         self.frames.itemSelectionChanged.connect(self.select_frame)
         self.elements.cellChanged.connect(self.timeline_changed)
+        # Picking a different placement in the timeline changes which rows the
+        # keyframe strip shows keys for, so the strip follows the selection.
+        self.elements.itemSelectionChanged.connect(self.refresh_keyframe_strip)
         self.populate()
 
     def eventFilter(self, watched, event):
@@ -1050,10 +1124,12 @@ class Editor(QWidget):
                 )
                 self.frames.selectRow(min(old_frame, max(0, len(obj["frames"]) - 1)))
                 self.show_elements()
+                self.refresh_keyframe_strip()
             else:
                 fill_table(self.children, [])
                 fill_table(self.frames, [])
                 fill_table(self.elements, [])
+                self.refresh_keyframe_strip()
         except Exception as e:
             self.error(e)
         finally:
@@ -1124,6 +1200,7 @@ class Editor(QWidget):
             message
             or "Click / drag a placement to move · Drag empty space to pan · Wheel to zoom"
         )
+        self.refresh_keyframe_strip()
 
     def tick(self):
         # One frame per tick, at the clip's own rate. Deriving the frame from
@@ -1155,6 +1232,428 @@ class Editor(QWidget):
         self.show_elements()
         self.frame.setValue(self.frame_index())
 
+    # --- keypoint animation -------------------------------------------------
+    #
+    # The format stores a discrete transform per frame with nowhere to record a
+    # curve, so a keypoint is simply "this frame holds a transform for this
+    # placement". Baking fills the frames between keys from a chosen curve; the
+    # game then reads ordinary frames. Nothing here is stored as a curve.
+
+    def placement_keys(self, clip):
+        """Frame indices where the placement's transform differs from identity.
+
+        Identity means the placement inherits the child's own transform, which
+        is the neutral state and not something a key needs to assert.
+        """
+        row = self.placement_row()
+        if row < 0:
+            return []
+        keys = []
+        for index, frame in enumerate(clip["frames"]):
+            # A placement can be absent from some frames; skip those rather than
+            # abandoning the scan, so the rest of the timeline is still reported.
+            if row >= len(frame["elements"]):
+                continue
+            element = frame["elements"][row]
+            if element[1] != 65535 or element[2] != 65535:
+                keys.append(index)
+        return keys
+
+    def placement_row(self):
+        """The placement row the timeline is acting on.
+
+        currentRow() is -1 whenever the table has no current cell, which happens
+        when it was rebuilt rather than clicked, so fall back to the first row.
+        """
+        row = self.elements.currentRow()
+        if row < 0 and self.elements.rowCount():
+            return 0
+        return row
+
+    # --- keyframe strip -----------------------------------------------------
+
+    def refresh_keyframe_strip(self):
+        """Push the current timeline and key set to the strip under the canvas."""
+        animatable = (
+            self.selected in self.doc.index
+            and self.doc.index[self.selected][0] == "movieclips"
+        )
+        if not animatable:
+            self.keyframes.set_state(0, 0, set(), -1)
+            return
+        clip = self.obj
+        row = self.elements.currentRow()
+        self.keyframes.set_state(
+            len(clip["frames"]),
+            self.frame.value(),
+            self.placement_keys(clip) if row >= 0 else set(),
+            row,
+        )
+
+    def goto_frame(self, index):
+        """Jump to a frame from the strip, stopping playback first."""
+        if self.timer.isActive():
+            self.toggle_play()
+        maximum = self.frame.maximum()
+        self.frame.setValue(max(0, min(index, maximum)))
+
+    def toggle_keypoint_at(self, index, row):
+        """Add a keypoint on a frame, or remove the one already there."""
+        if not (
+            self.selected in self.doc.index
+            and self.doc.index[self.selected][0] == "movieclips"
+            and 0 <= row < self.elements.rowCount()
+        ) or not self.resolve_drafts():
+            return
+        clip = self.doc.resource(self.selected)
+        if not 0 <= index < len(clip["frames"]):
+            return
+        if row >= len(clip["frames"][index]["elements"]):
+            self.window().statusBar().showMessage(
+                f"This placement is not present in frame {index + 1}", 4000
+            )
+            return
+        element = clip["frames"][index]["elements"][row]
+
+        def change():
+            if element[1] != 65535 or element[2] != 65535:
+                element[1] = 65535
+                element[2] = 65535
+                return False
+            # A new key starts from the transform the placement already renders
+            # with, so adding one never moves the object on screen.
+            reference = self.matrix_at(clip, index, row)
+            element[1] = self.intern_matrix(clip, reference)
+            return True
+
+        if self.mutate(lambda: (change(), self.doc.update("movieclips", clip))[1]):
+            self.refresh()
+            self.elements.selectRow(row)
+            self.preview.selected_placement = row
+
+    def matrix_at(self, clip, index, row):
+        """The transform a placement renders with on a frame, keyed or not.
+
+        Without a key the placement inherits the nearest earlier key, which is
+        how the engine resolves it; identity only if there is no earlier key.
+        """
+        for earlier in range(index, -1, -1):
+            if row >= len(clip["frames"][earlier]["elements"]):
+                continue
+            element = clip["frames"][earlier]["elements"][row]
+            if element[1] != 65535:
+                matrices = self.clip_bank(clip).get("matrices") or []
+                if element[1] < len(matrices):
+                    return list(matrices[element[1]])
+                return list(easing.IDENTITY)
+        return list(easing.IDENTITY)
+
+    def move_keypoint(self, source, target):
+        """Drag a keypoint to another frame, carrying its transform with it."""
+        if source == target or not self.animatable() or not self.resolve_drafts():
+            return
+        clip = self.doc.resource(self.selected)
+        row = self.placement_row()
+        if not 0 <= target < len(clip["frames"]):
+            return
+        if row >= len(clip["frames"][source]["elements"]) or row >= len(
+            clip["frames"][target]["elements"]
+        ):
+            return
+        origin = clip["frames"][source]["elements"][row]
+        if origin[1] == 65535 and origin[2] == 65535:
+            return
+        matrix = self.matrix_at(clip, source, row)
+        colours = self.clip_bank(clip).get("colors") or []
+        colour = (
+            list(colours[origin[2]])
+            if origin[2] != 65535 and origin[2] < len(colours)
+            else None
+        )
+        destination = clip["frames"][target]["elements"][row]
+
+        def change():
+            destination[1] = self.intern_matrix(clip, matrix)
+            if colour is not None:
+                destination[2] = self.intern_color(clip, colour)
+            origin[1] = 65535
+            origin[2] = 65535
+
+        if self.mutate(lambda: (change(), self.doc.update("movieclips", clip))[1]):
+            self.refresh()
+            self.elements.selectRow(row)
+            self.preview.selected_placement = row
+            self.window().statusBar().showMessage(
+                f"Moved keypoint to frame {target + 1}", 4000
+            )
+
+    def clip_bank(self, clip):
+        """The clip's transform bank, or an empty one when it has none yet.
+
+        A freshly created movieclip can name a bank index that does not exist,
+        and document.bank() raises on that rather than returning nothing.
+        """
+        index = clip.get("matrix_bank_index")
+        if index is None or index >= len(self.doc.storage["matrix_banks"]):
+            return {"matrices": [], "colors": []}
+        return self.doc.bank(index)
+
+    def key_transforms(self, clip):
+        """Matrix and colour per keyed frame, for the selected placement."""
+        bank = self.clip_bank(clip)
+        colours = bank.get("colors") or []
+        matrices = bank.get("matrices") or []
+        found = {}
+        for index in self.placement_keys(clip):
+            element = clip["frames"][index]["elements"][self.placement_row()]
+            matrix = (
+                list(matrices[element[1]])
+                if element[1] != 65535 and element[1] < len(matrices)
+                else list(easing.IDENTITY)
+            )
+            colour = (
+                list(colours[element[2]])
+                if element[2] != 65535 and element[2] < len(colours)
+                else None
+            )
+            found[index] = (matrix, colour)
+        return found
+
+    def refresh_keypoints(self):
+        """Rebuild the keypoint table and the curve preview for the selection."""
+        self.draw_curve(self.curve.currentText())
+        self.bake_info.setText("")
+        if not self.animatable():
+            fill_table(self.keypoints, [])
+            self.bake_info.setText("Select a placement in the Placements list.")
+            return
+        clip = self.obj
+        if not 0 <= self.frame.value() < len(clip["frames"]):
+            fill_table(self.keypoints, [])
+            return
+        found = self.key_transforms(clip)
+        rows = []
+        for index in sorted(found):
+            matrix, _ = found[index]
+            parts = easing.decompose(matrix)
+            rows.append(
+                [
+                    index,
+                    f"{parts['tx']:.1f}, {parts['ty']:.1f}",
+                    f"{math.degrees(parts['rotation']):.1f}°",
+                    f"{parts['scale_x']:.3f}, {parts['scale_y']:.3f}",
+                ]
+            )
+        fill_table(self.keypoints, rows)
+        if len(found) < 2:
+            self.bake_info.setText(
+                "Set a key on another frame to enable baking between them."
+            )
+        else:
+            span = max(found) - min(found)
+            self.bake_info.setText(
+                f"{len(found)} keys spanning {span + 1} frames · "
+                f"curve '{self.curve.currentText()}' applies between them"
+            )
+
+    def animatable(self):
+        """Whether the current frame holds a placement the strip can key."""
+        if self.selected not in self.doc.index:
+            return False
+        if self.doc.index[self.selected][0] != "movieclips":
+            return False
+        frames = self.obj.get("frames") or []
+        index = self.frame.value()
+        if not 0 <= index < len(frames):
+            return False
+        return 0 <= self.placement_row() < len(frames[index]["elements"])
+
+    def draw_curve(self, name):
+        """Render the selected curve so its shape is visible before baking."""
+        width, height = 110, 34
+        image = QImage(width, height, QImage.Format.Format_ARGB32)
+        image.fill(QColor("transparent"))
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(QPen(QColor("#6b7688"), 1))
+        painter.drawRect(0, 0, width - 1, height - 1)
+        points = easing.sample(name, width)
+        # Overshoot and anticipate leave 0..1, so the plot is padded to keep the
+        # whole curve on screen.
+        low = min([0.0] + points)
+        high = max([1.0] + points)
+        span = max(high - low, 1e-6)
+        path = QPainterPath()
+        for x, value in enumerate(points):
+            y = height - 2 - (value - low) / span * (height - 4)
+            if x == 0:
+                path.moveTo(x, y)
+            else:
+                path.lineTo(x, y)
+        painter.setPen(QPen(QColor("#63b5ff"), 2))
+        painter.drawPath(path)
+        painter.end()
+        self.curve_preview.setPixmap(QPixmap.fromImage(image))
+
+    def set_keypoint(self):
+        """Give the current frame its own transform, creating a keypoint."""
+        if not self.animatable() or not self.resolve_drafts():
+            return
+        clip = self.doc.resource(self.selected)
+        row = self.placement_row()
+        element = clip["frames"][self.frame.value()]["elements"][row]
+        matrix = self.effective_matrix(clip, element)
+        if self.mutate(lambda: self.assign_matrix(clip, element, matrix)):
+            self.refresh()
+            self.elements.selectRow(row)
+            self.preview.selected_placement = row
+            self.window().statusBar().showMessage(
+                f"Key set on frame {self.frame.value() + 1}", 4000
+            )
+
+    def effective_matrix(self, clip, element):
+        """The transform the placement renders with right now."""
+        if element[1] == 65535:
+            return list(easing.IDENTITY)
+        matrices = self.clip_bank(clip).get("matrices") or []
+        if element[1] < len(matrices):
+            return list(matrices[element[1]])
+        return list(easing.IDENTITY)
+
+    def delete_keypoint(self):
+        """Drop the current frame's key, so the frame inherits again."""
+        if not self.animatable() or not self.resolve_drafts():
+            return
+        clip = self.doc.resource(self.selected)
+        row = self.placement_row()
+        element = clip["frames"][self.frame.value()]["elements"][row]
+        if element[1] == 65535 and element[2] == 65535:
+            self.window().statusBar().showMessage(
+                f"Frame {self.frame.value() + 1} has no key", 4000
+            )
+            return
+        element[1] = 65535
+        element[2] = 65535
+        if self.mutate(lambda: self.doc.update("movieclips", clip)):
+            self.refresh()
+            self.elements.selectRow(row)
+
+    def clear_keypoints(self):
+        if not self.animatable() or not self.resolve_drafts():
+            return
+        clip = self.doc.resource(self.selected)
+        row = self.placement_row()
+        keys = self.placement_keys(clip)
+        if not keys:
+            return
+        for index in keys:
+            element = clip["frames"][index]["elements"][row]
+            element[1] = 65535
+            element[2] = 65535
+        if self.mutate(lambda: self.doc.update("movieclips", clip)):
+            self.refresh()
+            self.elements.selectRow(row)
+            self.window().statusBar().showMessage(f"Cleared {len(keys)} keys", 4000)
+
+    def bake_tween(self):
+        """Fill the frames between each pair of keys using the chosen curve."""
+        if not self.animatable() or not self.resolve_drafts():
+            return
+        clip = self.doc.resource(self.selected)
+        row = self.placement_row()
+        found = self.key_transforms(clip)
+        if len(found) < 2:
+            self.window().statusBar().showMessage("Need at least two keys to bake", 5000)
+            return
+        points = easing.curve_for(self.curve.currentText())
+        # Every frame the curve writes needs its own matrix, so the whole clip
+        # is rebuilt rather than patched in place.
+        written = set()
+        ordered = sorted(found)
+        for start, end in zip(ordered, ordered[1:]):
+            if end - start < 2:
+                continue
+            first, first_colour = found[start]
+            last, last_colour = found[end]
+            for index in range(start + 1, end):
+                # A placement can be absent from a frame in the middle of a run.
+                # The keyframes on either side still bound the animation, but
+                # there is nothing to write where the placement does not exist.
+                if row >= len(clip["frames"][index]["elements"]):
+                    continue
+                progress = (index - start) / (end - start)
+                eased = easing.bezier(progress, *points)
+                element = clip["frames"][index]["elements"][row]
+                matrix = easing.interpolate_matrix(first, last, eased)
+                element[1] = self.intern_matrix(clip, matrix)
+                if first_colour is not None and last_colour is not None:
+                    element[2] = self.intern_color(
+                        clip, easing.interpolate_color(first_colour, last_colour, eased)
+                    )
+                written.add(index)
+        if not written:
+            self.window().statusBar().showMessage(
+                "No frames between the keys to fill", 5000
+            )
+            return
+        if self.mutate(lambda: self.bake_and_compact(clip, row)):
+            # Remember exactly which frames the curve produced. Undoing a bake
+            # by guessing would delete keyframes the author set by hand, since a
+            # densely keyed clip looks identical to a baked one.
+            self.baked = (self.selected, row, written)
+            self.refresh()
+            self.elements.selectRow(row)
+            self.window().statusBar().showMessage(
+                f"Baked {len(written)} frames with '{self.curve.currentText()}'", 5000
+            )
+
+    def bake_and_compact(self, clip, row):
+        """Compact the baked bank once, then store the clip."""
+        element = clip["frames"][self.frame.value()]["elements"][row]
+        self.assign_matrix(clip, element, self.effective_matrix(clip, element))
+
+    def revert_tween(self):
+        """Drop exactly the frames the last bake wrote for this placement.
+
+        Only frames recorded by bake_tween are touched. Inferring them from the
+        key layout instead would be wrong: a clip keyed on every frame looks
+        identical to a baked one, and guessing would delete the author's own
+        keyframes.
+        """
+        if not self.resolve_drafts():
+            return
+        if self.selected not in self.doc.index:
+            return
+        if self.baked is None or self.baked[0] != self.selected:
+            self.window().statusBar().showMessage(
+                "No baked tween recorded for this clip; bake one first", 5000
+            )
+            return
+        _, row, frames = self.baked
+        clip = self.doc.resource(self.selected)
+        removed = 0
+        for index in sorted(frames):
+            if not 0 <= index < len(clip["frames"]):
+                continue
+            if row >= len(clip["frames"][index]["elements"]):
+                continue
+            element = clip["frames"][index]["elements"][row]
+            if element[1] == 65535 and element[2] == 65535:
+                continue
+            element[1] = 65535
+            element[2] = 65535
+            removed += 1
+        if not removed:
+            self.window().statusBar().showMessage("Baked frames are already clear", 4000)
+            return
+        if self.mutate(lambda: self.doc.update("movieclips", clip)):
+            self.baked = None
+            self.refresh()
+            self.elements.selectRow(row)
+            self.window().statusBar().showMessage(
+                f"Reverted {removed} baked frames", 4000
+            )
+
     def show_elements(self):
         if (
             self.selected in self.doc.index
@@ -1166,6 +1665,7 @@ class Editor(QWidget):
                 self.elements,
                 obj["frames"][i]["elements"] if i < len(obj["frames"]) else [],
             )
+            self.refresh_keypoints()
 
     def fill_visibility(self):
         hidden = self.child_visibility.get(self.selected, set())
@@ -1887,7 +2387,43 @@ class Editor(QWidget):
             self.elements.selectRow(self.elements.rowCount() - 1)
             self.render_frame(fit=True)
 
+    def intern_matrix(self, clip, matrix):
+        """Append a matrix to the clip's bank and return its new local index.
+
+        The whole clip is recompacted once at the end of an edit rather than
+        per append, which keeps baking a long tween linear instead of quadratic.
+        """
+        bank = (
+            self.doc.bank(clip["matrix_bank_index"])
+            if clip["matrix_bank_index"] < len(self.doc.storage["matrix_banks"])
+            else {"matrices": [], "colors": []}
+        )
+        matrices = list(bank.get("matrices") or [])
+        matrices.append([float(v) for v in matrix])
+        clip["matrix_bank_index"] = self.doc.add_bank(
+            matrices, list(bank.get("colors") or [])
+        )
+        # add_bank may reuse an existing identical bank, so read the count back.
+        fresh = self.doc.bank(clip["matrix_bank_index"])["matrices"]
+        return len(fresh) - 1
+
+    def intern_color(self, clip, color):
+        """Append a colour transform to the clip's bank and return its index."""
+        bank = self.doc.bank(clip["matrix_bank_index"])
+        colors = list(bank.get("colors") or [])
+        colors.append([int(v) for v in color])
+        clip["matrix_bank_index"] = self.doc.add_bank(
+            list(bank.get("matrices") or []), colors
+        )
+        fresh = self.doc.bank(clip["matrix_bank_index"])["colors"]
+        return len(fresh) - 1
+
     def assign_matrix(self, clip, element, matrix):
+        """Compact the clip's bank and point this element at ``matrix``.
+
+        Runs at the end of an edit, so each frame element is remapped once even
+        when a tween added many matrices.
+        """
         usedm = sorted(
             {e[1] for f in clip["frames"] for e in f["elements"] if e[1] != 65535}
         )

@@ -91,6 +91,20 @@ Select a resource and use **Resource → Reference tree** (**Ctrl+Shift+R**), or
 Open an atlas from the texture list. Every draw command that samples it is outlined, so the whole sheet is browsable: double-click any outline to open that shape, or right-click it to open the shape, run **Find usages**, or open a **Reference tree**. **Browse atlas shapes…** lists them with their command, reference and UV-rectangle columns. **Show referenced asset outlines** toggles the overlay.
 
 Most commands in a real UI atlas are *zero-area* — all four corners sample a single texel, so there is no rectangle to outline. Those are drawn as small diamond markers over the texel they sample and are pickable and openable like any other region, which keeps shapes that would otherwise be invisible in the atlas reachable. Several shapes commonly share one texel, so a click can land on more than one; the innermost match opens and the rest stay available in the right-click menu. Atlas commands are also dense — a single sheet can hold tens of thousands — so the marker overlay is what makes atlas-wide browsing practical.
+**Keyframe animation**
+
+A keyframe strip sits under the preview, so a timeline is visible and editable while you work rather than living in the Frames tab. It shows every frame of the open movieclip with the keyframes for the selected placement marked as diamonds, and the current frame highlighted.
+
+- **Left click** a frame to go there; clicking a keyframe also arms a drag, so dragging it moves the key to another frame.
+- **Right click** a frame to add a keyframe on it, or remove the one already there.
+- Picking a different placement in the Elements list switches the strip to that placement's keys.
+
+A keyframe is the placement's transform on that frame. Adding one copies the transform the placement currently renders with, so creating a key never moves the object on screen. Keyframes are created in place — there is no need to duplicate frames by hand first.
+
+**Between keyframes** chooses the curve used when filling the frames between two keys: Linear, Ease in, Ease out, Ease in-out, Smooth, Snap in, Snap out, Overshoot and Anticipate, drawn as a preview beside the list. **Bake tween** writes those in-between transforms as real frames; **Revert to keys** removes exactly the frames the last bake wrote, so keyframes you set yourself are never touched. The SC2 format stores one discrete transform per frame and has nowhere to record a curve, so a curve is an authoring choice that is baked into frames — the game reads ordinary frames.
+
+Rotation interpolates by the shorter way round, and scale is kept positive through a turn, which a direct blend of the matrix components would not do.
+
 ## Interface
 
 The compact menu bar has **File, Edit, View, Resource, Create, MCP, Help**. The right sidebar holds one panel at a time, chosen from the **INSPECTOR** dropdown: **Properties**, **Timeline**, **JSON**, **Textures**, **Geometry** and **Children**. Picking an entry swaps the panel below, and the dropdown stays available on every panel — including Children, which holds the child list and its editing actions (**Ctrl+1** through **Ctrl+6**). Drag splitters to resize panes, hide browser/inspector from View, or choose Reset layout. File paths and resource IDs/names appear in tooltips; clicking the ID header sorts numerically. The category dropdown lists only Movieclips, Shapes, Textfields, Modifiers, Texture atlases or Exports. Search applies to the chosen category and is debounced for large files; Enter selects the first match, Escape clears search and returns focus to the browser.

@@ -5,6 +5,7 @@ from PyQt6.QtCore import Qt, QPointF, QRectF, pyqtSignal
 from PyQt6.QtGui import (
     QTransform,
     QImage,
+    QPalette,
     QPixmap,
     QPainterPath,
     QPolygonF,
@@ -19,6 +20,7 @@ from PyQt6.QtWidgets import (
     QGraphicsItem,
     QGraphicsTextItem,
     QGraphicsPixmapItem,
+    QWidget,
 )
 from . import textures
 
@@ -145,6 +147,163 @@ class Container(QGraphicsItem):
 
     def paint(self, painter, option, widget=None):
         pass
+
+
+class KeyframeStrip(QWidget):
+    """A frame ruler with keyframe diamonds, sitting under the transport bar.
+
+    Shows and edits the whole timeline in place, so animating does not mean
+    switching to the Frames tab and duplicating frames by hand.
+    """
+
+    framePicked = pyqtSignal(int)
+    keyToggled = pyqtSignal(int, int)  # frame, placement row
+    moveRequested = pyqtSignal(int, int)  # from frame, to frame
+
+    KEY_WIDTH = 16
+    LABEL_HEIGHT = 13
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.frame_count = 0
+        self.current = 0
+        self.keys = set()
+        self.row = -1
+        self.dragging = None
+        self.setMinimumHeight(
+            self.KEY_WIDTH + self.LABEL_HEIGHT + 2 + self.fontMetrics().height()
+        )
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.setToolTip(
+            "Left click a frame to go there · click a keypoint to move it · "
+            "right click to add or remove a keypoint · double click to scrub"
+        )
+
+    def set_state(self, frame_count, current, keys, row):
+        """Adopt a new timeline, repainting only when something changed."""
+        keys = set(keys)
+        if (
+            frame_count == self.frame_count
+            and current == self.current
+            and keys == self.keys
+            and row == self.row
+        ):
+            return
+        self.frame_count = max(0, frame_count)
+        self.current = max(0, min(current, max(0, self.frame_count - 1)))
+        self.keys = keys
+        self.row = row
+        self.update()
+
+    def x_for(self, frame):
+        return frame * self.KEY_WIDTH + self.KEY_WIDTH / 2
+
+    def frame_at(self, x):
+        frame = int(x // self.KEY_WIDTH)
+        return max(0, min(frame, max(0, self.frame_count - 1)))
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        width = self.width()
+        height = self.height()
+        metrics = self.fontMetrics()
+        ruler_top = self.LABEL_HEIGHT + self.KEY_WIDTH + 2
+        painter.fillRect(0, 0, width, height, self.palette().window())
+        if not self.frame_count:
+            painter.setPen(self.palette().color(QPalette.ColorRole.PlaceholderText))
+            painter.drawText(4, metrics.ascent() + 4, "Select a movieclip to animate")
+            return
+
+        accent = self.palette().color(QPalette.ColorRole.Highlight)
+        text = self.palette().color(QPalette.ColorRole.WindowText)
+        muted = self.palette().color(QPalette.ColorRole.PlaceholderText)
+        current_color = QColor("#ff9d3a")
+
+        # Ruler ticks, labelled at a spacing that stays readable when narrow.
+        step = 1
+        while step * self.KEY_WIDTH < 34:
+            step *= 5 if step % 2 else 2
+        painter.setPen(muted)
+        for frame in range(0, self.frame_count, step):
+            x = self.x_for(frame)
+            # drawLine has no float overload, so points go in as QPointF.
+            painter.drawLine(QPointF(x, ruler_top), QPointF(x, ruler_top + 5))
+            painter.drawText(
+                QPointF(x + 2, ruler_top + 4 + metrics.ascent()), str(frame + 1)
+            )
+        painter.drawLine(QPointF(0, ruler_top), QPointF(width, ruler_top))
+
+        # The current frame's column, so the playhead is visible at a glance.
+        column = QRectF(
+            self.current * self.KEY_WIDTH,
+            0,
+            self.KEY_WIDTH,
+            height,
+        )
+        highlight = QColor(current_color)
+        highlight.setAlpha(46)
+        painter.fillRect(column, highlight)
+        pen = QPen(current_color)
+        pen.setWidth(2)
+        painter.setPen(pen)
+        playhead = self.current * self.KEY_WIDTH
+        painter.drawLine(QPointF(playhead, 0), QPointF(playhead, height))
+
+        # Keypoints on the row between the frame numbers and the ruler.
+        top = self.LABEL_HEIGHT + 2
+        for frame in sorted(self.keys):
+            if frame >= self.frame_count:
+                continue
+            x = self.x_for(frame)
+            size = self.KEY_WIDTH / 2 - 2
+            painter.setBrush(accent)
+            painter.setPen(QPen(text, 1))
+            painter.drawPolygon(
+                QPolygonF(
+                    [
+                        QPointF(x, top),
+                        QPointF(x + size, top + size),
+                        QPointF(x, top + size * 2),
+                        QPointF(x - size, top + size),
+                    ]
+                )
+            )
+
+    def mousePressEvent(self, event):
+        if not self.frame_count:
+            return
+        frame = self.frame_at(event.position().x())
+        if event.button() == Qt.MouseButton.RightButton:
+            self.keyToggled.emit(frame, self.row)
+            return
+        if frame in self.keys:
+            # Clicking a keypoint both navigates to it and arms a drag, which is
+            # what animators normally do; dragging is what moves the key.
+            self.dragging = frame
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        self.framePicked.emit(frame)
+
+    def mouseMoveEvent(self, event):
+        if self.dragging is not None:
+            target = self.frame_at(event.position().x())
+            if target != self.dragging:
+                self.moveRequested.emit(self.dragging, target)
+                self.dragging = target
+
+    def mouseReleaseEvent(self, event):
+        if self.dragging is not None:
+            self.dragging = None
+            self.unsetCursor()
+
+    def mouseDoubleClickEvent(self, event):
+        if self.frame_count:
+            self.framePicked.emit(self.frame_at(event.position().x()))
+
+    def wheelEvent(self, event):
+        # Forwarding keeps the pointer over the strip a valid place to zoom the
+        # preview, matching the viewport it sits under.
+        event.ignore()
 
 
 class Preview(QGraphicsView):

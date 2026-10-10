@@ -1042,9 +1042,19 @@ def test_atlas_real_context_event_and_multiple_rendered_outlines(window, monkeyp
     image = p.viewport().grab().toImage()
     for bounds in p.atlas_borders:
         pixel = p.mapFromScene(QPointF(bounds.center().x(), bounds.top()))
-        assert any((color := image.pixelColor(pixel.x()+dx, pixel.y()+dy)).red() > 180
-                   and color.green() > 120 and color.blue() < 110
-                   for dx in range(-2, 3) for dy in range(-2, 3))
+        # The border is a cosmetic 1px line, so which pixel it lands on depends
+        # on the fitted zoom. Scan a small band and accept either the pure
+        # outline colour or that colour blended over the blue atlas behind it
+        # (which stays yellow-dominant even at half coverage).
+        band = [
+            image.pixelColor(pixel.x() + dx, pixel.y() + dy)
+            for dx in range(-3, 4)
+            for dy in range(-3, 4)
+        ]
+        assert any(
+            color.red() > color.blue() + 40 and color.green() > color.blue() + 20
+            for color in band
+        ), f"no outline drawn at {bounds}: {[c.name() for c in band]}"
     menus = []
     def inspect(menu, *_):
         candidates = menu.actions()[0].menu()
@@ -1385,3 +1395,198 @@ def test_timings_are_recorded_for_edits_and_frames(window):
     for stage in ("snapshot", "validate", "commit"):
         assert len(e.timings[stage]) == 1, stage
         assert e.timings[stage][0] >= 0
+
+
+def animatable_clip(frames=6):
+    """A movieclip with one shape child placed on every frame."""
+    d = populated()
+    clip = d.resource(7)
+    clip["children"] = [{"id": 3, "name": "sprite", "blend": 0}]
+    clip["frames"] = [
+        {"label": f"f{i}", "elements": [[0, 65535, 65535]]} for i in range(frames)
+    ]
+    d.update("movieclips", clip)
+    return d
+
+
+def test_easing_curves_are_well_behaved():
+    from sc_studio import easing
+
+    # Endpoints are exact for every preset, so a tween cannot overshoot its ends.
+    for name in easing.PRESETS:
+        assert easing.bezier(0.0, *easing.curve_for(name)) == 0.0, name
+        assert easing.bezier(1.0, *easing.curve_for(name)) == 1.0, name
+    # Ease in-out is symmetric about the middle and monotonic.
+    eased = easing.sample("Ease in-out", 21)
+    assert eased[10] == pytest.approx(0.5, abs=0.02)
+    assert all(b >= a for a, b in zip(eased, eased[1:]))
+    # Overshoot really does leave the 0..1 range, which is the point of it.
+    assert max(easing.sample("Overshoot", 21)) > 1.0
+
+
+def test_matrix_interpolation_keeps_scale_and_takes_the_short_way():
+    import math
+    from sc_studio import easing
+
+    start = easing.compose({"tx": 0, "ty": 0, "rotation": 0, "scale_x": 2, "scale_y": 2})
+    end = easing.compose(
+        {"tx": 0, "ty": 0, "rotation": math.radians(350), "scale_x": 2, "scale_y": 2}
+    )
+    # 0 -> 350 degrees must go 10 degrees backwards, not 350 forwards.
+    middle = easing.decompose(easing.interpolate_matrix(start, end, 0.5))
+    assert abs(math.degrees(middle["rotation"]) + 5) < 1
+    # Scale must survive the middle of a half turn; a naive a,b,c,d blend
+    # collapses it to zero there.
+    half = easing.compose(
+        {"tx": 0, "ty": 0, "rotation": math.pi, "scale_x": 2, "scale_y": 2}
+    )
+    worst = min(
+        easing.decompose(easing.interpolate_matrix(start, half, i / 20))["scale_x"]
+        for i in range(21)
+    )
+    assert worst == pytest.approx(2.0, abs=0.01)
+    # Endpoints are returned untouched.
+    assert easing.interpolate_matrix(start, end, 0.0) == [float(v) for v in start]
+
+
+def test_keyframe_strip_shows_the_timeline(window):
+    w = window
+    w.add_doc(animatable_clip(6))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    strip = e.keyframes
+    assert strip.frame_count == 6
+    assert strip.current == 0
+    assert strip.row == 0
+    assert strip.keys == set()
+    # Clicking a frame moves the playhead without touching the document.
+    strip.framePicked.emit(3)
+    assert e.frame.value() == 3
+    assert strip.current == 3
+    assert e.placement_keys(e.obj) == []
+
+
+def test_set_and_delete_keypoint(window):
+    w = window
+    w.add_doc(animatable_clip(6))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    e.frame.setValue(2)
+    application().processEvents()
+
+    e.toggle_keypoint_at(2, 0)
+    assert e.placement_keys(e.obj) == [2]
+    assert 2 in e.keyframes.keys
+    # A second toggle on the same frame removes it again.
+    e.toggle_keypoint_at(2, 0)
+    assert e.placement_keys(e.obj) == []
+    # Frames without the placement are refused rather than crashing.
+    e.toggle_keypoint_at(99, 0)
+    assert e.placement_keys(e.obj) == []
+
+
+def test_keypoint_drag_moves_the_key(window):
+    w = window
+    w.add_doc(animatable_clip(6))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    e.frame.setValue(1)
+    application().processEvents()
+    e.toggle_keypoint_at(1, 0)
+    assert e.placement_keys(e.obj) == [1]
+    e.move_keypoint(1, 4)
+    assert e.placement_keys(e.obj) == [4]
+    assert "frame 5" in window.statusBar().currentMessage().lower()
+
+
+def test_bake_applies_the_curve_and_revert_restores_exactly(window):
+    w = window
+    w.add_doc(animatable_clip(6))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    e.frame.setValue(0)
+    application().processEvents()
+    e.toggle_keypoint_at(0, 0)
+
+    # Move the placement on the last frame and key it there.
+    clip = e.doc.resource(7)
+    clip["frames"][5]["elements"][0][1] = e.intern_matrix(clip, [1, 0, 0, 1, 100, 0])
+    e.doc.update("movieclips", clip)
+    e.go_to(7)
+    e.elements.selectRow(0)
+    e.frame.setValue(5)
+    application().processEvents()
+    keys_before = sorted(e.placement_keys(e.obj))
+    assert keys_before == [0, 5]
+
+    e.curve.setCurrentText("Ease out")
+    e.bake_tween()
+    baked = sorted(e.placement_keys(e.obj))
+    assert baked == [0, 1, 2, 3, 4, 5]
+    assert e.baked is not None and len(e.baked[2]) == 4
+
+    # Ease out front-loads the movement, so the middle must lead a straight line.
+    from sc_studio import easing
+
+    found = e.key_transforms(e.obj)
+    middle = easing.decompose(found[2][0])["tx"]
+    assert middle > 100 * 0.5
+
+    e.frame.setValue(0)
+    e.revert_tween()
+    assert sorted(e.placement_keys(e.obj)) == keys_before
+    assert e.baked is None
+
+
+def test_revert_refuses_without_a_recorded_bake(window):
+    """Hand-set keys must survive: a densely keyed clip looks baked."""
+    w = window
+    w.add_doc(animatable_clip(4))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    clip = e.doc.resource(7)
+    for index in range(4):
+        clip["frames"][index]["elements"][0][1] = e.intern_matrix(
+            clip, [1, 0, 0, 1, index * 10, 0]
+        )
+    e.doc.update("movieclips", clip)
+    e.go_to(7)  # direct doc.update bypasses the refresh the app does on an edit
+    e.elements.selectRow(0)
+    assert len(e.placement_keys(e.obj)) == 4
+    e.revert_tween()
+    # No bake was recorded, so every hand-set key is still there.
+    assert len(e.placement_keys(e.doc.resource(7))) == 4
+    assert "No baked tween recorded" in window.statusBar().currentMessage()
+
+
+def test_strip_survives_a_placement_absent_from_a_frame(window):
+    """Placements appear and disappear between frames in real files."""
+    w = window
+    d = animatable_clip(4)
+    clip = d.resource(7)
+    clip["frames"][2]["elements"] = []       # placement absent on frame 2
+    d.update("movieclips", clip)
+    w.add_doc(d)
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    e.frame.setValue(0)
+    application().processEvents()
+    e.toggle_keypoint_at(0, 0)
+    clip = e.doc.resource(7)
+    clip["frames"][3]["elements"][0][1] = e.intern_matrix(clip, [1, 0, 0, 1, 50, 0])
+    e.doc.update("movieclips", clip)
+    e.go_to(7)
+    e.elements.selectRow(0)
+    e.frame.setValue(3)
+    application().processEvents()
+    e.curve.setCurrentText("Linear")
+    e.bake_tween()                            # must skip frame 2, not crash
+    assert 2 not in e.placement_keys(e.obj)
+    assert e.doc.validate() == []

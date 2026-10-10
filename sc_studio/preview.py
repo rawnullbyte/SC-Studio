@@ -172,7 +172,8 @@ class AnimatorTimeline(QWidget):
     RULER_HEIGHT = 15
     TRACK_HEIGHT = 17
     EDGE = 5
-    MIN_TRACKS = 3
+    VISIBLE_TRACKS = 6
+    HEADROOM = 6  # frames drawn past the end of the clip
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -200,17 +201,25 @@ class AnimatorTimeline(QWidget):
         return max(1, self.width() - self.LABEL_WIDTH)
 
     def width_per_frame(self):
-        count = max(1, self.frame_count)
+        count = max(1, self.total_frames())
         return max(4.0, min(26.0, self.track_area() / count))
 
     def x_for(self, frame):
         step = self.width_per_frame()
         return self.LABEL_WIDTH + frame * step + step / 2
 
+    def total_frames(self):
+        """Frames drawn, which extends a little past the clip's end.
+
+        The cursor has to be able to sit beyond the last frame so a change made
+        there can extend the clip; it must not be pushed there by scrubbing.
+        """
+        return self.frame_count + (self.HEADROOM if self.frame_count else 0)
+
     def frame_at(self, x):
         step = self.width_per_frame()
         frame = int((x - self.LABEL_WIDTH) // step)
-        return max(0, min(frame, max(0, self.frame_count - 1)))
+        return max(0, min(frame, max(0, self.total_frames() - 1)))
 
     def raw_frame_at(self, x):
         """Unclamped frame under x, so a drag past the end can be detected."""
@@ -225,8 +234,16 @@ class AnimatorTimeline(QWidget):
         return self.RULER_HEIGHT + index * self.TRACK_HEIGHT
 
     def content_height(self):
-        rows = max(len(self.tracks), self.MIN_TRACKS)
-        return self.RULER_HEIGHT + rows * self.TRACK_HEIGHT + 2
+        """Height for the reserved band, independent of the current clip.
+
+        Deliberately constant: a widget that resized itself to fit its tracks
+        would re-flow the splitter every time the selection changed, which is
+        what made the panels jump when clicking the timeline.
+        """
+        return self.RULER_HEIGHT + self.VISIBLE_TRACKS * self.TRACK_HEIGHT + 2
+
+    def tracks_height(self):
+        return len(self.tracks) * self.TRACK_HEIGHT
 
     def selected_frames(self):
         """Selected frames, whether picked one by one or dragged as a range."""
@@ -259,15 +276,13 @@ class AnimatorTimeline(QWidget):
         self.current = max(0, min(current, max(0, self.frame_count - 1)))
         self.tracks = normalised
         self.row = row
-        wanted = self.content_height()
-        if self.height() != wanted:
-            self.setFixedHeight(wanted)
         if self.band is not None:
             low, high = sorted(self.band)
-            if low >= self.frame_count:
+            limit = max(0, self.total_frames() - 1)
+            if low > limit:
                 self.band = None
             else:
-                self.band = (low, min(high, max(0, self.frame_count - 1)))
+                self.band = (low, min(high, limit))
         self.update()
 
     def set_band(self, low, high):
@@ -376,7 +391,7 @@ class AnimatorTimeline(QWidget):
         while label_step * step < 38:
             label_step *= 5 if label_step % 2 else 2
         painter.setPen(muted)
-        for frame in range(0, self.frame_count, label_step):
+        for frame in range(0, self.total_frames(), label_step):
             x = self.LABEL_WIDTH + frame * step
             painter.drawLine(
                 QPointF(x, self.RULER_HEIGHT - 4), QPointF(x, self.RULER_HEIGHT)
@@ -389,6 +404,13 @@ class AnimatorTimeline(QWidget):
             QPointF(self.LABEL_WIDTH, self.RULER_HEIGHT),
             QPointF(self.width(), self.RULER_HEIGHT),
         )
+        # Mark where the clip currently ends, so the headroom beyond it is
+        # visibly not part of the animation yet.
+        end_x = self.LABEL_WIDTH + self.frame_count * step
+        pen = QPen(muted)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        painter.setPen(pen)
+        painter.drawLine(QPointF(end_x, 0), QPointF(end_x, self.height()))
 
         size = max(3.0, min(step / 2 - 1, 6.5))
         for index, track in enumerate(self.tracks):

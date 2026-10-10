@@ -294,6 +294,8 @@ class Editor(QWidget):
         self.play.setFixedHeight(self.play.sizeHint().height())
         self.play.setText("▶ Play")
         self.frame = QSlider(Qt.Orientation.Horizontal)
+        # Frames the cursor may reach past the end of the clip.
+        self.FRAME_HEADROOM = 8
         self.frame.setRange(0, 0)
         self.frame_label = QLabel("Frame 1 / 1")
         fit = QPushButton("Fit")
@@ -365,6 +367,8 @@ class Editor(QWidget):
         transform_row.addWidget(reload_button)
         self.animation_hint = QLabel("")
         transform_row.addWidget(self.animation_hint, 1)
+        self.curve_info = QLabel("")
+        controls_row.addWidget(self.curve_info, 1)
         animator_layout.addLayout(transform_row)
         cv.addWidget(animator)
         self.keyframes.framePicked.connect(self.goto_frame)
@@ -1113,7 +1117,12 @@ class Editor(QWidget):
             count = len(obj["frames"]) if kind == "movieclips" else 1
             self.play.setEnabled(kind == "movieclips" and count > 1)
             self.frame.setEnabled(kind == "movieclips" and count > 1)
-            self.frame.setRange(0, max(0, count - 1))
+            # The cursor may sit a little past the last frame: changing
+            # something there is what extends the clip, and scrubbing must be
+            # able to reach it without creating anything on its own.
+            self.frame.setRange(
+                0, max(0, count - 1) + (self.FRAME_HEADROOM if count else 0)
+            )
             self.frame.setValue(min(old_frame, self.frame.maximum()))
             if kind == "movieclips":
                 fill_table(
@@ -1217,7 +1226,9 @@ class Editor(QWidget):
         # wall-clock time made a slow frame (a heavy clip, or a large document)
         # drop the animation forward by dozens of frames, so the rate is now set
         # by the timer and rendering latency can only slow playback, not skip it.
-        self.frame.setValue((self.frame.value() + 1) % (self.frame.maximum() + 1))
+        last = max(0, len(self.obj.get("frames") or []) - 1)
+        # Playback loops over the clip itself, never into the headroom.
+        self.frame.setValue((self.frame.value() + 1) % (last + 1))
 
     def toggle_play(self):
         if self.timer.isActive():
@@ -1392,43 +1403,51 @@ class Editor(QWidget):
         self.frame.setValue(max(0, min(index, maximum)))
 
     def keyframe_selection_changed(self):
-        """Keep the tween controls in step with the strip's selected range."""
-        frames = self.keyframes.selected_frames()
-        if frames:
-            self.bake_button.setText(f"Apply curve to {len(frames)} frames")
+        """Keep the tween button in step with the selected keys."""
+        keys = self.selected_key_frames()
+        if keys:
+            self.bake_button.setText(
+                f"Curve between {len(keys)} key{'s' if len(keys) != 1 else ''}"
+            )
         else:
-            self.bake_button.setText("Apply curve to range")
-        self.update_curve_info(frames)
+            self.bake_button.setText("Curve between all keys")
+        self.update_curve_info()
 
-    def update_curve_info(self, frames=None):
+    def selected_key_frames(self):
+        """Frames of the keypoints selected on the current track."""
+        row = self.placement_row()
+        return sorted(
+            frame
+            for frame, chosen_row in self.keyframes.selected_keys()
+            if chosen_row == row
+        )
+
+    def update_curve_info(self):
         """Describe what applying the curve would affect, next to the button."""
         if not self.animatable():
-            self.animation_hint.setText("Select a movieclip placement to tween it.")
+            self.curve_info.setText("Select a keypoint or a placement to tween.")
             return
         keys = self.placement_keys(self.obj)
         if len(keys) < 2:
-            self.animation_hint.setText(
+            self.curve_info.setText(
                 "Set a keyframe on another frame to tween between them."
             )
             return
-        if frames is None:
-            frames = self.keyframes.selected_frames()
-        low, high = min(keys), max(keys)
+        chosen = self.selected_key_frames()
+        span_keys = chosen if len(chosen) >= 2 else sorted(keys)
         dense = self.key_density.value()
-        if frames:
-            inside = [k for k in keys if frames[0] <= k <= frames[-1]]
-            if len(inside) >= 2:
-                low, high = inside[0], inside[-1]
-            scope = f"selected frames {frames[0] + 1}-{frames[-1] + 1}"
-        else:
-            scope = "the whole clip"
+        low, high = span_keys[0], span_keys[-1]
         span = high - low
         step = max(1, round(span / dense)) if dense else 1
         estimate = max(0, span // step) if span else 0
-        self.animation_hint.setText(
-            f"{len(keys)} keys. Applying '{self.curve.currentText()}' to {scope} "
-            f"writes about {estimate} frames between {low + 1} and {high + 1}, "
-            f"keeping your keys."
+        scope = (
+            f"the {len(chosen)} keys you picked"
+            if len(chosen) >= 2
+            else f"all {len(keys)} keys"
+        )
+        self.curve_info.setText(
+            f"Curve '{self.curve.currentText()}' between {scope} writes about "
+            f"{estimate} frames across {low + 1}-{high + 1}."
         )
 
     def selected_key_range(self):
@@ -1442,11 +1461,12 @@ class Editor(QWidget):
         return sorted(keys)
 
     def apply_curve_to_range(self):
-        """Bake the chosen curve across the selected range, at the chosen density.
+        """Fill the gaps between the selected keys with the chosen curve.
 
-        The selected range may span the whole clip, one gap between two keys, or
-        nothing at all; the endpoints come from the keys that bound it and the
-        intermediate keys the author already set are preserved.
+        The selection is the keys themselves, not a range of frames: pick two
+        keys and everything between them is tweened, pick several and each gap
+        between them is filled. The keys are kept exactly and only the frames
+        between them are written, at the interval "Keys to create" asks for.
         """
         if not self.animatable() or not self.resolve_drafts():
             return
@@ -1458,53 +1478,48 @@ class Editor(QWidget):
                 "Set at least two keyframes to tween between", 5000
             )
             return
-        frames = self.keyframes.selected_frames()
-        if frames:
-            inside = [k for k in sorted(found) if frames[0] <= k <= frames[-1]]
-            if len(inside) < 2:
-                self.window().statusBar().showMessage(
-                    "Select a range containing at least two keyframes", 5000
-                )
-                return
-            low, high = inside[0], inside[-1]
-        else:
-            low, high = min(found), max(found)
-            inside = [k for k in sorted(found) if low <= k <= high]
-        if high - low < 2:
+        chosen = sorted(
+            key for key in self.keyframes.selected_keys() if key[0] in found
+        )
+        # Keys selected on this track; fall back to the whole key set when
+        # nothing has been picked, which is the usual "tween it all" case.
+        frames = sorted({frame for frame, chosen_row in chosen if chosen_row == row})
+        if len(frames) < 2:
+            frames = sorted(found)
+        if len(frames) < 2:
             self.window().statusBar().showMessage(
-                "The selected keyframes are on adjacent frames", 5000
+                "Select at least two keys to tween between", 5000
             )
             return
 
         points = easing.curve_for(self.curve.currentText())
         wanted = self.key_density.value()
         written = set()
-        for start, end in zip(inside, inside[1:]):
-            span = end - start
+        for start_frame, end_frame in zip(frames, frames[1:]):
+            span = end_frame - start_frame
             if span < 2:
                 continue
-            # The first and last key are kept exactly; only the frames between
-            # them are written, at the interval the density asks for.
             step = max(1, round(span / wanted)) if wanted else 1
             offset = 1
             while offset < span:
-                index = start + offset
-                if index < end and index < len(clip["frames"]):
+                index = start_frame + offset
+                if index < end_frame and index < len(clip["frames"]):
                     if row < len(clip["frames"][index]["elements"]):
                         progress = offset / span
                         eased = easing.bezier(progress, *points)
-                        element = clip["frames"][index]["elements"][row]
-                        element[1] = self.intern_matrix(
-                            clip,
-                            easing.interpolate_matrix(
-                                found[start][0], found[end][0], eased
-                            ),
+                        clip["frames"][index]["elements"][row][1] = (
+                            self.intern_matrix(
+                                clip,
+                                easing.interpolate_matrix(
+                                    found[start_frame][0], found[end_frame][0], eased
+                                ),
+                            )
                         )
                         written.add(index)
                 offset += step
         if not written:
             self.window().statusBar().showMessage(
-                "No frames in the selection needed filling", 5000
+                "No frames between the selected keys needed filling", 5000
             )
             return
         if self.mutate(lambda: self.bake_and_compact(clip, row)):
@@ -1512,11 +1527,11 @@ class Editor(QWidget):
             self.refresh()
             self.elements.selectRow(row)
             self.window().statusBar().showMessage(
-                f"Applied '{self.curve.currentText()}' to {len(written)} frames"
-                f" ({low + 1}-{high + 1}), keeping {len(inside)} keys",
+                f"Applied '{self.curve.currentText()}' between {len(frames)} keys, "
+                f"writing {len(written)} frames "
+                f"({frames[0] + 1}-{frames[-1] + 1})",
                 6000,
             )
-
     def keypoint_context_menu(self, index, row, position):
         """Actions for one keyframe, on the track it was clicked on."""
         if self.elements.currentRow() != row:
@@ -1779,8 +1794,6 @@ class Editor(QWidget):
             "Scale X": parts["scale_x"],
             "Scale Y": parts["scale_y"],
         }
-        with QSignalBlocker(self.key_fields["X"]):
-            pass
         for name, value in values.items():
             with QSignalBlocker(self.key_fields[name]):
                 self.key_fields[name].setValue(value)

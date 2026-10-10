@@ -550,7 +550,8 @@ def test_playback_advances_one_frame_per_tick(window):
     assert e.frame.maximum() >= 1
     e.toggle_play()
     e.timer.stop()  # advance by hand, so only tick() moves the frame
-    count = e.frame.maximum() + 1
+    # Playback loops over the clip itself, not the cursor's headroom.
+    count = len(e.obj["frames"])
     seen = []
     for _ in range(count * 2):
         e.tick()
@@ -1924,3 +1925,58 @@ def test_camera_stays_free_of_the_artwork_bounds(window):
     assert len(set(seen)) == 1, f"camera followed the artwork: {seen}"
     # The scrollable area is wider than the content, which is what frees it.
     assert e.preview.scene().sceneRect().contains(e.preview.content_rect)
+
+
+def test_apply_curve_uses_selected_keys_not_frame_range(window):
+    """The button acts on picked keys; it must not blame a frame range."""
+    w = window
+    w.add_doc(animatable_clip(12))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    key_at(e, 0, 0.0)
+    key_at(e, 5, 100.0)
+    key_at(e, 10, 200.0)
+    assert e.keyframes.keys_of(0) == {0, 5, 10}
+
+    # Shift picks a range of keys: 0 through 5.
+    e.keyframes.set_band(0, 5)
+    e.keyframes.picked_keys = {(0, 0), (5, 0)}
+    e.keyframe_selection_changed()
+    assert "2 keys" in e.bake_button.text()
+    assert "2 keys you picked" in e.curve_info.text()
+
+    e.key_density.setValue(6)
+    e.curve.setCurrentText("Ease in-out")
+    e.apply_curve_to_range()
+    keys = sorted(e.placement_keys(e.obj))
+    # Only the gap between the picked keys is filled; key 10 is left alone.
+    assert keys[0] == 0 and 5 in keys and 10 in keys
+    assert all(k <= 5 or k == 10 for k in keys), keys
+    assert len(keys) > 3
+    assert e.doc.validate() == []
+    # Undo curve removes only what the curve wrote.
+    e.revert_tween()
+    assert sorted(e.placement_keys(e.obj)) == [0, 5, 10]
+
+
+def test_cursor_can_sit_past_the_last_frame(window):
+    """The playhead reaches beyond the clip so a change there can extend it."""
+    w = window
+    w.add_doc(animatable_clip(5))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    strip = e.keyframes
+    assert strip.frame_count == 5
+    # The timeline draws headroom past the end, and reports it separately.
+    assert strip.total_frames() > strip.frame_count
+    far = strip.frame_at(strip.x_for(9))
+    assert far > 4, "the cursor cannot reach past the last frame"
+    # Simply moving there changes nothing.
+    frames = len(e.obj["frames"])
+    e.goto_frame(far)
+    assert e.frame.value() == far
+    assert len(e.obj["frames"]) == frames

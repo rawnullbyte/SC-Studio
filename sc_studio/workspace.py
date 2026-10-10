@@ -12,18 +12,30 @@ from .document import Document
 CLIP_MIME = "application/x-sc-studio-resource-graph"
 
 
+def apply_style(app, name):
+    """Switch the application style only when it is actually different.
+
+    QApplication.setStyle() re-polishes every live widget, and doing that
+    repeatedly while widgets exist is not something Qt supports -- it has been
+    observed to segfault. Re-applying the style already in use is pure work in
+    any case, so skip it.
+    """
+    if app.style().objectName().casefold() != name.casefold():
+        app.setStyle(name)
+
+
 def configure_theme(app, mode, system_palette, scheme=None):
     if not hasattr(app, "_sc_system_style"):
         app._sc_system_style = app.style().objectName()
     app.setStyleSheet("")
     if mode == "system":
-        app.setStyle(app._sc_system_style)
+        apply_style(app, app._sc_system_style)
         scheme = scheme if scheme is not None else app.styleHints().colorScheme()
         if scheme == Qt.ColorScheme.Unknown:
             app.setPalette(system_palette)
             return
         mode = "dark" if scheme == Qt.ColorScheme.Dark else "light"
-    app.setStyle("Fusion")
+    apply_style(app, "Fusion")
     p = app.style().standardPalette()
     dark = mode == "dark"
     colors = {

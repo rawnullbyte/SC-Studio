@@ -114,10 +114,18 @@ def compose(parts):
 
 
 def interpolate_matrix(start, end, t):
-    """Blend two affine matrices at ``t`` in 0..1."""
-    if t <= 0.0:
+    """Blend two affine matrices at ``t``.
+
+    ``t`` runs from 0 to 1 in the ordinary case, but an easing curve is allowed
+    to leave that range and this follows it: interpolating is an extrapolation
+    past the ends, so an overshooting curve really goes beyond the second key
+    and an anticipating one pulls back behind the first. Clamping here instead
+    flattened every frame past the peak onto the end value, which read as the
+    curve having thrown those frames away.
+    """
+    if t == 0.0:
         return [float(v) for v in start]
-    if t >= 1.0:
+    if t == 1.0:
         return [float(v) for v in end]
     a, b = decompose(start), decompose(end)
     # Take the shorter way round, so a 350 degrees turn goes 20 degrees back

@@ -545,18 +545,24 @@ def drag_view(p, start, end):
 def test_the_camera_pans_freely_past_the_artwork_and_stays_there(window):
     d, e = single_sprite(window)
     p = e.preview
+    # Panning does not zoom, and a view scrolls by whole device pixels, so the
+    # camera owes the same distance for every identical drag. The first drag is
+    # spent establishing that step, then every later one must match it: a scene
+    # rect sized to the artwork would swallow the later drags and the step would
+    # shrink instead.
+    p.fit_content()
+    application().processEvents()
     start = p.mapToScene(p.viewport().rect()).boundingRect().center()
-    scale = p.transform().m11()
-    # Panning does not zoom, so every drag owes exactly this much movement.
-    step = (390.0 / scale, 330.0 / scale)
-    for _ in range(6):
+    drag_view(p, (10, 10), (400, 340))
+    step = p.mapToScene(p.viewport().rect()).boundingRect().center() - start
+    assert step.manhattanLength() > 50, "the camera did not move at all"
+    for _ in range(5):
+        before = p.mapToScene(p.viewport().rect()).boundingRect().center()
         drag_view(p, (10, 10), (400, 340))
-    moved = p.mapToScene(p.viewport().rect()).boundingRect().center() - start
-    # Qt clamps the view to the scene rect, so a rect sized to the artwork
-    # would swallow the later drags instead of moving the camera by the full
-    # distance each one asks for.
-    assert abs(moved.x()) == pytest.approx(step[0] * 6, rel=0.05)
-    assert abs(moved.y()) == pytest.approx(step[1] * 6, rel=0.05)
+        after = p.mapToScene(p.viewport().rect()).boundingRect().center()
+        moved = after - before
+        assert abs(moved.x()) == pytest.approx(abs(step.x()), abs=0.5)
+        assert abs(moved.y()) == pytest.approx(abs(step.y()), abs=0.5)
     # The scene rect is put back after each drag, so the camera is not bounced
     # towards the middle of the artwork while the button is still down.
     assert p.scene().sceneRect() == p.view_rect
@@ -1630,8 +1636,14 @@ def test_revert_refuses_without_a_recorded_bake(window):
     assert "No baked tween recorded" in window.statusBar().currentMessage()
 
 
-def test_strip_survives_a_placement_absent_from_a_frame(window):
-    """Placements appear and disappear between frames in real files."""
+def test_a_placement_absent_from_a_gap_is_filled_to_tween_across_it(window):
+    """Placements appear and disappear between frames in real files.
+
+    A frame that lists fewer placements still draws the ones it inherits from
+    the frame before, so a gap in the middle of a tween is filled rather than
+    skipped: skipping it used to write nothing and then report that the gap was
+    already filled.
+    """
     w = window
     d = animatable_clip(4)
     clip = d.resource(7)
@@ -1652,8 +1664,15 @@ def test_strip_survives_a_placement_absent_from_a_frame(window):
     e.frame.setValue(3)
     application().processEvents()
     e.curve.setCurrentText("Linear")
-    e.bake_tween()                            # must skip frame 2, not crash
-    assert 2 not in e.placement_keys(e.obj)
+    e.bake_tween()                            # must not crash
+    assert 2 in e.placement_keys(e.obj)
+    # The frame gains the placement, and it is the child the row names.
+    gap = e.obj["frames"][2]["elements"]
+    assert len(gap) == 1
+    assert gap[0][0] == e.obj["frames"][0]["elements"][0][0]
+    assert e.doc.validate() == []
+    # Reverting clears the frames the curve wrote but leaves the clip valid.
+    e.revert_tween()
     assert e.doc.validate() == []
 
 
@@ -2401,7 +2420,7 @@ def test_a_key_cannot_be_dropped_onto_another_key(window):
     assert tween_x(e) == before
 
 
-def test_adjacent_keys_report_why_nothing_can_be_tweened(window):
+def test_keys_with_no_gap_say_there_is_nothing_to_tween(window):
     """Two keys side by side have no gap, which is not "already filled"."""
     w = window
     w.add_doc(animatable_clip(8))
@@ -2416,7 +2435,7 @@ def test_adjacent_keys_report_why_nothing_can_be_tweened(window):
     e.apply_curve_to_range()
     application().processEvents()
     message = window.statusBar().currentMessage()
-    assert "adjacent" in message, message
+    assert "no frames to tween" in message, message
 
 
 def test_reapplying_a_curve_says_the_gaps_are_already_filled(window):
@@ -2576,3 +2595,112 @@ def test_frame_elements_report_what_was_added(window):
     # read its length from the file's descriptor instead of the decoded list.
     assert len(clip["frames"][0]["elements"]) == original + 1
     assert len(list(clip["frames"][0]["elements"])) == original + 1
+
+
+def test_an_overlapping_curve_really_goes_past_the_end_key(window):
+    """Overshoot must pass the second key, not flatten onto it.
+
+    Clamping the blend at the ends made every frame past the peak identical to
+    the end key, so the curve looked like it had thrown those frames away: they
+    carry a value, but nothing changes and they stop reading as keys.
+    """
+    w = window
+    w.add_doc(animatable_clip(12))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    key_at(e, 0, 0.0)
+    key_at(e, 10, 100.0)
+    e.keyframes.picked_keys = {(0, 0), (10, 0)}
+    e.keyframe_selection_changed()
+    e.key_density.setValue(10)
+    e.curve.setCurrentText("Overshoot")
+    e.apply_curve_to_range()
+    application().processEvents()
+    values = [v for v in tween_x(e)[:11] if v is not None]
+    assert max(values) > 100.0, f"overshoot never passed the end value: {values}"
+    assert values[0] == 0.0 and values[10] == 100.0
+    # Every frame the curve wrote is still a key, including the end of the run.
+    assert e.keys_on_row(e.obj, 0) == list(range(11))
+
+
+def test_an_anticipating_curve_pulls_back_before_the_first_key(window):
+    """Anticipate goes behind the start value, the mirror of overshoot."""
+    w = window
+    w.add_doc(animatable_clip(12))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    key_at(e, 0, 0.0)
+    key_at(e, 10, 100.0)
+    e.keyframes.picked_keys = {(0, 0), (10, 0)}
+    e.keyframe_selection_changed()
+    e.key_density.setValue(10)
+    e.curve.setCurrentText("Anticipate")
+    e.apply_curve_to_range()
+    application().processEvents()
+    values = [v for v in tween_x(e)[:11] if v is not None]
+    assert min(values) < 0.0, f"anticipate never went behind the start: {values}"
+    assert values[0] == 0.0 and values[10] == 100.0
+    assert e.keys_on_row(e.obj, 0) == list(range(11))
+
+
+def test_a_plain_curve_holds_both_keys_so_they_stay_visible(window):
+    """A curve's own end frames keep every authored key readable on the strip."""
+    w = window
+    w.add_doc(animatable_clip(20))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    key_at(e, 0, 0.0)
+    key_at(e, 19, 190.0)
+    e.keyframes.picked_keys = {(0, 0), (19, 0)}
+    e.keyframe_selection_changed()
+    e.key_density.setValue(6)
+    e.curve.setCurrentText("Ease in-out")
+    e.apply_curve_to_range()
+    application().processEvents()
+    # Both keys are still shown as keys after the curve is applied over them.
+    keys = e.keys_on_row(e.obj, 0)
+    assert 0 in keys and 19 in keys
+
+
+def test_frames_added_by_extending_do_not_become_keys(window):
+    """Grown frames inherit, so only the keys that were set are keys.
+
+    The added frames used to copy the last frame outright, key reference
+    included, so a clip grown out to frame thirty read as thirty keys and the
+    frames between the two the author set could not be tweened.
+    """
+    w = window
+    w.add_doc(animatable_clip(1))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    key_at(e, 0, 0.0)
+    # Walk the cursor out and key the far end, which grows the clip.
+    e.goto_frame(30)
+    application().processEvents()
+    e.key_fields["X"].setValue(290.0)
+    e.apply_animation_fields()
+    application().processEvents()
+    assert len(e.obj["frames"]) == 31
+    # Two real keys, not thirty: everything between them inherits.
+    assert e.placement_keys(e.obj) == [0, 30]
+    assert e.keys_on_row(e.obj, 0) == [0, 30]
+    # And the pose still holds through the grown frames rather than going flat.
+    e.keyframes.picked_keys = {(0, 0), (29, 0)}
+    e.keyframe_selection_changed()
+    e.key_density.setValue(6)
+    e.curve.setCurrentText("Linear")
+    e.apply_curve_to_range()
+    application().processEvents()
+    values = tween_x(e)
+    assert values[0] == 0.0 and values[30] == 290.0
+    assert values[6] > values[1] > 0.0
+    bounds = rendered_x(e, (0, 10, 20, 30))
+    assert bounds[0] < bounds[1] < bounds[2] < bounds[3]

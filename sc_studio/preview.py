@@ -328,6 +328,25 @@ class AnimatorTimeline(QWidget):
         """Keypoints selected directly, as (frame, row) pairs."""
         return set(self.picked_keys)
 
+    def key_block(self, anchor, target):
+        """Every key in the block between two keys, across frames and tracks.
+
+        A block rather than a single row: shift-clicking from one key to
+        another picks everything between them whatever track it is on, which is
+        how a whole run of keys is taken in one gesture on a multi-track
+        timeline. Anchoring on one frame and reaching another on the same frame
+        takes the tracks between them instead.
+        """
+        low_row, high_row = sorted((anchor[1], target[1]))
+        low_frame, high_frame = sorted((anchor[0], target[0]))
+        return {
+            (frame, track["row"])
+            for track in self.tracks
+            if low_row <= track["row"] <= high_row
+            for frame in track["keys"]
+            if low_frame <= frame <= high_frame
+        }
+
     def pick_frame(self, frame, modifiers):
         """Shift extends a range from the anchor; ctrl toggles one frame."""
         shift = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
@@ -531,28 +550,27 @@ class AnimatorTimeline(QWidget):
         if track is not None:
             self.trackPicked.emit(track["row"])
         frame = self.frame_at(x)
-        # The playhead line takes precedence over the keys it runs through: it
-        # is stroked down the whole widget, so grabbing a key by the few pixels
-        # of that line is a mis-click, not a selection. Scrubbing it moves only
-        # the cursor, never a key.
-        # The ruler belongs to the playhead. It has no track of its own, so the row
-        # under it answers for a track and would hand back the key sitting at
-        # that frame: dragging the ruler would move a key instead of the cursor.
-        # A key is only grabbable on a track row, never from the ruler.
-        on_playhead = self._on_playhead(x) or y < self.RULER_HEIGHT
-        if not on_playhead:
-            # A key is the only thing a plain drag grabs; everywhere else the
-            # cursor moves freely, across the tracks as well as the ruler. Ctrl
-            # and shift apply to keys when a key was hit, and to frame ranges
-            # otherwise.
-            if track is None or frame not in track["keys"]:
-                if shift_or_ctrl:
-                    # Shift extends a range from the last frame touched, ctrl
-                    # toggles a single frame.
-                    self.pick_frame(frame, modifiers)
-                    self.framePicked.emit(frame)
-                    return
-        if not on_playhead and track is not None and frame in track["keys"]:
+        # The playhead line wins over anything under it, on the ruler as much as
+        # on a track: it is stroked down the whole widget, so that is what a
+        # press on it means. Everywhere else the ruler is for frames and the
+        # tracks are for keys, so the row under the ruler does not answer for
+        # keys on the ruler's behalf.
+        on_playhead = self._on_playhead(x)
+        on_track = track is not None and y >= self.RULER_HEIGHT
+        # What a modifier augments is decided by where the eye is, not by where
+        # the pointer happened to land: with keys selected, shift and click take
+        # a block of keys, and with none selected they take a run of frames. A
+        # pointer-based rule made a shift-click on a key's own pixel pick frames
+        # instead, which is what stopped keys being mass-selected.
+        picking_keys = on_track or bool(self.picked_keys)
+        if not on_playhead and not picking_keys:
+            # A press on the ruler is about frames: shift extends a range from
+            # the last frame touched and ctrl toggles one, which is what marks
+            # frames 2 through 6.
+            self.pick_frame(frame, modifiers)
+            self.framePicked.emit(frame)
+            return
+        if not on_playhead and on_track and frame in track["keys"]:
             # Clicking a key selects that keypoint, which is a finer selection
             # than a frame range. Ctrl adds or removes one, shift extends from
             # the last key touched, and a plain click replaces the selection.
@@ -565,7 +583,10 @@ class AnimatorTimeline(QWidget):
                 else:
                     self.picked_keys.add(key)
             elif modifiers & Qt.KeyboardModifier.ShiftModifier:
-                self.picked_keys.add(key)
+                # Shift takes the whole block from the last key touched to this
+                # one, on every track it spans, and adds it to the selection.
+                anchor = self.key_anchor or key
+                self.picked_keys |= self.key_block(anchor, key)
             elif key not in self.picked_keys:
                 # Clicking a key that is not already picked selects just it.
                 # Clicking one that is part of a picked set keeps the whole set,
@@ -579,11 +600,17 @@ class AnimatorTimeline(QWidget):
             self.update()
             self.framePicked.emit(frame)
             return
-        # A plain click also selects just that frame, which gives shift and ctrl
-        # an anchor to extend from. Scrubbing still moves the cursor freely.
+        # Clicking a track between its keys scrubs, and leaves any selected keys
+        # alone: building up a run of keys across a row should not be undone by
+        # a click on the empty space next to them. Pressing on the ruler is what
+        # clears the key selection and starts a fresh frame range instead.
         self.scrubbing = True
-        self.picked = {frame}
-        self.picked_keys = set()
+        if y < self.RULER_HEIGHT:
+            self.picked = {frame}
+            self.picked_keys = set()
+            self.key_anchor = None
+        else:
+            self.picked = set()
         self.anchor = frame
         self.band = None
         self.selectionChanged.emit()
@@ -628,13 +655,11 @@ class AnimatorTimeline(QWidget):
         self.unsetCursor()
 
     def mouseDoubleClickEvent(self, event):
-        if not self.frame_count or event.position().y() < self.RULER_HEIGHT:
-            return
-        index = self.track_at(event.position().y())
-        if index < len(self.tracks):
-            self.keyToggled.emit(
-                self.frame_at(event.position().x()), self.tracks[index]["row"]
-            )
+        # A double click does nothing here on purpose: it was toggling a key,
+        # which reads as "double clicking a frame deleted it" when the first
+        # click of the pair had already selected that frame. Keys are added and
+        # removed from the context menu, or by typing a value into the fields.
+        event.ignore()
 
     def wheelEvent(self, event):
         event.ignore()

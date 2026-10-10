@@ -361,21 +361,17 @@ class Editor(QWidget):
             transform_row.addWidget(QLabel(name))
             box = QDoubleSpinBox()
             box.setDecimals(2)
-            box.setRange(-3600.0, 3600.0)
+            box.setRange(-1e6, 1e6)
             box.setValue(0.0 if name in ("X", "Y", "Rotation") else 1.0)
             box.setMinimumWidth(70)
+            # Enter writes the value straight onto the selected placement, so
+            # there is no separate button to press after typing one in. Editing
+            # a field and then clicking the canvas would otherwise discard it,
+            # which is what "I entered -176.55 and nothing changed" was.
+            box.setKeyboardTracking(False)
+            box.editingFinished.connect(self.apply_animation_fields)
             transform_row.addWidget(box)
             self.key_fields[name] = box
-        self.apply_animation_button = QPushButton("Key transform")
-        self.apply_animation_button.setToolTip(
-            "Write these values as a keyframe on the current frame"
-        )
-        self.apply_animation_button.clicked.connect(self.apply_animation_fields)
-        transform_row.addWidget(self.apply_animation_button)
-        reload_button = QPushButton("Reload")
-        reload_button.setToolTip("Read the values back from the current frame")
-        reload_button.clicked.connect(self.load_animation_fields)
-        transform_row.addWidget(reload_button)
         self.animation_hint = QLabel("")
         transform_row.addWidget(self.animation_hint, 1)
         self.curve_info = QLabel("")
@@ -1436,7 +1432,16 @@ class Editor(QWidget):
             clip["frames"].append(
                 {
                     "label": "",
-                    "elements": [list(e) for e in template.get("elements", [])],
+                    # The child each frame draws, but not the transform it was
+                    # drawn with: a copied key reference would make every added
+                    # frame a key in its own right, so a clip grown out to frame
+                    # thirty would read as thirty keys that nothing ever set.
+                    # Leaving the transform unset makes the frames inherit, so
+                    # the timeline sees two keys and the tween has room to fill
+                    # the frames between them.
+                    "elements": [
+                        [e[0], 65535, 65535] for e in template.get("elements", [])
+                    ],
                 }
             )
         if update:
@@ -1517,12 +1522,6 @@ class Editor(QWidget):
             if len(chosen) >= 2
             else f"all {len(keys)} keys"
         )
-        if not gaps:
-            self.curve_info.setText(
-                f"The {len(span_keys)} keys are on adjacent frames, so there is "
-                "no room to tween between them."
-            )
-            return
         self.curve_info.setText(
             f"Curve '{self.curve.currentText()}' between {scope} writes "
             f"{estimate} frame{'' if estimate == 1 else 's'} across "
@@ -1594,24 +1593,41 @@ class Editor(QWidget):
             while offset < span:
                 index = start_frame + offset
                 if index < end_frame and index < len(clip["frames"]):
-                    if row < len(clip["frames"][index]["elements"]):
-                        progress = offset / span
-                        eased = easing.bezier(progress, *points)
-                        element = clip["frames"][index]["elements"][row]
-                        key = self.intern_matrix(
-                            clip,
-                            easing.interpolate_matrix(
-                                found[start_frame][0], found[end_frame][0], eased
-                            ),
+                    # A placement can be missing from the frames in between even
+                    # though it is keyed on both sides: the frames between two
+                    # keys hold whatever the frame before them held, and that
+                    # may be nothing at all. The frame is given the placement
+                    # here so the tween has something to draw, which is the only
+                    # way a curve can be authored across such a gap.
+                    if not self.ensure_placement(clip, index, row):
+                        self.window().statusBar().showMessage(
+                            f"Frame {index + 1} has no child to place, so the "
+                            "tween stops there",
+                            5000,
                         )
-                        if index not in keys:
-                            written.add(index)
-                        element[1] = key
+                        break
+                    if index in keys:
+                        # A key the author set between the two ends is left
+                        # exactly as it is. Writing the curve's value over it
+                        # would replace that pose, and where the curve has
+                        # flattened the frame would stop reading as a key at
+                        # all, which looked like the curve deleting keys.
+                        offset += step
+                        continue
+                    progress = offset / span
+                    eased = easing.bezier(progress, *points)
+                    element = clip["frames"][index]["elements"][row]
+                    element[1] = self.intern_matrix(
+                        clip,
+                        easing.interpolate_matrix(
+                            found[start_frame][0], found[end_frame][0], eased
+                        ),
+                    )
+                    written.add(index)
                 offset += step
         if not gaps:
             self.window().statusBar().showMessage(
-                f"{len(frames)} keys selected, but they are on adjacent frames: "
-                "pick keys with frames between them to tween",
+                f"{len(frames)} keys selected, with no frames to tween between",
                 6000,
             )
             return
@@ -1747,6 +1763,12 @@ class Editor(QWidget):
             return False
         picked = self.keyframes.selected_keys()
         if not picked:
+            # Nothing keyed is picked, so the frames themselves are what the
+            # selection means: a range marked out on the ruler deletes those
+            # frames, which is how a stretch of the timeline is taken out.
+            frames = self.keyframes.selected_frames()
+            if frames:
+                return self.remove_frames(frames)
             return False
         clip = self.doc.resource(self.selected)
         removed = 0
@@ -1770,6 +1792,45 @@ class Editor(QWidget):
                 f"Removed {removed} key{'s' if removed != 1 else ''}", 4000
             )
         return True
+
+    def remove_frames(self, indexes):
+        """Delete a set of frames at once, keeping at least one.
+
+        Every frame the clip must keep is kept, so selecting the whole timeline
+        empties it down to a single frame rather than leaving a clip with none.
+        """
+        clip = self.doc.resource(self.selected)
+        targets = sorted(
+            {i for i in indexes if 0 <= i < len(clip["frames"])}, reverse=True
+        )
+        asked = len(targets)
+        # The selection cannot take the clip below one frame; the lowest of the
+        # overlapping frames are the ones given up.
+        while targets and len(targets) >= len(clip["frames"]):
+            targets = targets[1:]
+        if not targets:
+            self.window().statusBar().showMessage(
+                "A movieclip must keep at least one frame"
+                if asked
+                else "No frames selected",
+                4000,
+            )
+            return False
+
+        def change():
+            for index in targets:
+                clip["frames"].pop(index)
+
+        if self.mutate(lambda: (change(), self.doc.update("movieclips", clip))[1]):
+            self.keyframes.clear_band()
+            self.refresh()
+            self.goto_frame(min(targets[0], len(clip["frames"]) - 1))
+            self.window().statusBar().showMessage(
+                f"Removed {len(targets)} frame{'s' if len(targets) != 1 else ''}",
+                4000,
+            )
+            return True
+        return False
 
     def add_frame_at(self, index, duplicate):
         """Insert a frame after ``index``, keeping the playhead on the original."""
@@ -1934,6 +1995,38 @@ class Editor(QWidget):
             return {"matrices": [], "colors": []}
         return self.doc.bank(index)
 
+    def ensure_placement(self, clip, index, row):
+        """Give a frame a placement for ``row``, inserting it if it is missing.
+
+        The frames of a movieclip each list the placements they draw, and a
+        frame may list fewer than its neighbours. Inserting the child at the
+        same row keeps the row numbering every other frame uses, so the frames
+        gain the placement rather than the whole clip being renumbered.
+        """
+        if not 0 <= index < len(clip["frames"]):
+            return False
+        elements = clip["frames"][index]["elements"]
+        if row < len(elements):
+            return True
+        # Which child the row slot belongs to is taken from the nearest earlier
+        # frame that has it, so the frame is given the placement it is missing
+        # rather than a different one. Failing that, the child with that index
+        # is used, and a clip with no such child cannot be filled at all.
+        child = None
+        for earlier in range(min(index, len(clip["frames"]) - 1), -1, -1):
+            occupied = clip["frames"][earlier]["elements"]
+            if row < len(occupied):
+                child = occupied[row][0]
+                break
+        if child is None:
+            children = clip.get("children") or []
+            if row >= len(children):
+                return False
+            child = row
+        while len(elements) <= row:
+            elements.append([child, 65535, 65535])
+        return True
+
     def key_transforms(self, clip):
         """Matrix and colour per keyed frame, for the selected placement."""
         bank = self.clip_bank(clip)
@@ -1960,7 +2053,6 @@ class Editor(QWidget):
         enabled = self.animatable()
         for box in self.key_fields.values():
             box.setEnabled(enabled)
-        self.apply_animation_button.setEnabled(enabled)
         if not enabled:
             self.animation_hint.setText(
                 "Select a movieclip placement to animate it."

@@ -62,9 +62,11 @@ def create_server(connection):
         return call("references", document_id=document_id, resource_id=resource_id)
 
     @server.tool()
-    def atlas_regions(atlas_index: int, document_id: str | None = None) -> list[dict]:
-        """List shapes and their UV rectangles within an atlas; overlapping regions remain separate."""
-        return call("atlas_regions", document_id=document_id, atlas_index=atlas_index)
+    def atlas_regions(atlas_index: int, offset: int = 0, limit: int = 1000,
+                      document_id: str | None = None) -> dict:
+        """Page through shapes and their UV rectangles in an atlas (max 5000 per page); overlapping regions stay separate, and commands with no area are reported as a single-texel rect."""
+        return call("atlas_regions", document_id=document_id, atlas_index=atlas_index,
+                    offset=offset, limit=limit)
 
     @server.tool()
     def select_resource(resource_id: int, document_id: str | None = None, frame: int | None = None) -> dict:

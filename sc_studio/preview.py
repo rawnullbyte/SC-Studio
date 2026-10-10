@@ -7,6 +7,7 @@ from PyQt6.QtGui import (
     QImage,
     QPixmap,
     QPainterPath,
+    QPolygonF,
     QFont,
     QColor,
     QPen,
@@ -20,6 +21,11 @@ from PyQt6.QtWidgets import (
     QGraphicsPixmapItem,
 )
 from . import textures
+
+
+# Screen-pixel radius for zero-area atlas regions: both the diamond drawn for
+# them and the radius they answer picks at, so drawn markers stay clickable.
+ATLAS_MARKER_RADIUS = 3.0
 
 
 def grid_coordinate(value, low, high, inner_low, inner_high, scale):
@@ -148,6 +154,7 @@ class Preview(QGraphicsView):
     placementMoved = pyqtSignal(int, float, float)
     placementContext = pyqtSignal(int, object)
     atlasContext = pyqtSignal(object, object)
+    atlasShapeOpened = pyqtSignal(int)
 
     placementTransformed = pyqtSignal(int, object)
 
@@ -169,16 +176,53 @@ class Preview(QGraphicsView):
         self.placementContext.emit(row, event.globalPos())
         event.accept()
 
+    def mouseDoubleClickEvent(self, event):
+        if self.atlas_regions is not None:
+            point = self.mapToScene(event.pos())
+            matches = self.atlas_shapes_at(point)
+            if matches:
+                # Innermost match first: the smallest footprint is the sprite
+                # the user aimed at, not the atlas-sized shape behind it.
+                self.atlasShapeOpened.emit(matches[0]["id"])
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
     def atlas_shapes_at(self, point):
-        """Pick all UV regions, with a small screen-space tolerance at borders."""
+        """Pick every UV region under the cursor, tolerance measured in screen pixels.
+
+        Zero-area regions have no interior to sit inside, so they answer to the
+        same radius the borders are drawn at.
+        """
         if self.atlas_regions is None:
             return []
-        tolerance = 2 / max(abs(self.transform().m11()), 1e-9)
+        tolerance = ATLAS_MARKER_RADIUS / max(abs(self.transform().m11()), 1e-9)
         return sorted(
-            (region for region in self.atlas_regions
-             if region["bounds"].adjusted(-tolerance, -tolerance, tolerance, tolerance).contains(point)),
-            key=lambda region: (region["bounds"].width() * region["bounds"].height(),
-                                region["id"], region["command"]))
+            (
+                region
+                for region in self.atlas_regions
+                if (
+                    region["bounds"].adjusted(
+                        -tolerance, -tolerance, tolerance, tolerance
+                    ).contains(point)
+                    # A zero-area region is a single texel, so its origin is the
+                    # only place left to test; the rect test above never matches it.
+                    or (
+                        (
+                            not region["bounds"].width()
+                            or not region["bounds"].height()
+                        )
+                        and abs(region["bounds"].x() - point.x()) <= tolerance
+                        and abs(region["bounds"].y() - point.y()) <= tolerance
+                    )
+                )
+            ),
+            key=lambda region: (
+                region["bounds"].width() * region["bounds"].height(),
+                region["id"],
+                region["command"],
+            ),
+        )
 
     def keyPressEvent(self, event):
         if (
@@ -425,16 +469,40 @@ class Preview(QGraphicsView):
 
     def drawForeground(self, painter, rect):
         if self.atlas_regions is not None and self.show_atlas_outlines:
+            # Same two-pass stroke for shapes and for the zero-area markers, so
+            # redrawing an already-stroked polygon does not build one path per
+            # marker. Positions repeat heavily (atlas 8 collapses 52,049
+            # commands onto a single point), so draw only what is on screen.
             borders = [bounds for bounds in self.atlas_borders if bounds.intersects(rect)]
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            # Dark under-stroke keeps borders readable on both white and dark sprites.
+            scale = abs(self.transform().m11())
+            # Radius in scene units so markers hold their screen size.
+            # atlas_shapes_at picks with this same radius, so anything visibly
+            # drawn is clickable.
+            size = ATLAS_MARKER_RADIUS / scale if scale > 0 else 0.0
             for color, width in ((QColor(15, 20, 28, 230), 3), (QColor(255, 205, 70, 255), 1)):
                 pen = QPen(color)
                 pen.setCosmetic(True)
                 pen.setWidthF(width)
                 painter.setPen(pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
                 if borders:
                     painter.drawRects(borders)
+                if size > 0:
+                    for x, y in self.atlas_marks:
+                        if x < rect.left() - size or x > rect.right() + size:
+                            continue
+                        if y < rect.top() - size or y > rect.bottom() + size:
+                            continue
+                        painter.drawPolygon(
+                            QPolygonF(
+                                [
+                                    QPointF(x, y - size),
+                                    QPointF(x + size, y),
+                                    QPointF(x, y + size),
+                                    QPointF(x - size, y),
+                                ]
+                            )
+                        )
         row = getattr(self, "selected_placement", None)
         if row is not None:
             for item, _ in self.instances.values():
@@ -481,6 +549,7 @@ class Preview(QGraphicsView):
         self.last = None
         self.atlas_regions = None
         self.atlas_borders = []
+        self.atlas_marks = []
         self.show_atlas_outlines = True
         self.hidden_children = set()
         self.matrix_override = None
@@ -489,6 +558,7 @@ class Preview(QGraphicsView):
     def invalidate(self, keep_atlases=False):
         self.atlas_regions = None
         self.atlas_borders = []
+        self.atlas_marks = []
         self.matrix_override = None
         if not keep_atlases:
             self.cache.clear()
@@ -509,12 +579,23 @@ class Preview(QGraphicsView):
             {**region, "bounds": QRectF(*region["rect"])}
             for region in doc.atlas_regions(index)
         ]
+        # A command whose four corners resolve to one texel has no rectangle to
+        # stroke, so it becomes a point marker instead: every atlas shape stays
+        # visible and right-clickable. Deduplicated because these repeat heavily
+        # (a whole atlas's worth can collapse onto one texel).
+        rects = list(
+            dict.fromkeys(tuple(region["rect"]) for region in self.atlas_regions)
+        )
         self.atlas_borders = [
-            QRectF(*values)
-            for values in dict.fromkeys(
-                tuple(region["rect"]) for region in self.atlas_regions
-            )
+            QRectF(*values) for values in rects if values[2] and values[3]
         ]
+        self.atlas_marks = list(
+            dict.fromkeys(
+                (values[0], values[1])
+                for values in rects
+                if not values[2] or not values[3]
+            )
+        )
         self.doc = doc
         self.editable = False
         self.selected_placement = None

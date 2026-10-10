@@ -861,6 +861,79 @@ def test_atlas_outlines_and_overlapping_shape_picker(window, monkeypatch):
     assert e.preview.atlas_regions is None
 
 
+def test_atlas_zero_area_commands_stay_visible_and_pickable(window):
+    from PyQt6.QtCore import QEvent, QPointF
+    from PyQt6.QtGui import QImage, QMouseEvent, QPainter, QColor
+
+    d = populated()
+    data = d.tables["Textures"]["textures"][0]["highres"]
+    data.update(width=64, height=64, data=bytes([30, 60, 90, 255]) * 64 * 64)
+    # Same shape as a real UI atlas: one real sprite plus commands whose four
+    # corners all sample a single texel.
+    for id, (u, v, du, dv) in ((3, (1000, 1000, 8000, 8000)), (5, (4096, 4096, 0, 0))):
+        obj = d.resource(3)
+        obj["id"] = id
+        obj["commands"][0]["vertices"] = [
+            [0, 0, u, v], [20, 0, u + du, v], [0, 20, u, v + dv], [20, 20, u + du, v + dv]
+        ]
+        d.update("shapes", obj)
+    window.add_doc(d)
+    e = window.current()
+    e.selected = None
+    e.texture_index = 0
+    e.show_texture()
+    p = e.preview
+
+    # A zero-area command must not be dropped from the atlas.
+    assert {r["id"] for r in p.atlas_regions} == {3, 5}
+    assert len(p.atlas_borders) == 1          # only the real sprite gets a rect
+    assert len(p.atlas_marks) == 1            # the texel gets one marker
+    assert p.atlas_marks[0] == pytest.approx((4096 * 64 / 65535,) * 2, abs=0.01)
+
+    # It must answer picks at its texel.
+    point = QPointF(*p.atlas_marks[0])
+    hits = p.atlas_shapes_at(point)
+    assert 5 in [h["id"] for h in hits]
+
+    # The marker has to actually render, at any zoom. Qt calls drawForeground
+    # with the painter already in scene coordinates, so mirror that here.
+    for zoom in (0.05, 4.0):
+        p.resetTransform()
+        p.scale(zoom, zoom)
+        image = QImage(200, 200, QImage.Format.Format_ARGB32)
+        image.fill(QColor("black"))
+        painter = QPainter(image)
+        painter.setTransform(p.transform())
+        scene_rect = p.mapToScene(p.viewport().rect()).boundingRect()
+        p.drawForeground(painter, scene_rect)
+        painter.end()
+        # Full scan: the diamond is only a few pixels across at low zoom, so a
+        # strided sample would step straight over its thin outline.
+        lit = sum(
+            1
+            for x in range(image.width())
+            for y in range(image.height())
+            if image.pixelColor(x, y) != QColor("black")
+        )
+        assert lit, f"nothing drawn at zoom {zoom}"
+
+    # Double-clicking the texel opens the shape. This navigates away from the
+    # atlas, so it goes last.
+    opened = []
+    p.atlasShapeOpened.connect(opened.append)
+    p.resetTransform()
+    p.mouseDoubleClickEvent(
+        QMouseEvent(
+            QEvent.Type.MouseButtonDblClick,
+            QPointF(p.mapFromScene(point)),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+    )
+    assert opened == [5]
+
+
 def test_atlas_real_context_event_and_multiple_rendered_outlines(window, monkeypatch):
     from PyQt6.QtCore import QPointF
     from PyQt6.QtGui import QContextMenuEvent

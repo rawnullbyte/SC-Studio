@@ -260,14 +260,18 @@ class Document:
                     min(p[1] for p in uv) * height / 65535,
                     max(p[1] for p in uv) * height / 65535,
                 )
-                if right > left and bottom > top:
-                    regions.append(
-                        {
-                            "id": id,
-                            "command": ci,
-                            "rect": [left, top, right - left, bottom - top],
-                        }
-                    )
+                # Commands whose corners all sample one texel have no area, but
+                # they are kept rather than dropped: over half the commands in a
+                # full UI atlas are these, and discarding them hid their shapes
+                # from the atlas view and from picking entirely. The rect is then
+                # the single texel, which is what the viewer draws as a marker.
+                regions.append(
+                    {
+                        "id": id,
+                        "command": ci,
+                        "rect": [left, top, right - left, bottom - top],
+                    }
+                )
         return regions
 
     def usages(self, target, indirect=False):

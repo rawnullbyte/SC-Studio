@@ -261,6 +261,7 @@ class Editor(QWidget):
         self.preview.placementTransformed.connect(self.commit_placement_transform)
         self.preview.placementContext.connect(self.viewer_context_menu)
         self.preview.atlasContext.connect(self.atlas_context_menu)
+        self.preview.atlasShapeOpened.connect(self.open_atlas_shape)
         cv.addWidget(self.preview)
         image_controls = QHBoxLayout()
         self.import_image_btn = QPushButton("Import image…")
@@ -1338,7 +1339,9 @@ class Editor(QWidget):
         layout.addWidget(search)
         tree = QTreeWidget()
         tree.setObjectName("atlas_shapes_picker")
-        tree.setHeaderLabels(["Shape", "ID", "Commands", "UV rectangles (x, y, w, h)"])
+        tree.setHeaderLabels(
+            ["Shape", "ID", "Commands", "Refs", "UV rectangles (x, y, w, h)"]
+        )
         tree.setColumnWidth(0, 220)
         layout.addWidget(tree)
         grouped = {}
@@ -1357,7 +1360,13 @@ class Editor(QWidget):
             rects = "; ".join(", ".join(f"{v:.1f}" for v in entry["rect"]) for entry in entries)
             usages = " ".join(str(parent) + " " + " ".join(self.doc.names.get(parent, []))
                               for parent in parents.get(id, []))
-            rows.append((id, [label, str(id), str(len(entries)), rects], usages))
+            rows.append(
+                (
+                    id,
+                    [label, str(id), str(len(entries)), str(len(parents.get(id, []))), rects],
+                    usages,
+                )
+            )
         count = QLabel()
         layout.addWidget(count)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Open | QDialogButtonBox.StandardButton.Cancel)
@@ -2243,8 +2252,11 @@ class Editor(QWidget):
         )
         try:
             self.preview.show_atlas(self.doc, self.texture_index)
+            marks = len(self.preview.atlas_marks)
             self.notice.setText(
-                f"{len(self.preview.atlas_regions):,} referenced regions · Right-click to open a shape or find usages"
+                f"{len(self.preview.atlas_regions):,} referenced regions"
+                + (f" · {marks:,} zero-area markers (diamonds)" if marks else "")
+                + " · Double-click to open a shape, right-click for usages"
             )
             index = self.texture_index
             QTimer.singleShot(

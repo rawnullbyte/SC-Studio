@@ -181,7 +181,16 @@ class AgentGateway(QObject):
         if operation == "references":
             return doc.reference_graph(args["resource_id"])
         if operation == "atlas_regions":
-            return doc.atlas_regions(args["atlas_index"])
+            # A full UI atlas holds tens of thousands of commands, most of them
+            # zero-area, so this is paged instead of returning everything.
+            regions = doc.atlas_regions(args["atlas_index"])
+            offset = max(0, args.get("offset", 0))
+            limit = max(1, min(5000, args.get("limit", 1000)))
+            return {
+                "total": len(regions),
+                "offset": offset,
+                "regions": regions[offset : offset + limit],
+            }
         if operation == "get_placement":
             id = args["movieclip_id"]
             if doc.index[id][0] != "movieclips":

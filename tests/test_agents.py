@@ -64,6 +64,41 @@ def test_reference_tree_roots_and_cycles():
     tree.deleteLater()
 
 
+def test_atlas_regions_tool_pages_large_atlases(window, tmp_path):
+    doc = populated()
+    data = doc.tables["Textures"]["textures"][0]["highres"]
+    data.update(width=64, height=64, data=bytes([10, 20, 30, 255]) * 64 * 64)
+    # One real sprite plus many zero-area commands, as a full UI atlas has.
+    # 3 already exists as a shape; 4 is a textfield in the fixture, and 7 is a
+    # movieclip, so the new shapes start above both.
+    ids = [3] + list(range(20, 29))
+    for id in ids:
+        obj = doc.resource(3)
+        obj["id"] = id
+        obj["commands"][0]["vertices"] = (
+            [[0, 0, 512, 512], [20, 0, 512, 512], [0, 20, 512, 512], [20, 20, 512, 512]]
+            if id == 3
+            else [[0, 0, 2048, 2048], [20, 0, 2048, 2048],
+                  [0, 20, 2048, 2048], [20, 20, 2048, 2048]]
+        )
+        doc.update("shapes", obj)
+    window.add_doc(doc)
+    gateway = AgentGateway(window, tmp_path / "connection.json")
+    gateway.start()
+    try:
+        page = gateway.execute("atlas_regions", {"atlas_index": 0, "limit": 4})
+        assert page["total"] == len(ids) and page["offset"] == 0
+        assert len(page["regions"]) == 4
+        rest = gateway.execute("atlas_regions", {"atlas_index": 0, "offset": 4, "limit": 100})
+        assert len(rest["regions"]) == len(ids) - 4
+        assert {r["id"] for r in page["regions"] + rest["regions"]} == set(ids)
+        # A zero-area command is reported as a single-texel rect, not dropped.
+        zero = next(r for r in page["regions"] + rest["regions"] if r["id"] != 3)
+        assert zero["rect"][2] == 0 and zero["rect"][3] == 0
+    finally:
+        gateway.stop()
+
+
 def test_agent_rollback_drafts_and_connection_cleanup(window, tmp_path):
     window.add_doc(populated())
     ed = window.current()

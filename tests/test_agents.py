@@ -239,3 +239,79 @@ def test_real_mcp_stdio_client_edit_view_import_and_save(window, tmp_path):
         assert Document.load(target).validate() == []
     finally:
         gateway.stop()
+
+
+def test_discovery_tools_answer_the_reconnaissance_in_one_call(window, tmp_path):
+    """An agent can learn a document without polling kinds and fetching each resource."""
+    doc = referenced_document()
+    window.add_doc(doc)
+    gateway = AgentGateway(window, tmp_path / "connection.json")
+    gateway.start()
+    try:
+        summary = gateway.execute("document_summary", {})
+        # Everything the questions of a first session need, in one answer.
+        assert summary["counts"]["movieclips"] == 2
+        assert summary["counts"]["shapes"] == 1
+        assert {"nine_slice", "sizing", "text", "children", "units"} <= set(
+            summary["conventions"]
+        )
+        assert summary["atlases"], "atlases with their pixel sizes"
+        # Exports are the entry points, reported with their kind.
+        outer = next(row for row in summary["exports"] if row["id"] == 8)
+        assert outer["exports"] == ["outer"] and outer["kind"] == "movieclips"
+
+        index = gateway.execute("atlas_index", {})
+        first = index["atlases"][0]
+        assert first["atlas_index"] == 0
+        assert first["shapes"] == [3], "the shape drawn from this atlas"
+        assert first["command_count"] >= 1
+
+        # A component that is only ever a child is still findable, which is how
+        # panels and buttons are named in a real UI file.
+        found = gateway.execute("find_components", {"with_size": True})
+        ids = {row["id"] for row in found["components"]}
+        assert {3, 7, 8} <= ids
+        nested = next(row for row in found["components"] if row["id"] == 7)
+        assert nested["used_as_child"] == 1
+        # The fixture's clip draws a 20x20 shape and a textfield beside it,
+        # so its size is the union of both, not just the shape.
+        assert nested["size"][0] >= 20.0 and nested["size"][1] >= 20.0, nested
+        # Searching narrows by export name and by ID.
+        assert {row["id"] for row in gateway.execute(
+            "find_components", {"query": "outer"})["components"]} == {8}
+        assert {row["id"] for row in gateway.execute(
+            "find_components", {"query": "3"})["components"]} >= {3}
+
+        # Batch fetch, with anything unknown reported rather than failing.
+        batch = gateway.execute("get_resources", {"resource_ids": [3, 7, 999]})
+        assert set(batch["resources"]) == {"3", "7"} and batch["missing"] == [999]
+        assert batch["resources"]["3"]["id"] == 3
+
+        texture = gateway.execute("get_texture", {"atlas_index": 0})
+        assert texture["highres"]["width"] == 2 and texture["highres"]["height"] == 2
+        assert "format" in texture["highres"] and "external" in texture["highres"]
+        assert texture["regions"] and texture["regions"][0]["id"] == 3
+        # Out-of-range atlases are refused rather than returning nothing.
+        with pytest.raises(ValueError):
+            gateway.execute("get_texture", {"atlas_index": 99})
+    finally:
+        gateway.stop()
+
+
+def test_a_clip_that_draws_itself_does_not_hang_the_size_walk(window, tmp_path):
+    """A cyclic graph has no finite size; the recursion has to stop."""
+    doc = populated()
+    clip = doc.resource(7)
+    clip["children"].append({"id": 7, "name": "self", "blend": 0})
+    doc.update("movieclips", clip)
+    window.add_doc(doc)
+    gateway = AgentGateway(window, tmp_path / "connection.json")
+    gateway.start()
+    try:
+        found = gateway.execute("find_components", {"with_size": True})
+        row = next(r for r in found["components"] if r["id"] == 7)
+        # It reports a size for the shapes it legitimately draws and does not
+        # recurse forever through the self-reference.
+        assert row["size"] is not None
+    finally:
+        gateway.stop()

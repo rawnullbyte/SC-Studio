@@ -124,6 +124,216 @@ class AgentGateway(QObject):
                 "selected": ed.selected, "dirty": ed.is_dirty(),
                 "active": ed is self.window.current()}
 
+    def document_summary(self, doc):
+        """A whole-document overview: what exists, what is reusable, how to size.
+
+        Built so one call replaces the reconnaissance an agent otherwise does by
+        hand: a per-kind count, the exported names that are the entry points, the
+        atlases with their pixel sizes, and the conventions for nine-slice art
+        and text, which were previously only discoverable by reading each shape
+        and each textfield in turn.
+        """
+        counts = {kind: 0 for kind in KINDS}
+        for kind, _ in doc.index.values():
+            counts[kind] = counts.get(kind, 0) + 1
+        textures = doc.tables["Textures"]["textures"]
+        atlases = []
+        for index, texture in enumerate(textures):
+            data = texture.get("highres")
+            atlases.append({
+                "atlas_index": index,
+                "width": data.get("width") if isinstance(data, dict) else None,
+                "height": data.get("height") if isinstance(data, dict) else None,
+            })
+        # Exports are the entry points: a shape behind one is a finished piece
+        # of art, which is what is worth reusing rather than rebuilding.
+        exports = sorted(
+            ({"id": id, "exports": names, "kind": doc.index[id][0]}
+             for id, names in doc.names.items() if id in doc.index),
+            key=lambda row: row["id"],
+        )
+        grids = [id for id, (kind, raw) in doc.index.items()
+                 if kind == "movieclips" and raw.get("scaling_grid")]
+        return {
+            **self.describe(self.editor()),
+            "counts": counts,
+            "atlases": atlases,
+            "exports": exports,
+            "scaling_grid_clips": grids,
+            "conventions": {
+                "nine_slice": (
+                    "There is no nine-slice flag. A nine-slice asset is a "
+                    "movieclip whose child shape is already cut into a 3x3 grid "
+                    "of commands, placed with an identity matrix; the renderer "
+                    "stretches the middle ones. Sizing it means scaling the "
+                    "placement, and screen span is shape bounds times that scale."
+                ),
+                "sizing": (
+                    "A shape's bounds come from its commands' vertices, which "
+                    "are already in pixels. A sprite drawn from an atlas can be "
+                    "sized from its UV rectangle instead, which get_texture and "
+                    "atlas_regions report in atlas pixels."
+                ),
+                "text": (
+                    "A textfield stores left/top/right/bottom, font_size, "
+                    "font_name, text, align and styles. styles is a bitfield: "
+                    "1 device font, 2 outline, 4 bold, 8 italic, 16 multiline, "
+                    "64 auto kern. align: 0 left, 1 center, 2 right."
+                ),
+                "children": (
+                    "A movieclip's children are named instances; the name is the "
+                    "slot the game's own code looks up, so an existing component "
+                    "should be reused by importing it rather than rebuilt."
+                ),
+                "units": (
+                    "Frames and placement indices are zero-based. Matrices are "
+                    "[a,b,c,d,tx,ty]. A placement that inherits has no matrix of "
+                    "its own and is reported as identity."
+                ),
+            },
+        }
+
+    def atlas_index(self, doc, document_id=None):
+        """Every atlas with its size and the distinct shapes drawn from it.
+
+        An atlas holds one region per command, and a full UI sheet can hold tens
+        of thousands, so this collapses them per shape: an agent wants to know
+        which shape to place, not every rectangle behind it.
+        """
+        textures = doc.tables["Textures"]["textures"]
+        by_atlas = {}
+        for id, (kind, raw) in doc.index.items():
+            if kind != "shapes":
+                continue
+            for ci, command in enumerate(raw["commands"]):
+                by_atlas.setdefault(command["texture_index"], []).append((id, ci))
+        result = []
+        for index, texture in enumerate(textures):
+            data = texture.get("highres")
+            shapes = sorted({id for id, _ in by_atlas.get(index, [])})
+            result.append({
+                "atlas_index": index,
+                "width": data.get("width") if isinstance(data, dict) else None,
+                "height": data.get("height") if isinstance(data, dict) else None,
+                "shapes": shapes,
+                "shape_count": len(shapes),
+                "command_count": len(by_atlas.get(index, [])),
+            })
+        return {"atlases": result}
+
+    def find_components(self, doc, query, with_size, limit):
+        """Drawable resources with their size, exported or used as a child.
+
+        In a real UI file the exported names are usually only the screens; the
+        panels, buttons and tabs behind them are plain clips named in some other
+        clip's children. Both are listed, so a piece that exists can be found
+        and reused instead of authored again. Sizes mean a screen can be laid
+        out without fetching each candidate in turn.
+        """
+        needle = query.casefold()
+        limit = max(1, min(500, limit))
+        # How many clips name each resource as a child, so a component that is
+        # actually used somewhere is distinguishable from a leftover.
+        used_by = {}
+        for id, (kind, raw) in doc.index.items():
+            if kind != "movieclips":
+                continue
+            for child in raw.get("children_ids", []):
+                used_by[child] = used_by.get(child, 0) + 1
+        rows = []
+        for id, (kind, _) in sorted(doc.index.items()):
+            if kind not in ("movieclips", "shapes", "textfields"):
+                continue
+            names = doc.names.get(id, [])
+            haystack = " ".join(names).casefold() + " " + str(id)
+            if needle and needle not in haystack:
+                continue
+            row = {
+                "id": id,
+                "kind": kind,
+                "exports": names,
+                "used_as_child": used_by.get(id, 0),
+            }
+            if with_size:
+                row["size"] = self.resource_size(doc, id)
+            rows.append(row)
+            if len(rows) >= limit:
+                break
+        return {"total": len(rows), "components": rows}
+
+    def resource_size(self, doc, id, seen=None):
+        """Rendered size of a resource in pixels, or None when it has none.
+
+        A clip's size is the union of what its first frame draws, a shape's is
+        its vertex bounds, a textfield's is its box. This is the one number an
+        agent needs to place something without measuring the art itself.
+        """
+        if id not in doc.index:
+            return None
+        seen = set() if seen is None else seen
+        if id in seen:
+            # A clip that draws itself, directly or through another, has no
+            # finite size; stopping keeps the walk finite.
+            return None
+        seen = seen | {id}
+        kind, _ = doc.index[id]
+        if kind == "shapes":
+            # The index holds the file's packed form, so the normalized
+            # commands are read to get vertices in pixels.
+            return self.vertex_bounds(doc.resource(id, lazy_frames=True))
+        if kind == "textfields":
+            obj = doc.resource(id, lazy_frames=True)
+            left, top = float(obj["left"]), float(obj["top"])
+            return [round(float(obj["right"]) - left, 3),
+                    round(float(obj["bottom"]) - top, 3)]
+        if kind != "movieclips":
+            return None
+        clip = doc.resource(id, lazy_frames=True)
+        if not clip["frames"]:
+            return None
+        bounds = None
+        for child_index, matrix_index, _ in clip["frames"][0]["elements"]:
+            if child_index >= len(clip["children"]):
+                continue
+            child = clip["children"][child_index]
+            inner = self.resource_size(doc, child["id"], seen)
+            if inner is None:
+                continue
+            matrix = [1, 0, 0, 1, 0, 0]
+            if matrix_index != 65535:
+                matrices = doc.bank(clip["matrix_bank_index"])["matrices"]
+                if matrix_index < len(matrices):
+                    matrix = matrices[matrix_index]
+            corners = [
+                (x, y)
+                for x in (0.0, inner[0])
+                for y in (0.0, inner[1])
+            ]
+            points = [
+                (matrix[0] * x + matrix[2] * y + matrix[4],
+                 matrix[1] * x + matrix[3] * y + matrix[5])
+                for x, y in corners
+            ]
+            xs = [p[0] for p in points]
+            ys = [p[1] for p in points]
+            box = [min(xs), min(ys), max(xs), max(ys)]
+            bounds = box if bounds is None else [
+                min(bounds[0], box[0]), min(bounds[1], box[1]),
+                max(bounds[2], box[2]), max(bounds[3], box[3]),
+            ]
+        if bounds is None:
+            return None
+        return [round(bounds[2] - bounds[0], 3), round(bounds[3] - bounds[1], 3)]
+
+    @staticmethod
+    def vertex_bounds(raw):
+        vertices = [v for command in raw["commands"] for v in command["vertices"]]
+        if not vertices:
+            return None
+        xs = [v[0] for v in vertices]
+        ys = [v[1] for v in vertices]
+        return [round(max(xs) - min(xs), 3), round(max(ys) - min(ys), 3)]
+
     def dispatch(self, request):
         payload, future = request
         if not future.set_running_or_notify_cancel():
@@ -168,6 +378,52 @@ class AgentGateway(QObject):
                     and (not query or query in (str(id) + " " + " ".join(doc.names.get(id, []))).casefold())]
             offset, limit = max(0, args.get("offset", 0)), max(1, min(500, args.get("limit", 100)))
             return {"total": len(rows), "offset": offset, "resources": rows[offset:offset + limit]}
+        if operation == "document_summary":
+            # One call that answers the questions every session opens with, so
+            # an agent does not have to poll list_resources per kind, fetch each
+            # resource and page every atlas to work out what a document holds.
+            return self.document_summary(doc)
+        if operation == "atlas_index":
+            return self.atlas_index(doc, args.get("document_id"))
+        if operation == "find_components":
+            return self.find_components(doc, args.get("query", ""),
+                                        bool(args.get("with_size")),
+                                        int(args.get("limit", 100)))
+        if operation == "get_resources":
+            ids = args["resource_ids"]
+            offset = max(0, args.get("frame_offset", 0))
+            limit = max(1, min(100, args.get("frame_limit", 1)))
+            found, missing = {}, []
+            for resource_id in ids:
+                if resource_id not in doc.index:
+                    missing.append(resource_id)
+                    continue
+                obj = doc.resource(resource_id, lazy_frames=True)
+                if doc.index[resource_id][0] == "movieclips":
+                    frames = obj["frames"]
+                    obj["frame_count"] = len(frames)
+                    obj["frames"] = frames[offset : offset + limit]
+                    obj["frame_start"] = offset
+                found[str(resource_id)] = jsonable(obj)
+            return {"resources": found, "missing": missing}
+        if operation == "get_texture":
+            index = args["atlas_index"]
+            textures = doc.tables["Textures"]["textures"]
+            if not 0 <= index < len(textures):
+                raise ValueError("Atlas index is out of range")
+            texture = textures[index]
+            result = {"atlas_index": index}
+            for name, key in (("highres", "highres"), ("lowres", "lowres")):
+                data = texture.get(key)
+                if isinstance(data, dict):
+                    result[name] = {
+                        "width": data.get("width"),
+                        "height": data.get("height"),
+                        "format": data.get("format"),
+                        "external": data.get("external"),
+                    }
+            result["regions"] = doc.atlas_regions(index)
+            return result
         if operation == "get_resource":
             obj = doc.resource(args["resource_id"], lazy_frames=True)
             if doc.index[args["resource_id"]][0] == "movieclips":

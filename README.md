@@ -56,7 +56,9 @@ The stdio server uses the [official Python MCP SDK](https://py.sdk.modelcontextp
 
 Tools use zero-based frame and placement indices. A `get_resource` movieclip result contains a frame page, not a complete replacement — use `patch_resource` for individual properties; passing `frames` explicitly replaces the whole timeline. Files are written only when `save_document` is requested.
 
-Example: call `documents`, then `list_resources` with `kind="movieclips"`, inspect `get_resource`, and call `view_preview`. To change a clip's speed, use `patch_resource` with `changes={"framerate": 24}`. To resize a placement, inspect `get_placement` and pass its adjusted six-component `[a,b,c,d,tx,ty]` matrix to `transform_placement`.
+**Orientation is one call, not a hunt.** `document_summary` reports a document's per-kind counts, every atlas with its pixel size, the exported entry points, and the authoring conventions — nine-slice as pre-cut shape geometry scaled by the placement, how a shape's or clip's rendered size is derived, the textfield style/align bitfields, that a child's name is the lookup slot, and that frames, placement indices and matrices are zero-based. The same answer also lists the conventions in prose, so an agent new to the format can start authoring without reading the source. `find_components` lists the drawable pieces with their rendered sizes and how many clips use each, which is how a panel or button that already exists gets reused rather than rebuilt; `atlas_index` maps each atlas to the shapes drawn from it without paging; `get_texture` returns one atlas's sizes and UV rectangles; and `get_resources` fetches several resources at once, reporting unknown IDs instead of failing.
+
+Example: call `documents`, then `document_summary` on the document you are working in, then `find_components` with `with_size` to see what is available to reuse, and `view_preview` to check the result. To change a clip's speed, use `patch_resource` with `changes={"framerate": 24}`. To resize a placement, inspect `get_placement` and pass its adjusted six-component `[a,b,c,d,tx,ty]` matrix to `transform_placement`.
 
 ## Working with files
 

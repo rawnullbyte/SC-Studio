@@ -2327,3 +2327,121 @@ def test_delete_removes_every_selected_key(window):
     e.undo()
     application().processEvents()
     assert e.keyframes.keys_of(0) == {0, 3, 6, 9}
+
+
+def drag_key(e, from_frame, to_frame, row=0):
+    """A real drag of a key along its track, the way the mouse does it."""
+    from PyQt6.QtCore import QEvent, QPointF
+    from PyQt6.QtGui import QMouseEvent
+
+    strip = e.keyframes
+    step = strip.width_per_frame()
+    y = strip.RULER_HEIGHT + (row + 0.5) * strip.TRACK_HEIGHT
+    start = (strip.LABEL_WIDTH + from_frame * step + step / 2, y)
+    end = (strip.LABEL_WIDTH + to_frame * step + step / 2, y)
+
+    def send(kind, point, button):
+        application().sendEvent(
+            strip,
+            QMouseEvent(
+                kind,
+                QPointF(*point),
+                QPointF(*point),
+                button,
+                button,
+                Qt.KeyboardModifier.NoModifier,
+            ),
+        )
+        application().processEvents()
+
+    send(QEvent.Type.MouseButtonPress, start, Qt.MouseButton.LeftButton)
+    send(QEvent.Type.MouseMove, end, Qt.MouseButton.NoButton)
+    send(QEvent.Type.MouseButtonRelease, end, Qt.MouseButton.LeftButton)
+
+
+def test_keys_can_be_moved_as_a_group(window):
+    """Several picked keys drag together and keep their spacing."""
+    w = window
+    w.add_doc(animatable_clip(8))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    for frame, value in ((0, 0.0), (2, 20.0), (4, 40.0), (6, 60.0)):
+        key_at(e, frame, value)
+    values = tween_x(e)
+    e.keyframes.picked_keys = {(0, 0), (2, 0), (4, 0), (6, 0)}
+    drag_key(e, 2, 3)
+    # Every key moved by one frame, and each kept its own pose.
+    assert e.keyframes.keys_of(0) == {1, 3, 5, 7}
+    moved = tween_x(e)
+    assert moved[1] == values[0]
+    assert moved[3] == values[2]
+    assert moved[5] == values[4]
+    assert moved[7] == values[6]
+    # The selection follows the keys rather than running ahead of them.
+    assert e.keyframes.selected_keys() == {(1, 0), (3, 0), (5, 0), (7, 0)}
+
+
+def test_a_key_cannot_be_dropped_onto_another_key(window):
+    """Dropping a key on an occupied frame leaves both where they were."""
+    w = window
+    w.add_doc(animatable_clip(8))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    for frame, value in ((0, 0.0), (2, 20.0), (4, 40.0)):
+        key_at(e, frame, value)
+    before = tween_x(e)
+    drag_key(e, 2, 4)
+    # The old code overwrote the key already on frame 4 and cleared frame 2,
+    # so one pose was lost; now the drag simply does not land.
+    assert e.keyframes.keys_of(0) == {0, 2, 4}
+    assert tween_x(e) == before
+
+
+def test_adjacent_keys_report_why_nothing_can_be_tweened(window):
+    """Two keys side by side have no gap, which is not "already filled"."""
+    w = window
+    w.add_doc(animatable_clip(8))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    key_at(e, 3, 30.0)
+    key_at(e, 4, 40.0)
+    e.keyframes.picked_keys = {(3, 0), (4, 0)}
+    e.keyframe_selection_changed()
+    e.apply_curve_to_range()
+    application().processEvents()
+    message = window.statusBar().currentMessage()
+    assert "adjacent" in message, message
+
+
+def test_reapplying_a_curve_says_the_gaps_are_already_filled(window):
+    """A second run at the same density is a no-op, and says so."""
+    w = window
+    w.add_doc(animatable_clip(12))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    key_at(e, 0, 0.0)
+    key_at(e, 10, 100.0)
+    e.keyframes.picked_keys = {(0, 0), (10, 0)}
+    e.keyframe_selection_changed()
+    e.curve.setCurrentText("Linear")
+    e.apply_curve_to_range()
+    application().processEvents()
+    assert "writing" in window.statusBar().currentMessage()
+    filled = tween_x(e)
+    e.apply_curve_to_range()
+    application().processEvents()
+    assert "already filled" in window.statusBar().currentMessage()
+    assert tween_x(e) == filled
+    # A coarser density still fills in the frames the curve skipped.
+    e.key_density.setValue(3)
+    e.apply_curve_to_range()
+    application().processEvents()
+    assert "writing" in window.statusBar().currentMessage()

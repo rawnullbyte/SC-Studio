@@ -1395,7 +1395,7 @@ class Editor(QWidget):
         """Move a key on a specific track, not only the selected one."""
         if self.elements.currentRow() != row:
             self.select_track(row)
-        self.move_keypoint(source, target)
+        self.move_keypoint(source, target, row)
 
     def extend_to_frame(self, needed):
         """Add frames until the clip is long enough for the frame asked for.
@@ -1541,10 +1541,18 @@ class Editor(QWidget):
         points = easing.curve_for(self.curve.currentText())
         wanted = self.key_density.value()
         written = set()
+        # Frames carrying the author's own key. An intermediate one is still
+        # given the curve's value, but it is never recorded as written, so
+        # undoing the curve leaves it in place rather than deleting it.
+        keys = set(found)
+        gaps = 0
         for start_frame, end_frame in zip(frames, frames[1:]):
             span = end_frame - start_frame
             if span < 2:
+                # Two keys side by side have no room for a tween between them,
+                # which is not the same as the curve having nothing to do.
                 continue
+            gaps += 1
             step = max(1, round(span / wanted)) if wanted else 1
             offset = 1
             while offset < span:
@@ -1560,17 +1568,25 @@ class Editor(QWidget):
                                 found[start_frame][0], found[end_frame][0], eased
                             ),
                         )
-                        # The last step of a gap lands on the key ending it. The
-                        # matrix is identical, so the key is only marked as
-                        # written when the frame was not already a key: it is
-                        # the author's, and undoing the curve must not take it.
-                        if element[1] == 65535:
+                        if index not in keys:
                             written.add(index)
                         element[1] = key
                 offset += step
-        if not written:
+        if not gaps:
             self.window().statusBar().showMessage(
-                "No frames between the selected keys needed filling", 5000
+                f"{len(frames)} keys selected, but they are on adjacent frames: "
+                "pick keys with frames between them to tween",
+                6000,
+            )
+            return
+        if not written:
+            # The gaps were already filled at this density, so nothing is
+            # written and a previous bake is left as it was; re-running at a
+            # different density still fills the frames the curve skipped.
+            self.window().statusBar().showMessage(
+                f"The gaps between {len(frames)} keys are already filled; "
+                "raise Keys to add more frames",
+                6000,
             )
             return
         if self.mutate(lambda: self.bake_and_compact(clip, row)):
@@ -1779,52 +1795,96 @@ class Editor(QWidget):
                 return list(easing.IDENTITY)
         return list(easing.IDENTITY)
 
-    def move_keypoint(self, source, target):
+    def move_keypoint(self, source, target, row=None, delta=None):
         """Drag a keypoint to another frame, carrying its transform with it.
 
         Dragging a key past the end extends the clip first, so a key can be
-        placed on a frame that does not exist yet by moving it there.
+        placed on a frame that does not exist yet by moving it there. Several
+        keys can be dragged as one selection, in which case they all move by the
+        same offset and keep their spacing.
         """
-        if source == target or not self.animatable() or not self.resolve_drafts():
+        if not self.animatable() or not self.resolve_drafts():
             return
-        clip = self.doc.resource(self.selected)
-        if target >= len(clip["frames"]):
+        if target >= len(self.doc.resource(self.selected)["frames"]):
             self.extend_to_frame(target)
             if not self.resolve_drafts():
                 return
-            clip = self.doc.resource(self.selected)
-        row = self.placement_row()
-        if not 0 <= target < len(clip["frames"]):
+        clip = self.doc.resource(self.selected)
+        row = self.placement_row() if row is None else row
+        delta = target - source if delta is None else delta
+        if not delta:
             return
-        if row >= len(clip["frames"][source]["elements"]) or row >= len(
-            clip["frames"][target]["elements"]
-        ):
-            return
-        origin = clip["frames"][source]["elements"][row]
-        if origin[1] == 65535 and origin[2] == 65535:
-            return
-        matrix = self.matrix_at(clip, source, row)
-        colours = self.clip_bank(clip).get("colors") or []
-        colour = (
-            list(colours[origin[2]])
-            if origin[2] != 65535 and origin[2] < len(colours)
-            else None
+
+        # Every key being dragged, on every track: either the whole selection,
+        # or just the one that was grabbed.
+        picking = self.keyframes.selected_keys()
+        moving = (
+            sorted(picking)
+            if picking and (source, row) in picking
+            else [(source, row)]
         )
-        destination = clip["frames"][target]["elements"][row]
+        landed = {(frame + delta, kind) for frame, kind in moving}
+        if min(frame for frame, _ in landed) < 0:
+            return
+        # A key may not be dropped on top of one that is staying put: dropping
+        # it there would quietly replace that key's pose. The drag simply does
+        # not land, and the key keeps the position it last had.
+        staying = {
+            (frame, kind)
+            for _, kind in moving
+            for frame in self.keys_on_row(clip, kind)
+            if (frame, kind) not in set(moving)
+        }
+        blocked = landed & staying
+        if blocked:
+            self.window().statusBar().showMessage(
+                f"Frame {min(frame for frame, _ in blocked) + 1} already has a key; "
+                "the move was left where it was",
+                4000,
+            )
+            return
+
+        bank = self.clip_bank(clip)
+        colours = bank.get("colors") or []
+        # Read every pose before anything is written, since the source frames
+        # are cleared as part of the same change.
+        poses = {}
+        for frame, kind in moving:
+            if not 0 <= frame < len(clip["frames"]):
+                return
+            if kind >= len(clip["frames"][frame]["elements"]):
+                return
+            origin = clip["frames"][frame]["elements"][kind]
+            if origin[1] == 65535 and origin[2] == 65535:
+                continue
+            poses[(frame, kind)] = (
+                self.matrix_at(clip, frame, kind),
+                list(colours[origin[2]])
+                if origin[2] != 65535 and origin[2] < len(colours)
+                else None,
+            )
 
         def change():
-            destination[1] = self.intern_matrix(clip, matrix)
-            if colour is not None:
-                destination[2] = self.intern_color(clip, colour)
-            origin[1] = 65535
-            origin[2] = 65535
+            for (frame, kind), (matrix, colour) in poses.items():
+                clip["frames"][frame]["elements"][kind][1] = 65535
+                clip["frames"][frame]["elements"][kind][2] = 65535
+            for (frame, kind), (matrix, colour) in poses.items():
+                after = frame + delta
+                destination = clip["frames"][after]["elements"][kind]
+                destination[1] = self.intern_matrix(clip, matrix)
+                if colour is not None:
+                    destination[2] = self.intern_color(clip, colour)
 
         if self.mutate(lambda: (change(), self.doc.update("movieclips", clip))[1]):
+            self.keyframes.picked_keys = landed
             self.refresh()
             self.elements.selectRow(row)
             self.preview.selected_placement = row
+            moved = len(poses)
             self.window().statusBar().showMessage(
-                f"Moved keypoint to frame {target + 1}", 4000
+                f"Moved {moved} key{'s' if moved != 1 else ''} to start at "
+                f"frame {min(f for f, _ in landed) + 1}",
+                4000,
             )
 
     def clip_bank(self, clip):

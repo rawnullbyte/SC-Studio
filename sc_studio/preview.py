@@ -562,7 +562,11 @@ class AnimatorTimeline(QWidget):
                     self.picked_keys.add(key)
             elif modifiers & Qt.KeyboardModifier.ShiftModifier:
                 self.picked_keys.add(key)
-            else:
+            elif key not in self.picked_keys:
+                # Clicking a key that is not already picked selects just it.
+                # Clicking one that is part of a picked set keeps the whole set,
+                # so the drag that follows carries every key along instead of
+                # quietly dropping back to the one under the cursor.
                 self.picked_keys = {key}
             self.key_anchor = key
             self.dragging = key
@@ -593,17 +597,19 @@ class AnimatorTimeline(QWidget):
         if self.dragging is not None:
             frame, row = self.dragging
             target = self.raw_frame_at(x)
+            # A key can only be dropped on a frame that belongs to the clip; a
+            # drag further out extends it first, and the move follows once the
+            # frames are there.
             if target >= self.frame_count:
                 self.extendRequested.emit(target + 1)
-            elif target != frame:
-                self.moveRequested.emit(frame, target, row)
-                shift = target - frame
                 self.dragging = (target, row)
-                if self.picked_keys:
-                    # Dragging one of several selected keys carries them along.
-                    self.picked_keys = {
-                        (f + shift, r) for f, r in self.picked_keys
-                    }
+                self.moveRequested.emit(frame, target, row)
+            elif target != frame:
+                self.dragging = (target, row)
+                self.moveRequested.emit(frame, target, row)
+            # The selection is left to the editor, which moves every key that
+            # was picked and reports where they ended up: shifting it here too
+            # would push the selection a step further on than the keys went.
             return
         self.setCursor(
             Qt.CursorShape.SizeHorCursor

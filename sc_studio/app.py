@@ -81,7 +81,7 @@ from .workspace import (
     clipboard_unpack,
     set_graph_clipboard,
 )
-from .preview import KeyframeStrip, Preview
+from .preview import AnimatorTimeline, Preview
 from . import textures
 from . import easing
 from . import themes as theme_schemes
@@ -307,15 +307,75 @@ class Editor(QWidget):
         transport.setLayout(controls)
         transport.setFixedHeight(transport.sizeHint().height())
         cv.addWidget(transport)
-        # A keyframe ruler under the transport bar: the timeline is visible and
-        # editable while previewing, instead of living in the Frames tab.
-        self.keyframes = KeyframeStrip()
+        # The animator sits under the canvas, so building an animation never
+        # means opening a tab: a labeled track per child, a ruler, a playhead.
+        animator = QWidget()
+        animator_layout = QVBoxLayout(animator)
+        animator_layout.setContentsMargins(0, 2, 0, 2)
+        animator_layout.setSpacing(3)
+        self.keyframes = AnimatorTimeline()
+        animator_layout.addWidget(self.keyframes)
+        controls_row = QHBoxLayout()
+        self.curve = QComboBox()
+        self.curve.addItems(easing.PRESETS)
+        self.curve.setMinimumWidth(118)
+        self.curve.setToolTip("Shape applied to the frames you apply it to")
+        controls_row.addWidget(QLabel("Curve"))
+        controls_row.addWidget(self.curve)
+        self.curve_preview = QLabel()
+        self.curve_preview.setFixedSize(74, 30)
+        controls_row.addWidget(self.curve_preview)
+        controls_row.addWidget(QLabel("Keys"))
+        self.key_density = QSpinBox()
+        self.key_density.setRange(1, 60)
+        self.key_density.setValue(6)
+        self.key_density.setToolTip("Frames to write between each pair of keys")
+        controls_row.addWidget(self.key_density)
+        self.bake_button = QPushButton("Apply to range")
+        self.bake_button.clicked.connect(self.apply_curve_to_range)
+        controls_row.addWidget(self.bake_button)
+        self.undo_curve_button = QPushButton("Undo curve")
+        self.undo_curve_button.clicked.connect(self.revert_tween)
+        controls_row.addWidget(self.undo_curve_button)
+        controls_row.addStretch()
+        self.remove_frame_button = QPushButton("Remove frame")
+        self.remove_frame_button.clicked.connect(self.remove_frame)
+        controls_row.addWidget(self.remove_frame_button)
+        animator_layout.addLayout(controls_row)
+        transform_row = QHBoxLayout()
+        self.key_fields = {}
+        for name in ("X", "Y", "Rotation", "Scale X", "Scale Y"):
+            transform_row.addWidget(QLabel(name))
+            box = QDoubleSpinBox()
+            box.setDecimals(2)
+            box.setRange(-3600.0, 3600.0)
+            box.setValue(0.0 if name in ("X", "Y", "Rotation") else 1.0)
+            box.setMinimumWidth(70)
+            transform_row.addWidget(box)
+            self.key_fields[name] = box
+        self.apply_animation_button = QPushButton("Key transform")
+        self.apply_animation_button.setToolTip(
+            "Write these values as a keyframe on the current frame"
+        )
+        self.apply_animation_button.clicked.connect(self.apply_animation_fields)
+        transform_row.addWidget(self.apply_animation_button)
+        reload_button = QPushButton("Reload")
+        reload_button.setToolTip("Read the values back from the current frame")
+        reload_button.clicked.connect(self.load_animation_fields)
+        transform_row.addWidget(reload_button)
+        self.animation_hint = QLabel("")
+        transform_row.addWidget(self.animation_hint, 1)
+        animator_layout.addLayout(transform_row)
+        cv.addWidget(animator)
         self.keyframes.framePicked.connect(self.goto_frame)
-        self.keyframes.moveRequested.connect(self.move_keypoint)
-        self.keyframes.frameContext.connect(self.keyframe_context_menu)
-        self.keyframes.keyContext.connect(self.keypoint_context_menu)
+        self.keyframes.trackPicked.connect(self.select_track)
+        self.keyframes.keyToggled.connect(self.toggle_keypoint_at)
+        self.keyframes.moveRequested.connect(self.move_keypoint_on_track)
+        self.keyframes.extendRequested.connect(self.extend_to_frame)
         self.keyframes.selectionChanged.connect(self.keyframe_selection_changed)
-        cv.addWidget(self.keyframes)
+        self.keyframes.keyContext.connect(self.keypoint_context_menu)
+        self.keyframes.trackContext.connect(self.keyframe_context_menu)
+        self.curve.currentTextChanged.connect(self.draw_curve)
         self.notice = QLabel("Select a resource to preview and edit.")
         self.notice.setWordWrap(True)
         self.notice.setObjectName("previewNotice")
@@ -363,131 +423,6 @@ class Editor(QWidget):
         placements_page = QWidget()
         placements_layout = QVBoxLayout(placements_page)
         self.timeline_pages.addTab(placements_page, "Placements")
-        animation_page = QWidget()
-        anim_layout = QVBoxLayout(animation_page)
-        anim_layout.addWidget(
-            QLabel(
-                "Keypoints for the selected placement. A key is the transform on "
-                "that frame; frames between keys are baked from the curve."
-            )
-        )
-        anim_layout.addWidget(QLabel("Frames"))
-        frame_row = QHBoxLayout()
-        for title, fn, tip in [
-            (
-                "Add frame",
-                lambda: self.add_frame(False),
-                "Append a frame after the current one",
-            ),
-            (
-                "Duplicate",
-                lambda: self.add_frame(True),
-                "Copy the current frame, including its placements",
-            ),
-            ("Delete frame", self.remove_frame, "Remove the current frame"),
-        ]:
-            button = QPushButton(title)
-            button.setToolTip(tip)
-            button.clicked.connect(fn)
-            frame_row.addWidget(button)
-        anim_layout.addLayout(frame_row)
-        anim_layout.addWidget(QLabel("Keypoints"))
-        self.keypoints = table(["Frame", "Position", "Rotation", "Scale"])
-        anim_layout.addWidget(self.keypoints)
-        key_row = QHBoxLayout()
-        for title, fn in [
-            ("Set key here", self.set_keypoint),
-            ("Delete key", self.delete_keypoint),
-            ("Clear all keys", self.clear_keypoints),
-        ]:
-            button = QPushButton(title)
-            button.clicked.connect(fn)
-            key_row.addWidget(button)
-        anim_layout.addLayout(key_row)
-        anim_layout.addWidget(QLabel("Transform on this frame"))
-        # The same fields the viewer's Size / position dialog offers, so a
-        # placement can be animated without leaving the animator.
-        self.key_fields = {}
-        transform = QFormLayout()
-        for name, low, high in (
-            ("X", -1e6, 1e6),
-            ("Y", -1e6, 1e6),
-            ("Rotation", -3600.0, 3600.0),
-            ("Scale X", -1000.0, 1000.0),
-            ("Scale Y", -1000.0, 1000.0),
-        ):
-            box = QDoubleSpinBox()
-            box.setDecimals(2)
-            box.setRange(low, high)
-            box.setValue(0.0 if name in ("X", "Y", "Rotation") else 1.0)
-            transform.addRow(name, box)
-            self.key_fields[name] = box
-        anim_layout.addLayout(transform)
-        apply_row = QHBoxLayout()
-        self.apply_animation_button = QPushButton("Apply to this frame")
-        self.apply_animation_button.setToolTip(
-            "Key the transform below on the current frame, so changing it here "
-            "animates rather than editing a shared transform"
-        )
-        self.apply_animation_button.clicked.connect(self.apply_animation_fields)
-        apply_row.addWidget(self.apply_animation_button)
-        nudge_clear = QPushButton("Reset")
-        nudge_clear.setToolTip("Reset the fields to the placement's current transform")
-        nudge_clear.clicked.connect(self.load_animation_fields)
-        apply_row.addWidget(nudge_clear)
-        anim_layout.addLayout(apply_row)
-        self.animation_hint = QLabel("")
-        self.animation_hint.setWordWrap(True)
-        anim_layout.addWidget(self.animation_hint)
-        anim_layout.addWidget(QLabel("Curve"))
-        curve_row = QHBoxLayout()
-        self.curve = QComboBox()
-        self.curve.addItems(easing.PRESETS)
-        self.curve.setToolTip("Shape applied to the selected range of frames")
-        curve_row.addWidget(self.curve, 1)
-        self.curve_preview = QLabel()
-        self.curve_preview.setMinimumHeight(34)
-        self.curve_preview.setMinimumWidth(110)
-        self.curve_preview.setToolTip("Curve shape, drawn left to right over time")
-        curve_row.addWidget(self.curve_preview)
-        anim_layout.addLayout(curve_row)
-        density_row = QHBoxLayout()
-        density_row.addWidget(QLabel("Keys to create"))
-        self.key_density = QSpinBox()
-        self.key_density.setRange(1, 60)
-        self.key_density.setValue(6)
-        self.key_density.setToolTip(
-            "How many frames to write between each pair of keys. Fewer keys "
-            "means a coarser, smaller animation."
-        )
-        density_row.addWidget(self.key_density)
-        density_row.addStretch()
-        anim_layout.addLayout(density_row)
-        bake_row = QHBoxLayout()
-        self.bake_button = QPushButton("Apply curve to range")
-        self.bake_button.setToolTip(
-            "Write the curve into the frames selected on the timeline"
-        )
-        self.bake_button.clicked.connect(self.apply_curve_to_range)
-        bake_row.addWidget(self.bake_button)
-        select_button = QPushButton("Select keys")
-        select_button.setToolTip("Select from the first key to the last")
-        select_button.clicked.connect(self.select_all_keys)
-        bake_row.addWidget(select_button)
-        anim_layout.addLayout(bake_row)
-        undo_row = QHBoxLayout()
-        bake_clear = QPushButton("Undo curve")
-        bake_clear.setToolTip(
-            "Remove only the frames the last curve wrote, keeping your keys"
-        )
-        bake_clear.clicked.connect(self.revert_tween)
-        undo_row.addWidget(bake_clear)
-        anim_layout.addLayout(undo_row)
-        self.bake_info = QLabel("")
-        self.bake_info.setWordWrap(True)
-        anim_layout.addWidget(self.bake_info)
-        self.curve.currentTextChanged.connect(self.draw_curve)
-        animation_page.setObjectName("animationPage")
         self.children = table(["Resource ID", "Instance name", "Blend", "Visible"])
         instances_layout.addWidget(QLabel("Resources used by this movieclip"))
         instances_layout.addWidget(self.children)
@@ -545,8 +480,6 @@ class Editor(QWidget):
             b = QPushButton(title)
             b.clicked.connect(fn)
             er.addWidget(b)
-        placements_layout.addLayout(er)
-        self.timeline_pages.addTab(animation_page, "Animation")
         self.tabs.addTab(timeline, "Timeline")
         advanced = QWidget()
         av = QVBoxLayout(advanced)
@@ -1289,14 +1222,10 @@ class Editor(QWidget):
     def toggle_play(self):
         if self.timer.isActive():
             self.timer.stop()
-            self.preview.play_rect = None
             self.play.setText("▶ Play")
             self.show_elements()
         elif self.selected in self.doc.index:
             fps = max(1, self.doc.index[self.selected][1].get("framerate", 30))
-            # Lock the scrollable area for the whole playthrough before the
-            # first frame change, so the camera holds still while it runs.
-            self.preview.play_rect = self.preview.content_rect
             self.timer.start(max(16, int(1000 / fps)))
             self.play.setText("⏸ Pause")
 
@@ -1350,22 +1279,110 @@ class Editor(QWidget):
     # --- keyframe strip -----------------------------------------------------
 
     def refresh_keyframe_strip(self):
-        """Push the current timeline and key set to the strip under the canvas."""
-        animatable = (
+        """Push the timeline and every child's keys to the animator."""
+        if not (
             self.selected in self.doc.index
             and self.doc.index[self.selected][0] == "movieclips"
-        )
-        if not animatable:
-            self.keyframes.set_state(0, 0, set(), -1)
+        ):
+            self.keyframes.set_state(0, 0, [], -1)
             return
         clip = self.obj
-        row = self.elements.currentRow()
+        tracks = []
+        for row, child in enumerate(clip.get("children") or []):
+            name = child.get("name") or ""
+            if not name:
+                kind = self.doc.index.get(child["id"], ("resource", None))[0]
+                name = f"{kind} {child['id']}" if kind != "resource" else str(child["id"])
+            tracks.append(
+                {"row": row, "label": name, "keys": self.keys_on_row(clip, row)}
+            )
         self.keyframes.set_state(
-            len(clip["frames"]),
-            self.frame.value(),
-            self.placement_keys(clip) if row >= 0 else set(),
-            row,
+            len(clip["frames"]), self.frame.value(), tracks, self.placement_row()
         )
+
+    def keys_on_row(self, clip, row):
+        """Frames where the given child row's transform actually changes.
+
+        A frame holding no transform of its own inherits the last one set, so it
+        is never a key. Only a frame that carries a transform different from the
+        one already in force starts a new key, which is why a still hold shows a
+        single key instead of one per frame.
+        """
+        bank = self.clip_bank(clip)
+        matrices = bank.get("matrices") or []
+        colours = bank.get("colors") or []
+        keys = []
+        current = None
+        for index, frame in enumerate(clip["frames"]):
+            if row >= len(frame["elements"]):
+                continue
+            element = frame["elements"][row]
+            if element[1] == 65535 and element[2] == 65535:
+                # Nothing set here, so this frame inherits and changes nothing.
+                continue
+            matrix = (
+                list(matrices[element[1]])
+                if element[1] != 65535 and element[1] < len(matrices)
+                else None
+            )
+            colour = (
+                list(colours[element[2]])
+                if element[2] != 65535 and element[2] < len(colours)
+                else None
+            )
+            state = (matrix, colour)
+            if state != current:
+                keys.append(index)
+                current = state
+        if not keys and clip["frames"]:
+            # The first frame is the state everything else inherits from, so it
+            # is shown as the base key even when nothing assigns one.
+            keys.append(0)
+        return keys
+
+    def select_track(self, row):
+        """Select a child's track, keeping the preview and panels in step."""
+        if row < 0 or row >= self.elements.rowCount():
+            return
+        self.elements.selectRow(row)
+        self.preview.selected_placement = row
+        self.preview.viewport().update()
+        self.load_animation_fields()
+
+    def move_keypoint_on_track(self, source, target, row):
+        """Move a key on a specific track, not only the selected one."""
+        if self.elements.currentRow() != row:
+            self.select_track(row)
+        self.move_keypoint(source, target)
+
+    def extend_to_frame(self, needed):
+        """Add frames until the clip is long enough for the frame asked for.
+
+        Scrubbing or dragging a key past the end grows the movieclip, so a
+        timeline extends by working on it rather than by pre-adding frames.
+        """
+        if not self.animatable():
+            return
+        clip = self.doc.resource(self.selected)
+        missing = needed + 1 - len(clip["frames"])
+        if missing <= 0:
+            return
+        template = clip["frames"][-1] if clip["frames"] else {"elements": []}
+
+        def change():
+            for _ in range(missing):
+                # New frames carry the last frame's placements, so they keep
+                # showing what was on screen instead of going blank.
+                clip["frames"].append(
+                    {
+                        "label": "",
+                        "elements": [list(e) for e in template.get("elements", [])],
+                    }
+                )
+
+        if self.mutate(lambda: (change(), self.doc.update("movieclips", clip))[1]):
+            self.refresh()
+            self.frame.setValue(min(needed, len(clip["frames"]) - 1))
 
     def goto_frame(self, index):
         """Jump to a frame from the strip, stopping playback first."""
@@ -1386,11 +1403,11 @@ class Editor(QWidget):
     def update_curve_info(self, frames=None):
         """Describe what applying the curve would affect, next to the button."""
         if not self.animatable():
-            self.bake_info.setText("Select a movieclip placement to tween it.")
+            self.animation_hint.setText("Select a movieclip placement to tween it.")
             return
         keys = self.placement_keys(self.obj)
         if len(keys) < 2:
-            self.bake_info.setText(
+            self.animation_hint.setText(
                 "Set a keyframe on another frame to tween between them."
             )
             return
@@ -1408,7 +1425,7 @@ class Editor(QWidget):
         span = high - low
         step = max(1, round(span / dense)) if dense else 1
         estimate = max(0, span // step) if span else 0
-        self.bake_info.setText(
+        self.animation_hint.setText(
             f"{len(keys)} keys. Applying '{self.curve.currentText()}' to {scope} "
             f"writes about {estimate} frames between {low + 1} and {high + 1}, "
             f"keeping your keys."
@@ -1500,11 +1517,13 @@ class Editor(QWidget):
                 6000,
             )
 
-    def keypoint_context_menu(self, index, position):
-        """Actions for one keyframe."""
+    def keypoint_context_menu(self, index, row, position):
+        """Actions for one keyframe, on the track it was clicked on."""
+        if self.elements.currentRow() != row:
+            self.select_track(row)
         menu = QMenu(self)
         menu.addAction("Remove this keypoint").triggered.connect(
-            lambda: self.toggle_keypoint_at(index, self.placement_row())
+            lambda: self.toggle_keypoint_at(index, row)
         )
         menu.addAction("Go to this frame").triggered.connect(
             lambda: self.goto_frame(index)
@@ -1657,10 +1676,19 @@ class Editor(QWidget):
         return list(easing.IDENTITY)
 
     def move_keypoint(self, source, target):
-        """Drag a keypoint to another frame, carrying its transform with it."""
+        """Drag a keypoint to another frame, carrying its transform with it.
+
+        Dragging a key past the end extends the clip first, so a key can be
+        placed on a frame that does not exist yet by moving it there.
+        """
         if source == target or not self.animatable() or not self.resolve_drafts():
             return
         clip = self.doc.resource(self.selected)
+        if target >= len(clip["frames"]):
+            self.extend_to_frame(target)
+            if not self.resolve_drafts():
+                return
+            clip = self.doc.resource(self.selected)
         row = self.placement_row()
         if not 0 <= target < len(clip["frames"]):
             return
@@ -1797,32 +1825,8 @@ class Editor(QWidget):
             )
 
     def refresh_keypoints(self):
-        """Rebuild the keypoint table and the curve preview for the selection."""
+        """Redraw the curve preview; the timeline itself shows the keys."""
         self.draw_curve(self.curve.currentText())
-        if not self.animatable():
-            fill_table(self.keypoints, [])
-            self.update_curve_info()
-            return
-        clip = self.obj
-        if not 0 <= self.frame.value() < len(clip["frames"]):
-            fill_table(self.keypoints, [])
-            return
-        found = self.key_transforms(clip)
-        rows = []
-        for index in sorted(found):
-            matrix, _ = found[index]
-            parts = easing.decompose(matrix)
-            rows.append(
-                [
-                    index,
-                    f"{parts['tx']:.1f}, {parts['ty']:.1f}",
-                    f"{math.degrees(parts['rotation']):.1f}°",
-                    f"{parts['scale_x']:.3f}, {parts['scale_y']:.3f}",
-                ]
-            )
-        fill_table(self.keypoints, rows)
-        # The description is owned by update_curve_info, so the two never fight
-        # over the same label.
         self.update_curve_info()
 
     def animatable(self):
@@ -2516,7 +2520,13 @@ class Editor(QWidget):
         )
 
     def remove_frame(self):
+        """Delete the current frame, never the last one a clip must keep."""
         i = self.frame_index()
+        if len(self.obj.get("frames") or []) <= 1:
+            self.window().statusBar().showMessage(
+                "A movieclip must keep at least one frame", 4000
+            )
+            return
         self.clip_edit(lambda o: o["frames"].pop(i))
 
     def add_element(self):

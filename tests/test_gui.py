@@ -561,44 +561,38 @@ def test_playback_advances_one_frame_per_tick(window):
 
 
 def test_playback_holds_the_camera_still(window):
-    window.add_doc(populated())
-    e = window.current()
+    """The view must not follow the objects, while playing or frame stepping."""
+    w = window
+    w.add_doc(animatable_clip(6))
+    e = w.current()
     e.go_to(7)
-    assert e.preview.play_rect is None
+    e.elements.selectRow(0)
+    application().processEvents()
 
     def visible():
         rect = e.preview.mapToScene(e.preview.viewport().rect()).boundingRect()
-        return (round(rect.x(), 2), round(rect.y(), 2))
+        return (round(rect.x(), 1), round(rect.y(), 1))
 
+    # The scrollable area is set once per resource rather than per frame, which
+    # is what stopped the camera drifting and left it free to pan.
+    assert e.preview.view_rect is not None
+    settled = e.preview.view_rect
+    seen = [visible()]
     e.toggle_play()
     e.timer.stop()
-    assert e.preview.play_rect is not None
-    seen = []
-    locked = []
     for _ in range(6):
         e.tick()
         application().processEvents()
         seen.append(visible())
-        locked.append(e.preview.sceneRect() == e.preview.play_rect)
-    # The scrollable area must stay the locked one for the whole playthrough.
-    # That is the guarantee: following the current frame's bounds instead is
-    # what made the view drift, and it would show up here as a growing rect.
-    assert all(locked), "scene rect stopped tracking the locked play area"
-    # The view within that area then holds still. Scroll positions are whole
-    # pixels and the first tick may settle one, so allow a pixel of slack.
-    xs = [v[0] for v in seen]
-    ys = [v[1] for v in seen]
-    assert max(xs) - min(xs) <= 1 and max(ys) - min(ys) <= 1, f"camera moved: {seen}"
-
-    # toggle_play reads its state from the timer, which the manual ticks above
-    # stopped, so restart it to exercise the real stop path.
+        # It must not be recomputed per frame, only grown if panning needs it.
+        assert e.preview.view_rect is settled or e.preview.view_rect.contains(settled)
     e.timer.start()
     e.toggle_play()
-    assert e.preview.play_rect is None
-    # A different resource must not inherit the locked area.
-    e.preview.play_rect = e.preview.content_rect
+    assert len(set(seen)) == 1, f"camera moved during playback: {seen}"
+    # A different resource gets its own area rather than inheriting one.
+    e.preview.view_rect = None
     e.go_to(3)
-    assert e.preview.play_rect is None
+    assert e.preview.view_rect is not None
 
 
 def test_play_button_keeps_its_width(window):
@@ -1234,9 +1228,11 @@ def test_wheel_zooms_to_cursor_in_and_out_below_fit(window, atlas):
         after = p.mapToScene(cursor)
         distance_pixels = (after - before).manhattanLength() * p.transform().m11()
         assert distance_pixels < 0.15
-    # Fitting returns to asset bounds rather than the camera's expanded pan region.
+    # Fitting frames the content without narrowing the scrollable area to it,
+    # which is what used to re-anchor the camera onto the artwork.
     p.fit_content()
-    assert p.scene().sceneRect() == p.content_rect
+    assert p.scene().sceneRect().contains(p.content_rect)
+    assert p.transform().m11() == pytest.approx(p.fit_scale)
 
 
 def test_shift_wheel_pans_horizontally_without_zoom_and_alt_vertically(window):
@@ -1460,12 +1456,15 @@ def test_keyframe_strip_shows_the_timeline(window):
     assert strip.frame_count == 6
     assert strip.current == 0
     assert strip.row == 0
-    assert strip.keys == set()
+    # One row per child. Every frame shares one transform here, so there is a
+    # single key: a frame only counts when the value actually changes.
+    assert [t["label"] for t in strip.tracks] == ["sprite"]
+    assert strip.keys_of(0) == {0}
     # Clicking a frame moves the playhead without touching the document.
     strip.framePicked.emit(3)
     assert e.frame.value() == 3
     assert strip.current == 3
-    assert e.placement_keys(e.obj) == []
+    assert e.doc.resource(7)["frames"][3]["elements"][0][1] == 65535
 
 
 def test_set_and_delete_keypoint(window):
@@ -1479,7 +1478,7 @@ def test_set_and_delete_keypoint(window):
 
     e.toggle_keypoint_at(2, 0)
     assert e.placement_keys(e.obj) == [2]
-    assert 2 in e.keyframes.keys
+    assert 2 in e.keyframes.keys_of(0)
     # A second toggle on the same frame removes it again.
     e.toggle_keypoint_at(2, 0)
     assert e.placement_keys(e.obj) == []
@@ -1653,11 +1652,20 @@ def test_strip_band_selects_a_range_including_keys(window):
     assert strip.band == (0, 5)
     strip.clear_band()
     assert strip.selected_frames() == []
-    # select_keys spans the keys themselves.
+    # A key marks a change: a frame inheriting the previous transform is not
+    # one, and keying a frame to the value already in force changes nothing.
     e.frame.setValue(1)
     e.toggle_keypoint_at(1, 0)
-    e.frame.setValue(4)
-    e.toggle_keypoint_at(4, 0)
+    assert e.keyframes.keys_of(0) == {1}
+    e.select_all_keys()
+    assert strip.band == (1, 1)
+    # Give frame 4 a transform of its own so it becomes a real second key.
+    clip = e.doc.resource(7)
+    clip["frames"][4]["elements"][0][1] = e.intern_matrix(clip, [1, 0, 0, 1, 40, 0])
+    e.doc.update("movieclips", clip)
+    e.go_to(7)
+    application().processEvents()
+    assert e.keyframes.keys_of(0) == {1, 4}
     e.select_all_keys()
     assert strip.band == (1, 4)
 
@@ -1729,3 +1737,190 @@ def test_key_density_controls_how_many_keys_are_created(window):
     sparse = len(e.placement_keys(e.obj))
     assert sparse < dense, f"sparse {sparse} should be fewer than dense {dense}"
     assert sparse >= 3
+
+
+def key_at(e, frame, value):
+    """Give a frame its own transform, the way the animator's fields do."""
+    e.frame.setValue(frame)
+    application().processEvents()
+    e.key_fields["X"].setValue(value)
+    e.apply_animation_fields()
+    application().processEvents()
+
+
+def test_only_changes_are_keys(window):
+    """A frame inheriting the previous transform is not a key."""
+    w = window
+    w.add_doc(animatable_clip(8))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    # Every frame starts with no transform of its own, so the clip shows a
+    # single base key rather than one per frame.
+    assert e.keyframes.keys_of(0) == {0}
+    key_at(e, 2, 30.0)
+    # Frames 3-7 inherit frame 2, so they are not keys.
+    assert e.keyframes.keys_of(0) == {2}
+    key_at(e, 5, 90.0)
+    assert e.keyframes.keys_of(0) == {2, 5}
+    # Keying a frame with the value already in force changes nothing.
+    key_at(e, 6, 90.0)
+    assert e.keyframes.keys_of(0) == {2, 5}
+
+
+def test_keys_can_be_picked_separately(window):
+    from PyQt6.QtCore import QEvent, QPointF
+    from PyQt6.QtGui import QMouseEvent
+
+    w = window
+    w.add_doc(animatable_clip(8))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    for frame, value in ((2, 30.0), (5, 90.0)):
+        key_at(e, frame, value)
+    strip = e.keyframes
+    assert strip.keys_of(0) == {2, 5}
+
+    def click_key(frame, modifiers):
+        y = strip.RULER_HEIGHT + strip.TRACK_HEIGHT / 2
+        point = QPointF(strip.x_for(frame), y)
+        strip.mousePressEvent(
+            QMouseEvent(QEvent.Type.MouseButtonPress, point,
+                        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton, modifiers)
+        )
+        strip.mouseReleaseEvent(
+            QMouseEvent(QEvent.Type.MouseButtonRelease, point,
+                        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton, modifiers)
+        )
+        application().processEvents()
+
+    click_key(2, Qt.KeyboardModifier.NoModifier)
+    assert strip.selected_keys() == {(2, 0)}
+    # Ctrl adds individual keys and removes them again.
+    click_key(5, Qt.KeyboardModifier.ControlModifier)
+    assert strip.selected_keys() == {(2, 0), (5, 0)}
+    click_key(5, Qt.KeyboardModifier.ControlModifier)
+    assert strip.selected_keys() == {(2, 0)}
+
+
+def test_selected_keys_are_painted_distinctly(window):
+    from PyQt6.QtCore import QEvent, QPointF
+    from PyQt6.QtGui import QMouseEvent
+
+    w = window
+    w.add_doc(animatable_clip(6))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    strip = e.keyframes
+    strip.picked_keys = {(0, 0)}
+    image = strip.grab().toImage()
+    y = int(strip.RULER_HEIGHT + strip.TRACK_HEIGHT / 2)
+    x = int(strip.x_for(0))
+    colours = {
+        image.pixelColor(x + dx, y + dy).name()
+        for dx in range(-3, 4)
+        for dy in range(-3, 4)
+    }
+    # The selection highlight is the orange used by the playhead.
+    assert "#ff9d3a" in colours, colours
+
+
+def test_scrubbing_never_creates_frames_or_keys(window):
+    from PyQt6.QtCore import QEvent, QPointF
+    from PyQt6.QtGui import QMouseEvent
+
+    w = window
+    w.add_doc(animatable_clip(6))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    strip = e.keyframes
+    frames = len(e.obj["frames"])
+    keys = list(e.keyframes.keys_of(0))
+
+    point = QPointF(strip.x_for(1), strip.RULER_HEIGHT + 4)
+    strip.mousePressEvent(
+        QMouseEvent(QEvent.Type.MouseButtonPress, point, Qt.MouseButton.LeftButton,
+                    Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+    )
+    # Drag far past the end of the clip.
+    strip.mouseMoveEvent(
+        QMouseEvent(QEvent.Type.MouseMove, QPointF(strip.x_for(40), point.y()),
+                    Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                    Qt.KeyboardModifier.NoModifier)
+    )
+    strip.mouseReleaseEvent(
+        QMouseEvent(QEvent.Type.MouseButtonRelease, QPointF(strip.x_for(40), point.y()),
+                    Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                    Qt.KeyboardModifier.NoModifier)
+    )
+    application().processEvents()
+    assert len(e.obj["frames"]) == frames, "scrubbing must not add frames"
+    assert e.keyframes.keys_of(0) == set(keys), "scrubbing must not add keys"
+
+
+def test_moving_a_key_past_the_end_extends_the_clip(window):
+    w = window
+    w.add_doc(animatable_clip(5))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    e.frame.setValue(1)
+    e.toggle_keypoint_at(1, 0)
+    assert e.placement_keys(e.obj) == [1]
+    e.move_keypoint(1, 8)
+    assert len(e.obj["frames"]) >= 9
+    assert e.placement_keys(e.obj) == [8]
+
+
+def test_a_movieclip_keeps_at_least_one_frame(window):
+    w = window
+    w.add_doc(animatable_clip(1))
+    e = w.current()
+    e.go_to(7)
+    application().processEvents()
+    assert len(e.obj["frames"]) == 1
+    e.remove_frame()
+    assert len(e.obj["frames"]) == 1
+    assert "at least one frame" in window.statusBar().currentMessage()
+    # With more than one frame, removal still works.
+    e.add_frame(False)
+    assert len(e.obj["frames"]) == 2
+    e.remove_frame()
+    assert len(e.obj["frames"]) == 1
+
+
+def test_camera_stays_free_of_the_artwork_bounds(window):
+    w = window
+    w.add_doc(animatable_clip(6))
+    e = w.current()
+    w.show()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    # Move one frame's placement far away and check the view does not follow.
+    clip = e.doc.resource(7)
+    clip["frames"][5]["elements"][0][1] = e.intern_matrix(clip, [1, 0, 0, 1, 900, 600])
+    e.doc.update("movieclips", clip)
+    e.go_to(7)
+    application().processEvents()
+
+    def visible():
+        rect = e.preview.mapToScene(e.preview.viewport().rect()).boundingRect()
+        return (round(rect.x(), 1), round(rect.y(), 1))
+
+    seen = []
+    for frame in (0, 2, 5, 1, 4):
+        e.frame.setValue(frame)
+        application().processEvents()
+        seen.append(visible())
+    assert len(set(seen)) == 1, f"camera followed the artwork: {seen}"
+    # The scrollable area is wider than the content, which is what frees it.
+    assert e.preview.scene().sceneRect().contains(e.preview.content_rect)

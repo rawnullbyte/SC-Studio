@@ -93,21 +93,23 @@ Open an atlas from the texture list. Every draw command that samples it is outli
 Most commands in a real UI atlas are *zero-area* — all four corners sample a single texel, so there is no rectangle to outline. Those are drawn as small diamond markers over the texel they sample and are pickable and openable like any other region, which keeps shapes that would otherwise be invisible in the atlas reachable. Several shapes commonly share one texel, so a click can land on more than one; the innermost match opens and the rest stay available in the right-click menu. Atlas commands are also dense — a single sheet can hold tens of thousands — so the marker overlay is what makes atlas-wide browsing practical.
 **Keyframe animation**
 
-A keyframe timeline sits under the preview, so the whole thing is done there rather than in the Frames tab. It shows every frame of the open movieclip, the keyframes of the selected placement as diamonds, a playhead, and a translucent band over the selected range of frames.
+A multi-track animator sits under the preview. Every child of the movieclip gets its own labeled track showing that object's keyframes, under a shared ruler with a draggable playhead, so a whole animation is visible and editable at once.
 
-- **Drag in the ruler** (the lower part) to select a range of frames. The same drag over either key selects the whole tween between them, which is the usual case.
-- **Drag a key** in the upper track to move it to another frame; **right-click a key** to remove it, jump to it, or extend the selection to it.
-- **Right-click the ruler** for frame actions (add, duplicate, delete) and to apply a curve to just that selection, including a submenu that picks how many frames to generate.
-- **Drag a band edge** to lengthen or shorten the selection.
-- Picking a different placement switches the strip to that placement's keys.
+**A key marks a change.** A frame with no key of its own inherits the last transform set, exactly as the engine resolves it, so a still hold shows one key rather than one per frame. Keying a frame with the value already in force changes nothing.
 
-**Size, position, rotation and scale** are editable in the Animation tab's transform fields for the current frame. Applying them keys that frame, so editing here animates instead of changing a transform shared with other frames. Rotation is not limited to a dialog: the same fields carry it.
+- **Drag the playhead** anywhere, over the ruler or a track, to scrub. Scrubbing moves the cursor only and never creates a frame or a key.
+- **Click a key** to select it; it turns orange. **Ctrl-click** adds or removes individual keys, so any set of keys can be picked. **Shift-click** extends a range from the last one.
+- **Drag a key** to move it to another frame. Dragging past the end extends the movieclip.
+- **Right-click a key** for per-key actions; **right-click a track or the ruler** for frame actions and to apply a curve to the selection.
+- Selecting a different track selects that child, so the preview and panels follow the timeline.
 
-**Curve and how many keys.** Choose a curve (Linear, Ease in, Ease out, Ease in-out, Smooth, Snap in, Snap out, Overshoot, Anticipate, drawn as a preview), set **Keys to create** to the number of frames to write between each pair of keys, then **Apply curve to range**. The keys you set are kept exactly; only the frames between them are generated. **Undo curve** removes just the frames that curve wrote.
+Moving an object in the viewer keys the current frame, so a change is recorded where the playhead is. A movieclip always keeps at least one frame.
 
-Frames can also be created from the animator directly — **Add frame**, **Duplicate**, **Delete frame** — so building a timeline does not mean switching tabs.
+**Transform and curve.** X, Y, Rotation, Scale X and Scale Y fields below the timeline show the selected track's transform on the current frame; **Key transform** writes them as a keyframe. Choose a curve (Linear, Ease in, Ease out, Ease in-out, Smooth, Snap in, Snap out, Overshoot, Anticipate, drawn as a preview), set **Keys to create** to how many frames to write between each pair of keys, then **Apply to range**. Keys are kept exactly and only the frames between them are generated. **Undo curve** removes just the frames a curve wrote.
 
-The SC2 format stores one discrete transform per frame and has nowhere to record a curve, so a curve is an authoring choice that is baked into frames; the game reads ordinary frames. Rotation interpolates by the shorter way round and scale is kept positive through a turn, which a direct blend of the matrix components would not do.
+The SC2 format stores one discrete transform per frame and has nowhere to record a curve, so a curve is an authoring choice that is baked into frames; the game reads ordinary frames. Rotation interpolates by the shorter way round and scale stays positive through a turn, which a direct blend of the matrix components would not do.
+
+**The view is not tied to the artwork.** The scrollable area is set once per resource rather than per frame, so scrubbing and playback never move the camera even though each frame has different bounds, and it stays free to pan and zoom.
 
 ## Interface
 

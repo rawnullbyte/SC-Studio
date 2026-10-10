@@ -328,6 +328,19 @@ class AnimatorTimeline(QWidget):
         """Keypoints selected directly, as (frame, row) pairs."""
         return set(self.picked_keys)
 
+    def pick_keys(self, keys):
+        """Select a set of keypoints, as the clicks on them would.
+
+        The editor's key operations act on what is picked here, so an agent
+        driving a curve authors the same selection a person would build by
+        clicking, rather than a parallel selection of its own.
+        """
+        self.picked_keys = {tuple(key) for key in keys}
+        self.picked = set()
+        self.band = None
+        self.selectionChanged.emit()
+        self.update()
+
     def key_block(self, anchor, target):
         """Every key in the block between two keys, across frames and tracks.
 

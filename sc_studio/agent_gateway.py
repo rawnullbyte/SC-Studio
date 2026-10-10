@@ -2,6 +2,7 @@
 import base64
 import hmac
 import json
+import math
 import os
 import secrets
 import threading
@@ -12,6 +13,7 @@ from pathlib import Path
 
 from PyQt6.QtCore import QObject, pyqtSignal, QBuffer, QIODevice
 from .document import Document, KINDS
+from . import easing
 
 
 def connection_path():
@@ -334,6 +336,244 @@ class AgentGateway(QObject):
         ys = [v[1] for v in vertices]
         return [round(max(xs) - min(xs), 3), round(max(ys) - min(ys), 3)]
 
+    def requested_matrix(self, ed, clip, row, args):
+        """The transform a call asked for, or None when it only named frames.
+
+        A partial transform is applied on top of what the row already renders on
+        the first named frame: naming only `x` should move the placement, not
+        drop its rotation and scale. `scale` is read as a resize about the
+        placement's own origin, so the object grows where it stands instead of
+        sliding away from the world origin.
+        """
+        transform = args.get("transform")
+        scale = args.get("scale")
+        if transform is None and scale is None:
+            return None
+        frames = args.get("frames") or [0]
+        base_frame = min(frames) if frames else 0
+        if not 0 <= base_frame < len(clip["frames"]):
+            raise ValueError("Frame is out of range")
+        base = list(ed.matrix_at(clip, base_frame, row))
+        if transform is not None:
+            if "matrix" in transform:
+                matrix = [float(v) for v in transform["matrix"]]
+                if len(matrix) != 6:
+                    raise ValueError("matrix must be [a,b,c,d,tx,ty]")
+                base = matrix
+            else:
+                parts = easing.decompose(base)
+                for name, key in (("x", "tx"), ("y", "ty")):
+                    if name in transform:
+                        parts[key] = float(transform[name])
+                if "rotation" in transform:
+                    parts["rotation"] = math.radians(float(transform["rotation"]))
+                for name in ("scale_x", "scale_y"):
+                    if name in transform:
+                        parts[name] = float(transform[name])
+                base = easing.compose(parts)
+        if scale is not None:
+            factor = float(scale)
+            # Scale about the placement's own origin: t' = t + (s - 1) * t.
+            base = [
+                base[0] * factor, base[1] * factor,
+                base[2] * factor, base[3] * factor,
+                base[4] + (factor - 1.0) * base[4],
+                base[5] + (factor - 1.0) * base[5],
+            ]
+        if any(not math.isfinite(v) for v in base):
+            raise ValueError("Transform values must be finite")
+        return base
+
+    def keyframe_edit(self, ed, operation, args):
+        """Key, unkey and tween, through the animator's own operations.
+
+        These run the same methods the timeline's menus and buttons call, so an
+        agent's edit and a person's edit are the same edit: the same rules about
+        which frames are keys, the same refusal to overwrite a key, the same
+        single undo step. The selection the operations act on is the timeline's,
+        which is set here from what the call asked for.
+        """
+        if not ed.animatable():
+            raise ValueError(
+                "That movieclip has no placement on this row and frame; add a "
+                "child with add_child first"
+            )
+        clip = ed.doc.resource(ed.selected)
+        row = args.get("row")
+        if row is None:
+            row = ed.placement_row()
+        if not 0 <= row < len(clip["children"]):
+            raise ValueError("Placement row is out of range")
+        if row != ed.elements.currentRow():
+            ed.select_track(row)
+        frames = args.get("frames")
+
+        if operation == "set_keys":
+            writes, keys = ed.key_frames(clip, row, frames)
+            matrix = self.requested_matrix(ed, clip, row, args)
+            if args.get("curve") is not None:
+                ed.curve.setCurrentText(args["curve"])
+                if ed.curve.currentText() != args["curve"]:
+                    raise ValueError(f"Unknown curve; choose from {ed.curve_names()}")
+            if args.get("key_density") is not None:
+                ed.key_density.setValue(int(args["key_density"]))
+            if matrix is not None and not writes and not args.get("overwrite"):
+                raise ValueError(
+                    "Every named frame already carries a key; pass "
+                    "overwrite=true to give them this transform instead, or "
+                    "clear_keys first"
+                )
+            if matrix is not None:
+                # Keyed directly at the requested transform. With overwrite the
+                # frames that are already keys are included, which is how an
+                # existing pose is replaced rather than skipped.
+                if args.get("overwrite"):
+                    writes = sorted(set(writes) | set(keys))
+                for frame in writes:
+                    ed.frame.setValue(frame)
+                    ed.assign_matrix(clip, clip["frames"][frame]["elements"][row], matrix)
+                if not ed.mutate(lambda: ed.doc.update("movieclips", clip)):
+                    return {}
+            elif args.get("curve") is not None and len(writes) >= 2:
+                # The named frames become the keys; the curve fills between them.
+                for frame in writes:
+                    ed.frame.setValue(frame)
+                    ed.toggle_keypoint_at(frame, row)
+                clip = ed.doc.resource(ed.selected)
+                ed.keyframes.pick_keys([(frame, row) for frame in writes])
+                ed.apply_curve_to_range()
+            else:
+                for frame in writes:
+                    ed.frame.setValue(frame)
+                    ed.toggle_keypoint_at(frame, row)
+            clip = ed.doc.resource(ed.selected)
+            result_keys = ed.keyed_frames(clip, row)
+            return {
+                "movieclip_id": ed.selected, "row": row,
+                "keys": result_keys, "key_count": len(result_keys),
+                "keyed": sorted(set(result_keys) - set(keys)),
+                "skipped_existing_keys": sorted(keys),
+                "curve": ed.curve.currentText() if args.get("curve") else None,
+            }
+
+        if operation == "clear_keys":
+            targets = frames if frames is not None else ed.keyed_frames(clip, row)
+            ed.remove_keypoints(sorted(targets))
+            clip = ed.doc.resource(ed.selected)
+            return {
+                "movieclip_id": ed.selected, "row": row,
+                "keys": ed.keyed_frames(clip, row),
+            }
+
+        if operation == "tween":
+            picks = args.get("keys")
+            if picks is None:
+                picks = [(frame, row) for frame in ed.keyed_frames(clip, row)]
+            else:
+                picks = [tuple(pair) for pair in picks]
+            if len(picks) < 2:
+                raise ValueError("Select at least two keys to tween between")
+            if args.get("curve") is not None:
+                ed.curve.setCurrentText(args["curve"])
+                if ed.curve.currentText() != args["curve"]:
+                    raise ValueError(f"Unknown curve; choose from {ed.curve_names()}")
+            if args.get("key_density") is not None:
+                ed.key_density.setValue(int(args["key_density"]))
+            before = set(ed.keyed_frames(clip, row))
+            ed.keyframes.pick_keys(picks)
+            ed.apply_curve_to_range()
+            clip = ed.doc.resource(ed.selected)
+            after = ed.keyed_frames(clip, row)
+            return {
+                "movieclip_id": ed.selected, "row": row,
+                "keys": after, "key_count": len(after),
+                "written": sorted(set(after) - before),
+                "curve": ed.curve.currentText(),
+                "key_density": ed.key_density.value(),
+            }
+
+        if operation == "move_keys":
+            delta = int(args["delta"])
+            picks = args.get("keys")
+            if picks is None:
+                picks = [(frame, row) for frame in ed.keyed_frames(clip, row)]
+            picks = sorted(tuple(pair) for pair in picks)
+            if not picks:
+                raise ValueError("No keys to move")
+            if min(frame for frame, _ in picks) + delta < 0:
+                raise ValueError("That would move a key before the first frame")
+            ed.keyframes.pick_keys(picks)
+            source = picks[0][0]
+            # Every pick moves by the same offset, so the selection keeps its
+            # spacing; the editor refuses a landing that would clobber a key.
+            ed.move_keypoint(source, source + delta, picks[0][1], delta=delta)
+            clip = ed.doc.resource(ed.selected)
+            return {
+                "movieclip_id": ed.selected, "row": picks[0][1],
+                "keys": ed.keyed_frames(clip, picks[0][1]),
+                "moved": sorted([frame + delta for frame, _ in picks]),
+                "delta": delta,
+            }
+
+        raise ValueError(f"Unknown keyframe operation: {operation}")
+
+    def get_timeline(self, doc, ed, args):
+        """A movieclip's whole animation: every track, its keys, and what is picked.
+
+        The animator's operations act on a track row and a selection of keys, so
+        an agent needs both before it changes anything. Poses are resolved
+        through inheritance, which is how the engine reads a frame that sets
+        nothing: reporting the raw references would leave an agent unable to
+        tell a held pose from a reset to no transform.
+        """
+        id = args["movieclip_id"]
+        if doc.index[id][0] != "movieclips":
+            raise ValueError("Resource must be a movieclip")
+        clip = doc.resource(id, lazy_frames=True)
+        row = args.get("row")
+        tracks = []
+        for index, child in enumerate(clip["children"]):
+            if row is not None and index != row:
+                continue
+            names = doc.names.get(child["id"], [])
+            tracks.append({
+                "row": index,
+                "name": child["name"],
+                "child_id": child["id"],
+                "child_exports": names,
+                "keys": ed.keyed_frames(clip, index),
+                "key_count": len(ed.keyed_frames(clip, index)),
+            })
+        result = {
+            "movieclip_id": id,
+            "frame_count": len(clip["frames"]),
+            "framerate": clip.get("framerate"),
+            "tracks": tracks,
+            "picked_keys": sorted(
+                [list(key) for key in ed.keyframes.selected_keys()]
+            ),
+            "picked_frames": ed.keyframes.selected_frames(),
+            "curve": ed.curve.currentText(),
+            "curve_names": ed.curve_names(),
+            "key_density": ed.key_density.value(),
+        }
+        if args.get("frames") is not None or args.get("row") is not None:
+            target = row if row is not None else 0
+            if not 0 <= target < len(clip["children"]):
+                raise ValueError("Placement row is out of range")
+            frames = args.get("frames") or ed.clip_frames(clip)
+            result["poses"] = [
+                {
+                    "frame": frame,
+                    "matrix": ed.matrix_at(clip, frame, target),
+                    "keyed": ed.keyed_matrix_at(clip, frame, target) is not None,
+                }
+                for frame in frames
+                if 0 <= frame < len(clip["frames"])
+            ]
+            result["row"] = target
+        return result
+
     def dispatch(self, request):
         payload, future = request
         if not future.set_running_or_notify_cancel():
@@ -353,6 +593,21 @@ class AgentGateway(QObject):
 
     def execute(self, operation, args):
         from .app import jsonable
+        if operation == "edit_frames":
+            # One tool with an action, so an agent new to the format does not
+            # have to find five near-identical frame tools.
+            operation = {
+                "insert": "insert_frames",
+                "duplicate": "duplicate_frames",
+                "delete": "delete_frames",
+                "set_label": "set_frame_label",
+                "set_framerate": "set_framerate",
+            }.get((args.get("action") or "").strip())
+            if operation is None:
+                raise ValueError(
+                    "action must be one of insert, duplicate, delete, "
+                    "set_label, set_framerate"
+                )
         if operation == "documents":
             return [self.describe(ed) for ed in self.editors()]
         if operation in ("open_document", "new_document"):
@@ -447,6 +702,8 @@ class AgentGateway(QObject):
                 "offset": offset,
                 "regions": regions[offset : offset + limit],
             }
+        if operation == "get_timeline":
+            return self.get_timeline(doc, ed, args)
         if operation == "get_placement":
             id = args["movieclip_id"]
             if doc.index[id][0] != "movieclips":
@@ -468,6 +725,18 @@ class AgentGateway(QObject):
         # Navigation also resolves draft widgets in the normal GUI; do not prompt agents.
         if ed.drafts:
             raise ValueError("Apply or discard unapplied inspector edits in the app before agent changes")
+        if operation in ("set_keys", "clear_keys", "tween", "move_keys"):
+            # These drive the animator's own widgets, so the document has to be
+            # the one on screen and no inspector draft may be pending.
+            self.window.editors.setCurrentWidget(ed)
+            if args.get("movieclip_id") is not None:
+                id = args["movieclip_id"]
+                if id not in doc.index:
+                    raise ValueError("Resource does not exist")
+                ed.go_to(id)
+            if doc.index[ed.selected][0] != "movieclips":
+                raise ValueError("Resource must be a movieclip")
+            return self.keyframe_edit(ed, operation, args)
         if operation in ("select_resource", "view_preview"):
             self.window.editors.setCurrentWidget(ed)
             if args.get("resource_id") is not None:
@@ -551,6 +820,108 @@ class AgentGateway(QObject):
                 if source is ed:
                     raise ValueError("Choose a different source document")
                 result["mapping"] = doc.import_resources(source.doc, args["resource_ids"])
+            elif operation in ("insert_frames", "delete_frames", "duplicate_frames",
+                                "set_frame_label", "set_framerate", "remove_child"):
+                id = args["movieclip_id"]
+                if doc.index[id][0] != "movieclips":
+                    raise ValueError("Resource must be a movieclip")
+                clip = doc.resource(id)
+                count = len(clip["frames"])
+                if operation == "remove_child":
+                    index = args["child_index"]
+                    if not 0 <= index < len(clip["children"]):
+                        raise ValueError("Child index is out of range")
+                    if any(any(e[0] == index for e in frame["elements"])
+                           for frame in clip["frames"]):
+                        raise ValueError(
+                            "That child is placed in a frame; remove its "
+                            "placements first"
+                        )
+                    removed = clip["children"].pop(index)
+                    result["removed"] = removed
+                    doc.update("movieclips", clip)
+                elif operation == "set_framerate":
+                    rate = args["framerate"]
+                    if not 1 <= rate <= 120:
+                        raise ValueError("framerate must be between 1 and 120")
+                    clip["framerate"] = rate
+                    doc.update("movieclips", clip)
+                elif operation == "set_frame_label":
+                    index = args["frame"]
+                    if not 0 <= index < count:
+                        raise ValueError("Frame is out of range")
+                    clip["frames"][index]["label"] = args.get("label", "")
+                    doc.update("movieclips", clip)
+                else:
+                    index = args.get("frame", 0)
+                    amount = max(1, int(args.get("count", 1)))
+                    if operation == "insert_frames":
+                        if not 0 <= index <= count:
+                            raise ValueError("Frame is out of range")
+                        label = args.get("label", "")
+                        label_every = bool(args.get("label_every_frame"))
+                        # The inserted frames draw the children the frame before
+                        # them draws, with no transform of their own, so the
+                        # animation holds through the gap instead of the objects
+                        # disappearing. A frame with no children would blank the
+                        # stage for however many frames were added.
+                        template = (
+                            clip["frames"][index - 1]["elements"]
+                            if index > 0
+                            else (clip["frames"][0]["elements"] if clip["frames"] else [])
+                        )
+                        clip["frames"][index:index] = [
+                            {
+                                "label": label if (index == 0 or label_every) else "",
+                                "elements": [[e[0], 65535, 65535] for e in template],
+                            }
+                            for _ in range(amount)
+                        ]
+                    elif operation == "delete_frames":
+                        frames = args.get("frames")
+                        if frames is None:
+                            frames = list(range(index, index + amount))
+                        if not frames:
+                            raise ValueError("No frames to delete")
+                        targets = sorted({f for f in frames
+                                          if 0 <= f < count}, reverse=True)
+                        while targets and len(targets) >= count:
+                            # A movieclip always keeps one frame.
+                            targets = targets[1:]
+                        if not targets:
+                            raise ValueError("A movieclip must keep at least one frame")
+                        for f in targets:
+                            clip["frames"].pop(f)
+                    else:
+                        # Duplicating copies the frame as it renders, so the new
+                        # frame holds the pose that was on screen.
+                        frames = args.get("frames") or [index]
+                        frames = sorted({f for f in frames if 0 <= f < count})
+                        if not frames:
+                            raise ValueError("Frame is out of range")
+                        built = []
+                        for f in frames:
+                            source = clip["frames"][f]
+                            elements = []
+                            for row_index, element in enumerate(source["elements"]):
+                                # The pose the frame renders is written onto the
+                                # duplicate as its own key. Leaving it to
+                                # inherit would resolve against the end of the
+                                # clip instead, which is not the pose that was
+                                # on screen when it was copied.
+                                elements.append([
+                                    element[0],
+                                    ed.intern_matrix(
+                                        clip, ed.matrix_at(clip, f, row_index)
+                                    ),
+                                    element[2],
+                                ])
+                            for _ in range(amount):
+                                built.append({"label": source["label"],
+                                              "elements": [list(e) for e in elements]})
+                        clip["frames"].extend(built)
+                        result["added"] = len(built)
+                    doc.update("movieclips", clip)
             elif operation in ("add_child", "transform_placement", "move_placement"):
                 id = args["movieclip_id"]
                 if doc.index[id][0] != "movieclips":

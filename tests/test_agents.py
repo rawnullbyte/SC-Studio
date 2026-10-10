@@ -315,3 +315,138 @@ def test_a_clip_that_draws_itself_does_not_hang_the_size_walk(window, tmp_path):
         assert row["size"] is not None
     finally:
         gateway.stop()
+
+
+def test_agent_can_author_an_animation(window, tmp_path):
+    """Keying, tweening and frame editing through the animator's own operations."""
+    doc = populated()
+    clip = doc.resource(7)
+    clip["children"] = [{"id": 3, "name": "sprite", "blend": 0}]
+    clip["frames"] = [
+        {"label": "", "elements": [[0, 65535, 65535]]} for _ in range(16)
+    ]
+    doc.update("movieclips", clip)
+    window.add_doc(doc)
+    gateway = AgentGateway(window, tmp_path / "connection.json")
+    gateway.start()
+    try:
+        # The timeline reports the tracks, the selection and the curve palette.
+        timeline = gateway.execute("get_timeline", {"movieclip_id": 7})
+        assert timeline["frame_count"] == 16
+        assert [t["row"] for t in timeline["tracks"]] == [0]
+        assert timeline["tracks"][0]["keys"] == []
+        assert "Overshoot" in timeline["curve_names"]
+
+        # Key two frames at chosen transforms.
+        first = gateway.execute("set_keys", {
+            "movieclip_id": 7, "row": 0, "frames": [0],
+            "transform": {"x": 0, "y": 0}})
+        assert first["keys"] == [0]
+        second = gateway.execute("set_keys", {
+            "movieclip_id": 7, "row": 0, "frames": [12],
+            "transform": {"x": 240, "y": 90, "rotation": 30}})
+        assert second["keys"] == [0, 12]
+
+        # A curve fills the gap and keeps the keys exact.
+        tweened = gateway.execute("tween", {
+            "movieclip_id": 7, "row": 0, "keys": [[0, 0], [12, 0]],
+            "curve": "Overshoot", "key_density": 6})
+        assert tweened["keys"][0] == 0 and tweened["keys"][-1] == 12
+        assert tweened["written"], "the curve wrote the frames between the keys"
+        poses = gateway.execute("get_timeline", {
+            "movieclip_id": 7, "row": 0, "frames": [0, 12]})["poses"]
+        assert [p["matrix"][4] for p in poses] == [0.0, 240.0]
+        # Overshoot really passes the end value.
+        middle = gateway.execute("get_timeline", {
+            "movieclip_id": 7, "row": 0, "frames": [11]})["poses"][0]
+        assert middle["matrix"][4] > 240.0
+
+        # A frame with no key of its own reports the pose it inherits.
+        unkeyed = gateway.execute("get_timeline", {
+            "movieclip_id": 7, "row": 0, "frames": [2]})["poses"][0]
+        assert unkeyed["keyed"] is False
+        assert unkeyed["matrix"][4] > 0.0
+
+        # Overwriting an existing key is explicit.
+        with pytest.raises(ValueError):
+            gateway.execute("set_keys", {
+                "movieclip_id": 7, "row": 0, "frames": [12],
+                "transform": {"x": 1}})
+        forced = gateway.execute("set_keys", {
+            "movieclip_id": 7, "row": 0, "frames": [12],
+            "transform": {"x": 1}, "overwrite": True})
+        assert forced["keys"] == [0, 1, 3, 5, 7, 9, 11, 12]
+        assert gateway.execute("get_timeline", {
+            "movieclip_id": 7, "row": 0, "frames": [12]})["poses"][0]["matrix"][4] == 1.0
+
+        # Clearing a key returns the frame to inheriting.
+        cleared = gateway.execute("clear_keys", {
+            "movieclip_id": 7, "row": 0, "frames": [6]})
+        assert 6 not in cleared["keys"]
+
+        # Moving a key keeps its pose and refuses to clobber another.
+        moved = gateway.execute("move_keys", {
+            "movieclip_id": 7, "row": 0, "keys": [[12, 0]], "delta": 2})
+        assert moved["moved"] == [14]
+        assert 14 in moved["keys"] and 12 not in moved["keys"]
+
+        # Frame editing: insert holds the previous frame's children, duplicate
+        # copies the pose, and the clip always keeps a frame.
+        before = gateway.execute("get_timeline", {"movieclip_id": 7})["frame_count"]
+        gateway.execute("edit_frames", {
+            "movieclip_id": 7, "action": "insert", "frame": 5, "count": 2})
+        inserted = gateway.execute("get_timeline", {
+            "movieclip_id": 7, "row": 0, "frames": [5, 6]})["poses"]
+        # The inserted frames draw the child rather than blanking the stage.
+        assert all(p["matrix"] is not None for p in inserted)
+        duplicated = gateway.execute("edit_frames", {
+            "movieclip_id": 7, "action": "duplicate", "frames": [0], "count": 1})
+        assert duplicated["added"] == 1
+        assert gateway.execute("get_timeline", {"movieclip_id": 7})["frame_count"] == before + 3
+        gateway.execute("edit_frames", {
+            "movieclip_id": 7, "action": "delete", "frames": [0, 1, 2]})
+        gateway.execute("edit_frames", {"movieclip_id": 7, "action": "set_framerate",
+                                        "framerate": 24})
+        assert gateway.execute("get_timeline", {"movieclip_id": 7})["framerate"] == 24
+        # Everything an agent wrote is a valid document.
+        assert gateway.execute("validate", {})["errors"] == []
+
+        gateway.execute("undo", {})
+        gateway.execute("redo", {})
+        assert gateway.execute("validate", {})["errors"] == []
+    finally:
+        gateway.stop()
+
+
+def test_agent_animation_refuses_bad_requests(window, tmp_path):
+    doc = populated()
+    clip = doc.resource(7)
+    clip["children"] = [{"id": 3, "name": "sprite", "blend": 0}]
+    clip["frames"] = [{"label": "", "elements": [[0, 65535, 65535]]}]
+    doc.update("movieclips", clip)
+    window.add_doc(doc)
+    gateway = AgentGateway(window, tmp_path / "connection.json")
+    gateway.start()
+    try:
+        with pytest.raises(ValueError):
+            gateway.execute("set_keys", {"movieclip_id": 7, "row": 0,
+                                         "frames": [0], "curve": "Wobble"})
+        with pytest.raises(ValueError):
+            gateway.execute("tween", {"movieclip_id": 7, "row": 0,
+                                      "keys": [[0, 0]]})
+        with pytest.raises(ValueError):
+            gateway.execute("edit_frames", {"movieclip_id": 7, "action": "erase"})
+        with pytest.raises(ValueError):
+            gateway.execute("edit_frames", {"movieclip_id": 7, "action": "set_framerate",
+                                            "framerate": 0})
+        # A placement row that does not exist is refused rather than ignored.
+        with pytest.raises(ValueError):
+            gateway.execute("set_keys", {"movieclip_id": 7, "row": 9,
+                                         "frames": [0], "transform": {"x": 1}})
+        # Deleting every frame cannot leave the clip empty.
+        with pytest.raises(ValueError):
+            gateway.execute("edit_frames", {"movieclip_id": 7, "action": "delete",
+                                            "frames": [0]})
+        assert gateway.execute("validate", {})["errors"] == []
+    finally:
+        gateway.stop()

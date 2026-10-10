@@ -1481,6 +1481,56 @@ class Editor(QWidget):
             if chosen_row == row
         )
 
+    # --- keying helpers, shared with agent access -----------------------------
+    #
+    # Each of these is the body of the animator's own operation with the widget
+    # handling arranged around it, so an agent driving the timeline keys frames
+    # exactly the way the buttons do. They are guarded by ``animatable`` rather
+    # than assuming a selection, so an out-of-context call is a no-op instead of
+    # a crash on stale widget state.
+
+    @staticmethod
+    def clip_frames(clip):
+        """Frame indices, for defaulting an operation to the whole clip."""
+        return list(range(len(clip.get("frames") or [])))
+
+    def keyed_matrix_at(self, clip, frame, row):
+        """The placement's keyed transform, or None if it has no key there."""
+        if not 0 <= frame < len(clip["frames"]):
+            return None
+        elements = clip["frames"][frame]["elements"]
+        if row >= len(elements) or elements[row][1] == 65535:
+            return None
+        matrices = self.clip_bank(clip).get("matrices") or []
+        index = elements[row][1]
+        return list(matrices[index]) if index < len(matrices) else None
+
+    def key_frames(self, clip, row, frames=None):
+        """Split requested frames into the ones to write and the ones that are keys.
+
+        A frame already carrying a key is left exactly as it is: writing the
+        incoming transform over it would replace that pose, and where the new
+        value equals the old the frame would stop reading as a key at all.
+        """
+        wanted = self.clip_frames(clip) if frames is None else sorted(set(frames))
+        already = set(self.keyed_frames(clip, row))
+        return (
+            [f for f in wanted if 0 <= f < len(clip["frames"]) and f not in already],
+            [f for f in wanted if 0 <= f < len(clip["frames"]) and f in already],
+        )
+
+    def keyed_frames(self, clip, row):
+        """Frames where the placement carries a transform of its own."""
+        keys = []
+        for frame in self.clip_frames(clip):
+            if self.keyed_matrix_at(clip, frame, row) is not None:
+                keys.append(frame)
+        return keys
+
+    def curve_names(self):
+        """Every easing curve an agent may ask for."""
+        return list(easing.PRESETS)
+
     def update_curve_info(self):
         """Describe what applying the curve would affect, next to the button."""
         if not self.animatable():

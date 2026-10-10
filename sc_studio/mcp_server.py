@@ -184,6 +184,115 @@ together. Use this when you are walking an atlas's commands in bulk.
         return call("import_resources", document_id=document_id, source_document_id=source_document_id, resource_ids=resource_ids)
 
     @server.tool()
+    def get_timeline(movieclip_id: int, row: int | None = None,
+                     frames: list[int] | None = None,
+                     document_id: str | None = None) -> dict:
+        """A movieclip's animation: every track with its keys, the current key selection, the chosen curve and key density.
+
+        Call this before keying anything. `row` limits the answer to one track,
+        and passing `frames` as well adds that track's resolved pose per frame
+        with a `keyed` flag, which is how you tell a held pose from a frame that
+        has no key: an unkeyed frame inherits the nearest earlier key and is
+        reported with that inherited matrix. Poses are plain affine matrices.
+        """
+        return call("get_timeline", document_id=document_id, movieclip_id=movieclip_id,
+                    row=row, frames=frames)
+
+    @server.tool()
+    def set_keys(movieclip_id: int, frames: list[int] | None = None, row: int | None = None,
+                 transform: dict | None = None, scale: float | None = None,
+                 curve: str | None = None, key_density: int | None = None,
+                 document_id: str | None = None) -> dict:
+        """Key frames on one track, optionally writing a tween between them.
+
+        The main animation tool. Give `frames` (zero-based; omit for every
+        frame) and either `transform` (any of x, y, rotation in degrees, scale_x,
+        scale_y, or a full matrix as [a,b,c,d,tx,ty]) or `scale` to resize about
+        the placement's own origin. Without `curve` each frame is keyed at that
+        transform. With `curve` (see get_timeline's curve_names; "Linear", "Ease
+        in", "Ease in-out", "Smooth", "Snap in", "Snap out", "Overshoot",
+        "Anticipate") the listed frames become the keys and the curve fills the
+        frames between them at `key_density` steps per gap.
+
+        Frames that already carry a key are left exactly as they are and listed
+        in `skipped_existing_keys`, so a tween never overwrites a pose you set
+        deliberately. An empty `frames` means every frame in the clip.
+        """
+        return call("set_keys", document_id=document_id, movieclip_id=movieclip_id,
+                    frames=frames, row=row, transform=transform, scale=scale,
+                    curve=curve, key_density=key_density)
+
+    @server.tool()
+    def tween(movieclip_id: int, keys: list[list[int]] | None = None,
+              curve: str | None = None, key_density: int | None = None,
+              row: int | None = None, document_id: str | None = None) -> dict:
+        """Fill the gaps between keys with an easing curve, keeping the keys themselves exact.
+
+        `keys` is a list of [frame, row] pairs; omit it to tween between every
+        key on `row`. The curve is an authoring choice baked into frames because
+        the format stores one discrete transform per frame with nowhere to record
+        an interpolation — the game reads ordinary frames afterwards. Rotation
+        interpolates the short way round and scale stays positive through a turn.
+        """
+        return call("tween", document_id=document_id, movieclip_id=movieclip_id,
+                    keys=keys, curve=curve, key_density=key_density, row=row)
+
+    @server.tool()
+    def clear_keys(movieclip_id: int, frames: list[int] | None = None,
+                   row: int | None = None, document_id: str | None = None) -> dict:
+        """Remove keys so those frames inherit again; omit `frames` to clear the whole track.
+
+        The frames are not deleted, only unkeyed: each goes back to holding
+        whatever the nearest earlier key sets.
+        """
+        return call("clear_keys", document_id=document_id, movieclip_id=movieclip_id,
+                    frames=frames, row=row)
+
+    @server.tool()
+    def move_keys(movieclip_id: int, delta: int, keys: list[list[int]] | None = None,
+                  row: int | None = None, document_id: str | None = None) -> dict:
+        """Shift keys by a number of frames, keeping the selection's spacing.
+
+        Every listed key moves by the same `delta`. A move that would land on a
+        key that is staying put is refused rather than overwriting that pose.
+        """
+        return call("move_keys", document_id=document_id, movieclip_id=movieclip_id,
+                    delta=delta, keys=keys, row=row)
+
+    @server.tool()
+    def edit_frames(movieclip_id: int, action: str, frame: int = 0,
+                    count: int = 1, frames: list[int] | None = None,
+                    label: str = "", label_every_frame: bool = False,
+                    framerate: int | None = None,
+                    document_id: str | None = None) -> dict:
+        """Add, duplicate and delete movieclip frames.
+
+        action is one of: "insert" (blank frames at `frame`; `label_every_frame`
+        puts `label` on each rather than only the first), "duplicate" (copy
+        `frames` — or just `frame` — as they render, so the new frames hold the
+        pose that was on screen, appended to the end), "delete" (`frames`, or
+        `count` starting at `frame`; the clip always keeps at least one frame),
+        "set_label" and "set_framerate". Frames are zero-based. For a nine-slice
+        or any clip that animates, duplicate is the way to hold a pose for
+        longer: keying one frame then duplicating it is cheaper than keying each.
+        """
+        return call("edit_frames", document_id=document_id, movieclip_id=movieclip_id,
+                    action=action, frame=frame, count=count, frames=frames,
+                    label=label, label_every_frame=label_every_frame,
+                    framerate=framerate)
+
+    @server.tool()
+    def remove_child(movieclip_id: int, child_index: int,
+                     document_id: str | None = None) -> dict:
+        """Remove a child instance from a movieclip, once no frame places it.
+
+        Refused while any frame still lists the placement, so a removal cannot
+        leave a frame pointing at a child that is gone.
+        """
+        return call("remove_child", document_id=document_id,
+                    movieclip_id=movieclip_id, child_index=child_index)
+
+    @server.tool()
     def get_placement(movieclip_id: int, placement_index: int, frame: int = 0,
                       document_id: str | None = None) -> dict:
         """Inspect a placement's child, resolved affine matrix and color transform."""
@@ -200,7 +309,11 @@ together. Use this when you are walking an atlas's commands in bulk.
     @server.tool()
     def transform_placement(movieclip_id: int, placement_index: int, matrix: list[float],
                             frame: int = 0, document_id: str | None = None) -> dict:
-        """Set placement affine matrix [a,b,c,d,tx,ty]. Supports move, resize, rotate without changing shared transforms. Undoable."""
+        """Set one placement's affine matrix [a,b,c,d,tx,ty] on one frame. Supports move, resize, rotate without changing shared transforms. Undoable.
+
+This writes the transform, not a key. To animate, use set_keys, which keys the
+transform on the frames you name and can write a curve between them.
+        """
         return call("transform_placement", document_id=document_id, movieclip_id=movieclip_id,
                     placement_index=placement_index, matrix=matrix, frame=frame)
 

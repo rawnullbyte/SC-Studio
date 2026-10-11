@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QTableWidgetSelectionRange,
     QFileDialog,
 )
-from sc_studio.app import Window, typing_into
+from sc_studio.app import Window, fill_table, typing_into
 from sc_studio.document import Document
 from sc_studio.workspace import (
     CLIP_MIME,
@@ -240,7 +240,7 @@ def test_table_tsv_paste_and_preview_frame_sync(window):
     w.add_doc(populated())
     e = w.current()
     e.go_to(7)
-    e.set_panel(1)
+    e.set_panel(2)
     e.children.setCurrentCell(0, 1)
     e.children.setFocus()
     application().clipboard().setText("changed_child")
@@ -297,7 +297,7 @@ def test_pending_edits_cancel_apply_and_invalid_json(window, monkeypatch):
     )
     assert e.go_to(4)
     assert e.doc.resource(7)["framerate"] == 12
-    e.set_panel(2)
+    e.set_panel(3)
     e.code.setPlainText("{invalid")
     errors = []
     monkeypatch.setattr(e, "error", errors.append)
@@ -320,7 +320,7 @@ def test_geometry_switch_preserves_draft_on_correct_command(window, monkeypatch)
     w.add_doc(d)
     e = w.current()
     e.go_to(3)
-    e.set_panel(4)
+    e.set_panel(5)
     e.commands.selectRow(0)
     e.vertices.item(0, 0).setText("42")
     monkeypatch.setattr(
@@ -433,7 +433,7 @@ def test_invalid_timeline_paste_rolls_back_and_plain_clipboard_is_not_a_graph(
     w.add_doc(populated())
     e = w.current()
     e.go_to(7)
-    e.set_panel(1)
+    e.set_panel(2)
     e.children.setCurrentCell(0, 0)
     errors = []
     monkeypatch.setattr(e, "error", errors.append)
@@ -709,7 +709,7 @@ def test_lazy_frame_views_match_eager_and_json(window):
     e = window.current()
     e.go_to(7)
     assert not e.code.toPlainText()
-    e.set_panel(2)
+    e.set_panel(3)
     import json
 
     assert json.loads(e.code.toPlainText()) == d.resource(7)
@@ -782,7 +782,7 @@ def test_child_visibility_is_preview_only_and_click_selects_child(window):
     e.select_placement(0)
     assert e.elements.currentRow() == 0
     assert e.children.currentRow() == 0
-    assert e.panel_picker.currentIndex() == 5
+    assert e.panel_picker.currentIndex() == 0
 
 
 def test_supplied_popup_and_heavy_animation_render():
@@ -889,7 +889,7 @@ def test_children_tab_duplicate_delete_and_layer_order(window, monkeypatch):
     e.go_to(7)
     e.select_placement(0)
     # Children is a panel_picker entry, so the picker stays usable on it.
-    assert e.active_panel == 5
+    assert e.active_panel == 0
     assert e.panel_picker.currentText() == "Children"
     assert e.panel_picker.isVisible()
     e.children.selectRow(0)
@@ -1002,7 +1002,7 @@ def test_atlas_outlines_and_overlapping_shape_picker(window, monkeypatch):
     monkeypatch.setattr(QMenu, "exec", fake_exec)
     e.atlas_context_menu(e.preview.atlas_regions, QPoint(100, 100))
     assert "Shape #3" in seen and "Shape #5" in seen
-    assert e.selected == 3 and e.active_panel == 4
+    assert e.selected == 3 and e.active_panel == 5
     assert e.preview.atlas_regions is None
 
 
@@ -1095,7 +1095,7 @@ def test_atlas_real_context_event_and_multiple_rendered_outlines(window, monkeyp
     window.add_doc(d)
     e = window.current()
     e.go_to(7)
-    e.set_panel(3)
+    e.set_panel(4)
     assert e.selected is None and e.texture_index == 0
     assert e.preview.atlas_regions is not None and not e.preview.editable
     e.go_to(7)
@@ -1142,7 +1142,7 @@ def test_atlas_real_context_event_and_multiple_rendered_outlines(window, monkeyp
         return QDialog.DialogCode.Accepted
     monkeypatch.setattr(QDialog, "exec", inspect_picker)
     e.browse_atlas_shapes()
-    assert e.selected == 3 and e.active_panel == 4
+    assert e.selected == 3 and e.active_panel == 5
 
 
 def test_create_menu_assets_children_image_and_undo(window, monkeypatch, tmp_path):
@@ -1152,12 +1152,12 @@ def test_create_menu_assets_children_image_and_undo(window, monkeypatch, tmp_pat
     e = window.current()
     window.actions["create_textfields"].trigger()
     text = e.selected
-    assert e.doc.index[text][0] == "textfields" and e.active_panel == 0
+    assert e.doc.index[text][0] == "textfields" and e.active_panel == 1
     assert e.category.currentText() == "Textfields"
     window.actions["create_movieclips"].trigger()
     clip = e.selected
     window.actions["create_child_textfields"].trigger()
-    assert e.selected == clip and e.active_panel == 5
+    assert e.selected == clip and e.active_panel == 0
     child = e.doc.resource(clip)["children"][0]["id"]
     assert e.doc.index[child][0] == "textfields"
     assert e.doc.resource(clip)["frames"][0]["elements"] == [[0, 65535, 65535]]
@@ -1175,7 +1175,7 @@ def test_create_menu_assets_children_image_and_undo(window, monkeypatch, tmp_pat
     assert shape not in e.doc.index and len(e.doc.tables["Textures"]["textures"]) == 0
     e.go_to(text)
     window.actions["create_image"].trigger()
-    assert e.doc.index[e.selected][0] == "shapes" and e.active_panel == 4
+    assert e.doc.index[e.selected][0] == "shapes" and e.active_panel == 5
     assert e.doc.resource(e.selected)["commands"][0]["vertices"][3][:2] == [24, 12]
     e.undo()
     assert e.selected == text and len(e.doc.tables["Textures"]["textures"]) == 0
@@ -1268,7 +1268,7 @@ def test_find_usages_dialog_shows_instance_and_indirect_parent(window, monkeypat
     window.references()
     assert e.selected == 7
     assert e.children.currentRow() == 0
-    assert e.active_panel == 5
+    assert e.active_panel == 0
 
 
 @pytest.mark.parametrize("atlas", [False, True])
@@ -2704,3 +2704,141 @@ def test_frames_added_by_extending_do_not_become_keys(window):
     assert values[6] > values[1] > 0.0
     bounds = rendered_x(e, (0, 10, 20, 30))
     assert bounds[0] < bounds[1] < bounds[2] < bounds[3]
+
+
+def test_children_leads_the_panels_and_indices_line_up(window):
+    """The panel picker and the tab widget agree on what each index means."""
+    w = window
+    w.add_doc(animatable_clip(4))
+    e = w.current()
+    e.go_to(7)
+    application().processEvents()
+    assert e.panel_picker.itemText(0) == "Children"
+    assert e.tabs.tabText(0) == "Children"
+    assert e.active_panel == 0, "a movieclip opens on the panel its edits start from"
+    # Every enabled panel switches to itself, both ways round.
+    for index in range(e.panel_picker.count()):
+        if not e.tabs.isTabEnabled(index):
+            continue
+        e.set_panel(index)
+        application().processEvents()
+        assert e.active_panel == index
+        assert e.tabs.currentIndex() == index
+        assert e.panel_picker.currentIndex() == index
+
+
+def test_the_json_panel_fills_in_when_switched_to(window):
+    """The guard that decides whether to write the code box uses the new index."""
+    w = window
+    w.add_doc(animatable_clip(4))
+    e = w.current()
+    e.go_to(7)
+    application().processEvents()
+    assert not e.code.toPlainText()
+    e.set_panel(3)
+    application().processEvents()
+    import json
+
+    assert json.loads(e.code.toPlainText())["id"] == 7
+
+
+def find_in(window, term):
+    """Run Ctrl+F over a grid with a scripted answer."""
+    from PyQt6.QtWidgets import QInputDialog
+
+    original = QInputDialog.getText
+    QInputDialog.getText = staticmethod(lambda *a, **k: (term, True))
+    try:
+        window.focus_search()
+        application().processEvents()
+    finally:
+        QInputDialog.getText = original
+
+
+def test_ctrl_f_finds_in_the_focused_list_and_steps_through_matches(window):
+    w = window
+    w.add_doc(animatable_clip(4))
+    e = w.current()
+    e.go_to(7)
+    application().processEvents()
+    fill_table(
+        e.children,
+        [[1, "alpha_one", 0, True], [2, "beta", 0, True],
+         [3, "alpha_two", 0, True], [4, "alpha_three", 0, True]],
+    )
+    e.children.setCurrentCell(0, 0)
+    e.children.setFocus()
+    application().processEvents()
+    seen = []
+    for _ in range(4):
+        find_in(w, "alpha")
+        seen.append(e.children.item(e.children.currentRow(), 1).text())
+    # The first press lands on the topmost match, later presses step and wrap.
+    assert seen == ["alpha_one", "alpha_two", "alpha_three", "alpha_one"]
+    # The prompt names the pane, so it is clear what is being searched.
+    from PyQt6.QtWidgets import QInputDialog
+
+    titles = []
+    original = QInputDialog.getText
+    QInputDialog.getText = staticmethod(
+        lambda *a, **k: (titles.append(a[2]), (None, False))[1])
+    try:
+        e.frames.setFocus()
+        application().processEvents()
+        w.focus_search()
+    finally:
+        QInputDialog.getText = original
+    assert "frames" in titles[-1]
+
+
+def test_ctrl_f_in_the_browser_still_filters_assets(window):
+    w = window
+    w.add_doc(animatable_clip(4))
+    e = w.current()
+    e.go_to(7)
+    application().processEvents()
+    e.tree.setFocus()
+    application().processEvents()
+    w.focus_search()
+    assert e.search.hasFocus(), "the browser filter is what Ctrl+F means here"
+
+
+def test_mouse_side_buttons_are_undo_and_redo(window):
+    from PyQt6.QtCore import QEvent, QPointF
+    from PyQt6.QtGui import QMouseEvent
+
+    w = window
+    w.add_doc(animatable_clip(6))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    key_at(e, 0, 42.0)
+
+    def pose():
+        """The transform frame 0 actually carries, not the row's key list."""
+        clip = e.obj
+        element = clip["frames"][0]["elements"][0]
+        return (
+            None
+            if element[1] == 65535
+            else round(e.clip_bank(clip)["matrices"][element[1]][4], 1)
+        )
+
+    assert pose() == 42.0
+
+    def press(button):
+        # The filter is installed on the application, which is what sees a
+        # button the widget under the cursor would otherwise ignore.
+        point = QPointF(50, 50)
+        application().sendEvent(
+            application(),
+            QMouseEvent(QEvent.Type.MouseButtonPress, point, point, button,
+                        button, Qt.KeyboardModifier.NoModifier),
+        )
+        application().processEvents()
+
+    press(Qt.MouseButton.BackButton)
+    assert pose() is None, "the back side button undid the edit"
+    press(Qt.MouseButton.ForwardButton)
+    assert pose() == 42.0, "the forward side button redid it"

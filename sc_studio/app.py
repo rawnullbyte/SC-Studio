@@ -155,8 +155,9 @@ def fill_table(table, rows):
     table.resizeColumnsToContents()
 
 
-def table(headers):
+def table(headers, name=""):
     widget = QTableWidget(0, len(headers))
+    widget.setObjectName(name or headers[0].split()[0].lower())
     widget.setHorizontalHeaderLabels(headers)
     widget.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
     return widget
@@ -401,8 +402,11 @@ class Editor(QWidget):
         iv.setContentsMargins(0, 0, 0, 0)
         iv.setSpacing(4)
         self.panel_picker = QComboBox()
+        # In tab order, so an index into the picker is an index into the tabs.
+        # Children leads: a movieclip is mostly the things it is made of, so it
+        # is the panel an edit usually starts from.
         self.panel_picker.addItems(
-            ["Properties", "Timeline", "JSON", "Textures", "Geometry", "Children"]
+            ["Children", "Properties", "Timeline", "JSON", "Textures", "Geometry"]
         )
         self.panel_picker.setToolTip("Inspector panel · Ctrl+1 through Ctrl+6")
         inspector_label = QLabel("INSPECTOR")
@@ -425,7 +429,6 @@ class Editor(QWidget):
         pv.addWidget(scroll)
         apply = QPushButton("Apply properties")
         pv.addWidget(apply)
-        self.tabs.addTab(props, "Properties")
         timeline = QWidget()
         tv = QVBoxLayout(timeline)
         self.timeline_pages = QTabWidget()
@@ -438,7 +441,7 @@ class Editor(QWidget):
         placements_page = QWidget()
         placements_layout = QVBoxLayout(placements_page)
         self.timeline_pages.addTab(placements_page, "Placements")
-        self.children = table(["Resource ID", "Instance name", "Blend", "Visible"])
+        self.children = table(["Resource ID", "Instance name", "Blend", "Visible"], "children")
         instances_layout.addWidget(QLabel("Resources used by this movieclip"))
         instances_layout.addWidget(self.children)
         cr = QHBoxLayout()
@@ -468,7 +471,7 @@ class Editor(QWidget):
                 extra = QHBoxLayout()
             extra.addWidget(button)
         instances_layout.addLayout(extra)
-        self.frames = table(["Frame", "Label", "Placements"])
+        self.frames = table(["Frame", "Label", "Placements"], "frames")
         frames_layout.addWidget(QLabel("Choose a frame to preview and edit"))
         frames_layout.addWidget(self.frames)
         fr = QHBoxLayout()
@@ -481,7 +484,7 @@ class Editor(QWidget):
             b.clicked.connect(fn)
             fr.addWidget(b)
         frames_layout.addLayout(fr)
-        self.elements = table(["Child index", "Matrix index", "Color index"])
+        self.elements = table(["Child index", "Matrix index", "Color index"], "placements")
         placements_layout.addWidget(
             QLabel("Current frame placements · 65535 = identity")
         )
@@ -542,8 +545,8 @@ class Editor(QWidget):
                 "Bitmap commands and triangle-strip vertices. UV coordinates use 0–65535."
             )
         )
-        self.commands = table(["Texture atlas", "Flags", "Vertex count"])
-        self.vertices = table(["X", "Y", "U16", "V16"])
+        self.commands = table(["Texture atlas", "Flags", "Vertex count"], "commands")
+        self.vertices = table(["X", "Y", "U16", "V16"], "vertices")
         sv.addWidget(self.commands)
         sr = QHBoxLayout()
         for title, fn in [
@@ -567,7 +570,12 @@ class Editor(QWidget):
             vr.addWidget(button)
         sv.addLayout(vr)
         self.tabs.addTab(shape, "Geometry")
-        self.tabs.addTab(instances_page, "Children")
+        # Added last but moved to the front: the widget index is what the panel
+        # picker and every set_panel call use, so the tab order is the panel
+        # order. Children leads, since a movieclip is mostly what it is made of.
+        self.tabs.insertTab(0, instances_page, "Children")
+        self.tabs.insertTab(1, props, "Properties")
+        self.tabs.setCurrentIndex(0)
         self.children.itemSelectionChanged.connect(self.children_selection_changed)
         self.commands.itemSelectionChanged.connect(self.show_vertices)
         split.setSizes([265, 565, 350])
@@ -666,7 +674,9 @@ class Editor(QWidget):
 
     def update_code(self, obj):
         self.pending_json = obj
-        if self.active_panel != 2:
+        # JSON is panel 3 in the tab order; this was left at the old index, so
+        # the panel never filled in until it was re-selected.
+        if self.active_panel != 3:
             return
         with QSignalBlocker(self.code):
             self.code.setPlainText(
@@ -873,12 +883,12 @@ class Editor(QWidget):
             with QSignalBlocker(self.panel_picker):
                 self.panel_picker.setCurrentIndex(self.active_panel)
             return
-        if index == 3 and self.texture_index is None and self.doc.tables["Textures"]["textures"]:
+        if index == 4 and self.texture_index is None and self.doc.tables["Textures"]["textures"]:
             self.view_selection_atlas()
             return
         self.active_panel = index
         self.tabs.setCurrentIndex(index)
-        if index == 2 and hasattr(self, "pending_json"):
+        if index == 3 and hasattr(self, "pending_json"):
             self.update_code(self.pending_json)
 
     def sync_panel(self, index):
@@ -1109,14 +1119,18 @@ class Editor(QWidget):
             self.form.addRow("Export names", export)
             self.property_widgets["exports"] = (export, list)
             export.textEdited.connect(lambda *_: self.mark_draft("properties"))
-            self.tabs.setTabEnabled(1, kind == "movieclips")
-            self.tabs.setTabEnabled(5, kind == "movieclips")
-            self.panel_picker.model().item(5).setEnabled(kind == "movieclips")
-            self.tabs.setTabEnabled(4, kind == "shapes")
-            self.panel_picker.model().item(1).setEnabled(kind == "movieclips")
-            self.panel_picker.model().item(4).setEnabled(kind == "shapes")
-            if self.active_panel == 3 or not self.tabs.isTabEnabled(self.active_panel):
-                self.tabs.setCurrentIndex(0)
+            # Timeline (2) and Children (0) belong to a movieclip; Geometry (5)
+            # belongs to a shape. The indices follow the tab order, which is
+            # what the picker and set_panel use.
+            for panel, enabled in (
+                (0, kind == "movieclips"),
+                (2, kind == "movieclips"),
+                (5, kind == "shapes"),
+            ):
+                self.tabs.setTabEnabled(panel, enabled)
+                self.panel_picker.model().item(panel).setEnabled(enabled)
+            if not self.tabs.isTabEnabled(self.active_panel):
+                self.set_panel(0)
             if kind == "shapes":
                 fill_table(
                     self.commands,
@@ -1248,9 +1262,18 @@ class Editor(QWidget):
             message
             or "Click / drag a placement to move · Drag empty space to pan · Wheel to zoom"
         )
-        self.refresh_keyframe_strip()
-        # The transform fields belong to the current frame, so they follow it.
-        self.load_animation_fields()
+        if self.timer.isActive():
+            # Playback only moves the cursor: the tracks, their keys and the
+            # widget layout cannot change on their own, so rebuilding them every
+            # frame is work that is thrown away. On a clip with thousands of
+            # keys it cost more than drawing the frame did, which is what made
+            # playback crawl on a long animation.
+            self.keyframes.set_cursor(self.frame.value())
+        else:
+            self.refresh_keyframe_strip()
+            # The transform fields belong to the current frame, so they follow
+            # it. Nothing is editing them mid-playback, so they can wait too.
+            self.load_animation_fields()
 
     def tick(self):
         # One frame per tick, at the clip's own rate. Deriving the frame from
@@ -2524,7 +2547,7 @@ class Editor(QWidget):
             if self.mutate(change):
                 dialog.reject()
                 self.refresh()
-                self.set_panel(5)
+                self.set_panel(0)
                 self.elements.selectRow(self.elements.rowCount() - 1)
 
         new_clip.clicked.connect(create_child)
@@ -2538,7 +2561,7 @@ class Editor(QWidget):
                 lambda: self.place_child(id, " / ".join(self.doc.names.get(id, [])))
             ):
                 self.refresh()
-                self.set_panel(5)
+                self.set_panel(0)
                 self.elements.selectRow(self.elements.rowCount() - 1)
 
     def place_child(self, id, name):
@@ -2604,7 +2627,7 @@ class Editor(QWidget):
 
     def open_atlas_shape(self, id):
         if self.go_to(id):
-            self.set_panel(4)
+            self.set_panel(5)
 
     def atlas_context_menu(self, regions, position):
         menu = QMenu(self)
@@ -2969,7 +2992,7 @@ class Editor(QWidget):
         self.preview.viewport().update()
         if self.timer.isActive():
             self.toggle_play()
-        self.set_panel(5)
+        self.set_panel(0)
         self.elements.selectRow(row)
         # The cursor can sit past the last frame while the clip is short, and
         # a preview is reloaded for resources that hold no frames at all, so
@@ -3146,7 +3169,7 @@ class Editor(QWidget):
 
         if self.mutate(change, raise_errors=raise_errors):
             self.refresh()
-            self.set_panel(5)
+            self.set_panel(0)
             self.frames.selectRow(fi)
             self.elements.selectRow(self.elements.rowCount() - 1)
             self.render_frame(fit=True)
@@ -3418,7 +3441,7 @@ class Editor(QWidget):
         if self.mutate(change):
             if place:
                 self.refresh()
-                self.set_panel(5)
+                self.set_panel(0)
                 self.children.selectRow(self.children.rowCount() - 1)
             else:
                 self.go_to(created[0])
@@ -3450,7 +3473,7 @@ class Editor(QWidget):
                                  [0, h, 0, 65535], [w, h, 65535, 65535]]}]})
             if self.mutate(change):
                 self.go_to(created[0])
-                self.set_panel(4)
+                self.set_panel(5)
         except Exception as error:
             self.error(error)
 
@@ -3639,7 +3662,10 @@ class Editor(QWidget):
         self.preview_resource = None
         t = self.doc.tables["Textures"]["textures"][self.texture_index]
         d = t["highres"]
-        self.tabs.setCurrentIndex(3)
+        # Textures is panel 4 in the current order; this was left at the old
+        # index and opened the JSON panel instead when an atlas was picked.
+        self.tabs.setCurrentIndex(4)
+        self.active_panel = 4
         self.preview.scene().clear()
         self.breadcrumb.setText(f"Texture atlas #{self.texture_index}")
         self.texture_info.setText(
@@ -3916,7 +3942,7 @@ class Window(QMainWindow):
         self.action(view, "reset_layout", "Reset layout", self.reset_layout)
         panels = view.addMenu("Inspector")
         for index, name in enumerate(
-            ("Properties", "Timeline", "JSON", "Textures", "Geometry", "Children")
+            ("Children", "Properties", "Timeline", "JSON", "Textures", "Geometry")
         ):
             self.action(
                 panels,
@@ -4025,6 +4051,19 @@ class Window(QMainWindow):
         action.triggered.connect(lambda checked=False: fn() if not self.jobs else None)
         parent.addAction(action)
         self.actions[key] = action
+        return action
+
+    def shortcuts(self, parent, key, title, fn, *keys):
+        """One action reachable by several keys, tried in order.
+
+        Qt tries a window's actions in an unspecified order and takes the first
+        whose key matches, so registering the same key on several hidden actions
+        is a coin toss. Here the first key is the action's own shortcut and the
+        rest are matched by the event filter, which is deterministic: the first
+        one listed that applies wins.
+        """
+        action = self.action(parent, key, title, fn, keys[0] if keys else None)
+        action.setProperty("extra_shortcuts", [QKeySequence(k) for k in keys[1:]])
         return action
 
     def current(self):
@@ -4457,12 +4496,62 @@ class Window(QMainWindow):
             ed.mark_draft("geometry")
 
     def focus_search(self):
+        """Ctrl+F searches whatever is focused.
+
+        One key means "find in the thing I am looking at" rather than always the
+        asset browser: in the browser it filters assets, at the timeline it
+        filters frames and placements, in a panel it picks a row, and in text it
+        is the editor's own find. Searching the wrong pane and having to correct
+        it is the cost this avoids.
+        """
         ed = self.current()
-        if ed:
-            ed.splitter.widget(0).show()
-            ed.search.setFocus()
-            ed.search.selectAll()
-            self.active_changed()
+        if ed is None:
+            return
+        focus = QApplication.focusWidget()
+        if focus in (ed.children, ed.frames, ed.elements):
+            self.find_in_table(focus)
+            return
+        if focus is ed.code:
+            self.find_json()
+            return
+        ed.splitter.widget(0).show()
+        ed.search.setFocus()
+        ed.search.selectAll()
+        self.active_changed()
+
+    def find_in_table(self, grid):
+        """Pick the first row matching what is typed, columns left to right."""
+        ed = self.current()
+        term, ok = QInputDialog.getText(
+            self,
+            "Find in table",
+            f"Find in {grid.objectName() or 'table'}:",
+            text=getattr(self, "table_term", ""),
+        )
+        if not ok or not term:
+            return
+        self.table_term = term
+        needle = term.casefold()
+        # The scan starts at the current row and wraps, so the first press finds
+        # the topmost match rather than skipping the row already selected. A
+        # repeated press steps past the row it last landed on, which is what
+        # makes it walk the matches.
+        start = max(0, grid.currentRow())
+        hit = getattr(self, "table_hit", None)
+        if hit and hit[0] is grid and hit[1] == start:
+            start += 1
+        rows = list(range(start, grid.rowCount()))
+        rows += list(range(0, min(start, grid.rowCount())))
+        for row in rows:
+            for column in range(grid.columnCount()):
+                item = grid.item(row, column)
+                if item and needle in item.text().casefold():
+                    grid.selectRow(row)
+                    grid.scrollToItem(item)
+                    grid.setFocus()
+                    self.table_hit = (grid, row)
+                    return
+        self.statusBar().showMessage(f"No match for {term!r}", 4000)
 
     def eventFilter(self, watched, event):
         # Plain G opens Go to ID from anywhere except text entry, where the
@@ -4482,6 +4571,28 @@ class Window(QMainWindow):
         ):
             self.go_to_id()
             return True
+        if event.type() == QEvent.Type.KeyPress:
+            # Extra shortcuts, tried in the order they were declared, so one
+            # function can be reachable by several keys without depending on the
+            # order Qt happens to try its actions in.
+            for action in self.actions.values():
+                extra = action.property("extra_shortcuts") or []
+                for sequence in extra:
+                    if event.keyCombination() == sequence:
+                        if action.isEnabled():
+                            action.trigger()
+                        return True
+        if event.type() == QEvent.Type.MouseButtonPress:
+            # Mouse side buttons are the conventional undo and redo, and Qt does
+            # not map them to anything by default.
+            ed = self.current()
+            if ed is not None and QApplication.activeModalWidget() is None:
+                if event.button() == Qt.MouseButton.BackButton:
+                    ed.undo()
+                    return True
+                if event.button() == Qt.MouseButton.ForwardButton:
+                    ed.redo()
+                    return True
         return super().eventFilter(watched, event)
 
     def go_to_id(self):
@@ -4529,11 +4640,11 @@ class Window(QMainWindow):
         ed = self.current()
         if not ed:
             return
-        if ed.active_panel == 0:
+        if ed.active_panel == 1:
             ed.apply_properties()
-        elif ed.active_panel == 2:
+        elif ed.active_panel == 3:
             ed.apply_json()
-        elif ed.active_panel == 4:
+        elif ed.active_panel == 5:
             ed.apply_geometry()
 
     def find_json(self):
@@ -4545,7 +4656,7 @@ class Window(QMainWindow):
         )
         if ok and term:
             self.json_term = term
-            ed.set_panel(2)
+            ed.set_panel(3)
             ed.code.setFocus()
             self.find_next()
 
@@ -4649,7 +4760,7 @@ class Window(QMainWindow):
             parent, child = item.data(0, Qt.ItemDataRole.UserRole)
             dialog.accept()
             if ed.go_to(parent):
-                ed.set_panel(5)
+                ed.set_panel(0)
                 ed.children.selectRow(child)
 
         tree.itemDoubleClicked.connect(follow)

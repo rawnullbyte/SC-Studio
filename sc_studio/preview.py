@@ -162,6 +162,10 @@ class AnimatorTimeline(QWidget):
     editable at once instead of one placement at a time. Dragging the playhead
     or a key past the end asks for the clip to be extended, which is how a
     timeline grows by working on it rather than by pre-adding frames.
+
+    Painting is bounded by the width of the widget rather than the length of the
+    clip: a clip of several hundred frames on several tracks is thousands of
+    keys, and a clip's key count does not change what can be seen at once.
     """
 
     framePicked = pyqtSignal(int)
@@ -272,6 +276,20 @@ class AnimatorTimeline(QWidget):
             if track["row"] == row:
                 return track["keys"]
         return set()
+
+    def set_cursor(self, current):
+        """Move the playhead without rebuilding the tracks.
+
+        Playback changes only where the cursor is, but the full state update
+        copies every track's key set and compares them all, so a clip with
+        thousands of keys spent more time re-deriving that nothing had changed
+        than it did drawing the frame. This is the cheap path for it.
+        """
+        current = max(0, current)
+        if current == self.current:
+            return
+        self.current = current
+        self.update()
 
     def set_state(self, frame_count, current, tracks, row):
         normalised = [
@@ -485,11 +503,20 @@ class AnimatorTimeline(QWidget):
                 QPointF(self.width(), top + self.TRACK_HEIGHT),
             )
             colour = QColor(accent) if selected else QColor(muted)
+            mid = top + self.TRACK_HEIGHT / 2
+            # Only the keys that can land inside the widget are drawn, and only
+            # the rows it is tall enough to show. A clip of several hundred
+            # frames across many tracks is thousands of keys, and painting them
+            # all on every tick is what made a long animation crawl: what is
+            # visible does not grow with the length of the clip.
+            first = max(0, int((0 - self.LABEL_WIDTH) / step))
+            last = min(self.frame_count, int((self.width() - self.LABEL_WIDTH) / step) + 1)
+            if top > self.height():
+                break
             for frame in sorted(track["keys"]):
-                if frame >= self.frame_count:
+                if frame < first or frame >= last:
                     continue
                 x = self.x_for(frame)
-                mid = top + self.TRACK_HEIGHT / 2
                 if (frame, track["row"]) in self.picked_keys:
                     painter.setBrush(QColor("#ff9d3a"))
                 else:
@@ -1124,6 +1151,8 @@ class Preview(QGraphicsView):
         self.cache = OrderedDict()
         self.resource_cache = OrderedDict()
         self.shape_cache = OrderedDict()
+        # Cleared per render: keyed by clip identity, frame and row.
+        self.inherit_cache = {}
         self.messages = []
         self.doc = None
         self.last = None
@@ -1456,6 +1485,7 @@ class Preview(QGraphicsView):
 
     def show_resource(self, doc, id, frame=0, fit=True):
         self.atlas_regions = None
+        self.inherit_cache = {}
         self.free_camera = True
         self.doc = doc
         self.editable = doc.index[id][0] == "movieclips"
@@ -1522,6 +1552,13 @@ class Preview(QGraphicsView):
         for a frame whose own elements are all unset, which is exactly the frame
         that needs the earlier values looked up.
         """
+        # Cached per clip and frame for the length of one render: a clip draws
+        # many elements that inherit, and each lookup otherwise walks backwards
+        # through every earlier frame, which is quadratic in the clip's length.
+        key = (builtins.id(clip), frame, row)
+        cached = self.inherit_cache.get(key)
+        if cached is not None:
+            return cached
         frames = clip["frames"]
         index = clip.get("matrix_bank_index")
         banks = self.doc.storage["matrix_banks"]
@@ -1531,16 +1568,23 @@ class Preview(QGraphicsView):
             else []
         )
         start = min(frame, len(frames) - 1)
+        answer = list(IDENTITY_MATRIX)
         for earlier in range(start, -1, -1):
             elements = frames[earlier]["elements"]
             if row >= len(elements):
                 continue
             matrix_index = elements[row][1]
             if matrix_index != 65535:
-                if matrix_index < len(matrices):
-                    return matrices[matrix_index]
-                return list(IDENTITY_MATRIX)
-        return list(IDENTITY_MATRIX)
+                answer = (
+                    matrices[matrix_index]
+                    if matrix_index < len(matrices)
+                    else list(IDENTITY_MATRIX)
+                )
+                break
+        # Stored as a tuple so a caller that mutates what it is given cannot
+        # poison the cache for the rest of the render.
+        self.inherit_cache[key] = answer
+        return answer
 
     def draw(self, id, frame, parent, stack, path, incoming=None, deformation=None):
         if id in stack:

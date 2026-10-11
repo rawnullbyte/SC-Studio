@@ -89,16 +89,19 @@ def decompose(matrix):
         scale_x = 0.0
         scale_y = math.hypot(c, d)
         rotation = math.atan2(-c, d)
+        shear = 0.0
     else:
         rotation = math.atan2(b, a)
         determinant = a * d - b * c
         scale_y = determinant / scale_x
+        shear = (a * c + b * d) / scale_x
     return {
         "tx": tx,
         "ty": ty,
         "rotation": rotation,
         "scale_x": scale_x,
         "scale_y": scale_y,
+        "shear": shear,
     }
 
 
@@ -108,8 +111,8 @@ def compose(parts):
     sin = math.sin(parts["rotation"])
     a = cos * parts["scale_x"]
     b = sin * parts["scale_x"]
-    c = -sin * parts["scale_y"]
-    d = cos * parts["scale_y"]
+    c = cos * parts.get("shear", 0.0) - sin * parts["scale_y"]
+    d = sin * parts.get("shear", 0.0) + cos * parts["scale_y"]
     return [a, b, c, d, parts["tx"], parts["ty"]]
 
 
@@ -141,6 +144,7 @@ def interpolate_matrix(start, end, t):
         "rotation": a["rotation"] + delta * t,
         "scale_x": a["scale_x"] + (b["scale_x"] - a["scale_x"]) * t,
         "scale_y": a["scale_y"] + (b["scale_y"] - a["scale_y"]) * t,
+        "shear": a["shear"] + (b["shear"] - a["shear"]) * t,
     }
     return compose(blended)
 
@@ -151,6 +155,4 @@ def interpolate_color(start, end, t):
         return list(start)
     if t >= 1.0:
         return list(end)
-    return [
-        round(a + (b - a) * t) for a, b in zip(start, end)
-    ]
+    return [round(a + (b - a) * t) for a, b in zip(start, end)]

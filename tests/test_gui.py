@@ -1826,7 +1826,7 @@ def test_key_density_controls_how_many_keys_are_created(window):
 
 def key_at(e, frame, value):
     """Give a frame its own transform, the way the animator's fields do."""
-    e.frame.setValue(frame)
+    e.goto_frame(frame)
     application().processEvents()
     e.key_fields["X"].setValue(value)
     e.apply_animation_fields()
@@ -2062,7 +2062,7 @@ def test_cursor_can_sit_past_the_last_frame(window):
     # Simply moving there changes nothing.
     frames = len(e.obj["frames"])
     e.goto_frame(far)
-    assert e.frame.value() == far
+    assert e.cursor.value() == far
     assert len(e.obj["frames"]) == frames
 
 
@@ -2079,9 +2079,9 @@ def test_a_change_past_the_end_can_extend_the_clip_more_than_once(window):
         # Walk the cursor to the far end of what the strip allows and change
         # something there; the clip grows to cover it, so the next trip has
         # further to go.
-        e.goto_frame(e.frame.maximum())
+        e.goto_frame(e.cursor.maximum())
         application().processEvents()
-        key_at(e, e.frame.value(), 20.0)
+        key_at(e, e.cursor.value(), 20.0)
         lengths.append(len(e.obj["frames"]))
     assert lengths == sorted(set(lengths)), f"the clip stopped growing: {lengths}"
     assert lengths[0] > 2
@@ -2100,7 +2100,7 @@ def test_moving_a_placement_past_the_end_extends_the_clip(window):
     application().processEvents()
     lengths = []
     for _ in range(3):
-        e.goto_frame(e.frame.maximum())
+        e.goto_frame(e.cursor.maximum())
         application().processEvents()
         # The old code indexed straight into the frame list and raised
         # IndexError, so nothing after the first extension was possible.
@@ -2151,7 +2151,7 @@ def test_the_playhead_line_scrubs_without_grabbing_the_key_under_it(window):
     e.goto_frame(3)
     application().processEvents()
     strip.picked_keys = set()
-    line_x = strip.LABEL_WIDTH + e.frame.value() * step
+    line_x = strip.LABEL_WIDTH + e.cursor.value() * step
     assert strip._on_playhead(line_x)
     send(QEvent.Type.MouseButtonPress, (line_x, track_y), Qt.MouseButton.LeftButton)
     assert strip.picked_keys == set(), "the playhead drag grabbed the key"
@@ -2168,7 +2168,7 @@ def test_the_playhead_line_scrubs_without_grabbing_the_key_under_it(window):
         (strip.x_for(1), track_y),
         Qt.MouseButton.LeftButton,
     )
-    assert e.frame.value() < 3
+    assert e.cursor.value() < 3
     assert e.keyframes.keys_of(0) == {3}
 
 
@@ -2183,10 +2183,10 @@ def test_a_one_frame_clip_reports_one_frame_and_can_still_be_extended(window):
     # One frame is one frame: the slider reaching past the end is not part of
     # the count, which used to read "Frame 1 / 9" on a one-frame clip.
     assert "Frame 1 / 1" == e.frame_label.text()
-    # A single-frame clip cannot be played, but its slider has to stay live:
-    # reaching past the only frame is how the clip gets its second one.
+    # A single-frame clip cannot be played, but its authoring cursor stays live:
+    # only the orange cursor can move beyond the existing frame.
     assert not e.play.isEnabled()
-    assert e.frame.isEnabled()
+    assert not e.frame.isEnabled()
     e.goto_frame(4)
     application().processEvents()
     assert "past the end" in e.frame_label.text()
@@ -2209,7 +2209,7 @@ def test_the_timeline_cursor_reaches_the_end_and_back_without_losing_frames(wind
         application().processEvents()
         # The strip is told where the cursor is on every render; clamping it to
         # the clip's own length left it behind while the slider moved on.
-        assert e.keyframes.current == e.frame.value() == target
+        assert e.keyframes.current == e.cursor.value() == target
 
 
 def test_scrubbing_outward_is_not_capped_at_a_fixed_length(window):
@@ -2224,15 +2224,15 @@ def test_scrubbing_outward_is_not_capped_at_a_fixed_length(window):
     for _ in range(4):
         # Walk the cursor outwards, one step past where the slider previously
         # stopped, the way dragging towards the end does.
-        target = e.frame.maximum() + 2 if reached else 6
+        target = e.cursor.maximum() + 2 if reached else 6
         e.goto_frame(target)
         application().processEvents()
-        reached.append(e.frame.value())
+        reached.append(e.cursor.value())
         # The strip's playhead is where the slider is, even past the last frame.
-        assert e.keyframes.current == e.frame.value()
+        assert e.keyframes.current == e.cursor.value()
         # Grow the clip there so the next walk starts from further out.
-        key_at(e, e.frame.value(), 20.0)
-        assert e.frame.maximum() > reached[-1]
+        key_at(e, e.cursor.value(), 20.0)
+        assert e.cursor.maximum() > reached[-1]
     assert reached == sorted(set(reached)), f"scrubbing stalled: {reached}"
     assert reached[-1] > reached[0]
 
@@ -2247,7 +2247,7 @@ def test_the_cursor_past_the_end_does_not_crash_the_editor(window):
     application().processEvents()
     e.goto_frame(6)
     application().processEvents()
-    assert e.frame.value() == 6 > len(e.obj["frames"]) - 1
+    assert e.cursor.value() == 6 > len(e.obj["frames"]) - 1
     # These all used to index the frame list directly and raise IndexError.
     e.select_placement(0)
     e.show_elements()
@@ -2755,7 +2755,7 @@ def find_in(window, term):
         QInputDialog.getText = original
 
 
-def test_ctrl_f_finds_in_the_focused_list_and_steps_through_matches(window):
+def test_ctrl_f_uses_inline_children_filter_and_frame_find(window):
     w = window
     w.add_doc(animatable_clip(4))
     e = w.current()
@@ -2769,12 +2769,13 @@ def test_ctrl_f_finds_in_the_focused_list_and_steps_through_matches(window):
     e.children.setCurrentCell(0, 0)
     e.children.setFocus()
     application().processEvents()
-    seen = []
-    for _ in range(4):
-        find_in(w, "alpha")
-        seen.append(e.children.item(e.children.currentRow(), 1).text())
-    # The first press lands on the topmost match, later presses step and wrap.
-    assert seen == ["alpha_one", "alpha_two", "alpha_three", "alpha_one"]
+    w.focus_search()
+    assert e.children_search.hasFocus()
+    e.children_search.setText("alpha")
+    application().processEvents()
+    assert [row for row in range(e.children.rowCount()) if not e.children.isRowHidden(row)] == [0, 2, 3]
+    e.first_child_match()
+    assert e.children.currentRow() == 0
     # The prompt names the pane, so it is clear what is being searched.
     from PyQt6.QtWidgets import QInputDialog
 

@@ -294,13 +294,18 @@ class Editor(QWidget):
         self.play.setText("⏸ Pause")
         self.play.setFixedHeight(self.play.sizeHint().height())
         self.play.setText("▶ Play")
+        from .frame_cursor import FrameCursor
+        self.cursor = FrameCursor(self)
         self.frame = QSlider(Qt.Orientation.Horizontal)
+        self.frame.setRange(0, 0)
+        self.frame.valueChanged.connect(self.scrub_progress)
+        self.frame.sliderPressed.connect(lambda: self.scrub_progress(self.frame.value()))
         # Frames the cursor may reach past the end of the clip. The far end of
         # the slider is a ratchet, not a fixed limit: working past it moves it
         # further out, so the timeline is not capped at some arbitrary length.
         self.FRAME_HEADROOM = 8
         self.frame_span = 0  # furthest frame the slider currently reaches
-        self.frame.setRange(0, 0)
+        self.cursor.setRange(0, 0)
         self.frame_label = QLabel("Frame 1 / 1")
         fit = QPushButton("Fit")
         controls.addWidget(self.play)
@@ -321,6 +326,20 @@ class Editor(QWidget):
         animator_layout.setSpacing(3)
         self.keyframes = AnimatorTimeline()
         animator_layout.addWidget(self.keyframes)
+        zoom_row = QHBoxLayout()
+        zoom_row.addWidget(QLabel("Timeline zoom"))
+        for label, fn in (("−", lambda: self.keyframes.set_zoom(self.keyframes.zoom / 1.5)),
+                          ("+", lambda: self.keyframes.set_zoom(self.keyframes.zoom * 1.5)),
+                          ("Fit all", self.keyframes.fit_timeline)):
+            button = QPushButton(label)
+            button.clicked.connect(fn)
+            zoom_row.addWidget(button)
+        self.timeline_zoom_label = QLabel("Fit")
+        zoom_row.addWidget(self.timeline_zoom_label)
+        zoom_row.addStretch()
+        zoom_row.addWidget(QLabel("Ctrl+wheel: zoom · Shift+wheel: pan"))
+        self.keyframes.zoomChanged.connect(lambda z: self.timeline_zoom_label.setText("Fit" if z == 1 else f"{z:.1f}×"))
+        animator_layout.addLayout(zoom_row)
         controls_row = QHBoxLayout()
         self.curve = QComboBox()
         self.curve.addItems(easing.PRESETS)
@@ -442,7 +461,15 @@ class Editor(QWidget):
         placements_layout = QVBoxLayout(placements_page)
         self.timeline_pages.addTab(placements_page, "Placements")
         self.children = table(["Resource ID", "Instance name", "Blend", "Visible"], "children")
-        instances_layout.addWidget(QLabel("Resources used by this movieclip"))
+        instances_layout.addWidget(QLabel("CHILDREN"))
+        self.children_search = QLineEdit()
+        self.children_search.setPlaceholderText("Search children…  Ctrl+F")
+        self.children_search.setToolTip("Filter by instance name, resource ID, or export name. Enter selects the first match.")
+        self.children_search.setClearButtonEnabled(True)
+        self.children_search.textChanged.connect(self.filter_children)
+        self.children_search.returnPressed.connect(self.first_child_match)
+        self.children_search.installEventFilter(self)
+        instances_layout.addWidget(self.children_search)
         instances_layout.addWidget(self.children)
         cr = QHBoxLayout()
         for title, fn in [
@@ -617,7 +644,7 @@ class Editor(QWidget):
         self.delete_btn.clicked.connect(lambda: self.window().delete_selection())
         apply.clicked.connect(self.apply_properties)
         apply_json.clicked.connect(self.apply_json)
-        self.frame.valueChanged.connect(self.render_frame)
+        self.cursor.valueChanged.connect(self.render_frame)
         self.play.clicked.connect(self.toggle_play)
         fit.clicked.connect(lambda: self.render_frame(fit=True))
         self.children.cellChanged.connect(self.child_changed)
@@ -642,6 +669,11 @@ class Editor(QWidget):
                 bar.setValue(bar.value() - round(delta))
                 event.accept()
                 return True
+        if (watched is getattr(self, "children_search", None) and event.type() == QEvent.Type.KeyPress
+                and event.key() == Qt.Key.Key_Escape):
+            self.children_search.clear()
+            self.children.setFocus()
+            return True
         if (
             watched is self.search
             and event.type() == QEvent.Type.KeyPress
@@ -708,7 +740,7 @@ class Editor(QWidget):
             copy.deepcopy(self.doc.tables["Textures"]),
             self.revision,
             self.selected,
-            self.frame.value(),
+            self.cursor.value(),
         )
 
     def restored_state(self, blob):
@@ -743,7 +775,7 @@ class Editor(QWidget):
         self.preview.invalidate(keep_atlases=keep_atlases)
         self.populate()
         self.refresh()
-        self.frame.setValue(min(frame, self.frame.maximum()))
+        self.cursor.setValue(min(frame, self.cursor.maximum()))
         self.changed.emit()
 
     def mutate(self, fn, raise_errors=False, rebuild_browser=True,
@@ -1065,7 +1097,7 @@ class Editor(QWidget):
                 fill_table(grid, [])
             return
         old_frame = (
-            self.frame.value()
+            self.cursor.value()
             if getattr(self, "view_resource", None) == self.selected
             else 0
         )
@@ -1146,27 +1178,26 @@ class Editor(QWidget):
                 fill_table(self.vertices, [])
             count = len(obj["frames"]) if kind == "movieclips" else 1
             self.play.setEnabled(kind == "movieclips" and count > 1)
-            # The slider stays live on a one-frame clip: reaching past its only
-            # frame is how a second one gets made, so disabling it would leave
-            # the clip with no way to grow from the transport.
-            self.frame.setEnabled(kind == "movieclips" and count > 0)
+            # Transport seeks existing frames only. The separate orange
+            # authoring cursor remains usable even on a one-frame clip.
+            self.frame.setEnabled(kind == "movieclips" and count > 1)
             # The cursor may sit a little past the last frame: changing
             # something there is what extends the clip, and scrubbing must be
             # able to reach it without creating anything on its own.
-            # The ratchet only widens here, so re-selecting a resource does not
-            # pull the cursor's range back in under it.
+            # Headroom belongs to the authoring cursor, never the transport.
             self.frame_span = max(
-                self.frame_span,
+                old_frame,
                 max(0, count - 1) + (self.FRAME_HEADROOM if count else 0),
             )
-            self.frame.setRange(0, self.frame_span)
-            self.frame.setValue(min(old_frame, self.frame.maximum()))
+            self.cursor.setRange(0, self.frame_span)
+            self.cursor.setValue(min(old_frame, self.cursor.maximum()))
             if kind == "movieclips":
                 fill_table(
                     self.children,
                     [[c["id"], c["name"], c["blend"]] for c in obj["children"]],
                 )
                 self.fill_visibility()
+                self.filter_children()
                 fill_table(
                     self.frames,
                     [
@@ -1189,7 +1220,7 @@ class Editor(QWidget):
         finally:
             self.loading = False
         self.render_frame(
-            value=self.frame.value(),
+            value=self.cursor.value(),
             fit=getattr(self, "preview_resource", None) != self.selected,
         )
         self.preview_resource = self.selected
@@ -1227,6 +1258,11 @@ class Editor(QWidget):
         except Exception as e:
             self.error(e)
 
+    def scrub_progress(self, value):
+        """The transport can seek only existing frames; it never grows a clip."""
+        count = len(self.obj.get("frames") or []) if hasattr(self, "obj") else 0
+        self.cursor.setValue(max(0, min(value, max(0, count - 1))))
+
     def render_frame(self, value=None, fit=False):
         if self.texture_index is not None:
             if fit:
@@ -1236,10 +1272,10 @@ class Editor(QWidget):
             return
         if (
             self.doc.index[self.selected][0] == "movieclips"
-            and self.frames.currentRow() != self.frame.value()
+            and self.frames.currentRow() != self.cursor.value()
         ):
             with QSignalBlocker(self.frames):
-                self.frames.selectRow(self.frame.value())
+                self.frames.selectRow(self.cursor.value())
             if not self.timer.isActive():
                 self.show_elements()
         # The clip's own length, not the slider's: the slider reaches a little
@@ -1247,15 +1283,18 @@ class Editor(QWidget):
         # counting that headroom would claim frames the clip does not have.
         clip = self.obj.get("frames")
         count = len(clip) if clip else 1
-        beyond = self.frame.value() >= count
+        with QSignalBlocker(self.frame):
+            self.frame.setRange(0, max(0, count - 1))
+            self.frame.setValue(min(self.cursor.value(), count - 1))
+        beyond = self.cursor.value() >= count
         self.frame_label.setText(
-            f"Frame {self.frame.value()+1} / {count}"
+            f"Frame {self.cursor.value()+1} / {count}"
             + (" · past the end" if beyond else "")
         )
         self.preview.hidden_children = self.child_visibility.get(self.selected, set())
         started = time.perf_counter()
         message = self.preview.show_resource(
-            self.doc, self.selected, self.frame.value(), fit=fit or value is None
+            self.doc, self.selected, self.cursor.value(), fit=fit or value is None
         )
         self.record_timing("render", time.perf_counter() - started)
         self.notice.setText(
@@ -1268,7 +1307,7 @@ class Editor(QWidget):
             # frame is work that is thrown away. On a clip with thousands of
             # keys it cost more than drawing the frame did, which is what made
             # playback crawl on a long animation.
-            self.keyframes.set_cursor(self.frame.value())
+            self.keyframes.set_cursor(self.cursor.value())
         else:
             self.refresh_keyframe_strip()
             # The transform fields belong to the current frame, so they follow
@@ -1282,7 +1321,7 @@ class Editor(QWidget):
         # by the timer and rendering latency can only slow playback, not skip it.
         last = max(0, len(self.obj.get("frames") or []) - 1)
         # Playback loops over the clip itself, never into the headroom.
-        self.frame.setValue((self.frame.value() + 1) % (last + 1))
+        self.cursor.setValue((self.cursor.value() + 1) % (last + 1))
 
     def toggle_play(self):
         if self.timer.isActive():
@@ -1290,6 +1329,7 @@ class Editor(QWidget):
             self.play.setText("▶ Play")
             self.show_elements()
         elif self.selected in self.doc.index:
+            self.cursor.setValue(min(self.cursor.value(), max(0, len(self.obj.get("frames") or []) - 1)))
             fps = max(1, self.doc.index[self.selected][1].get("framerate", 30))
             self.timer.start(max(16, int(1000 / fps)))
             self.play.setText("⏸ Pause")
@@ -1307,14 +1347,14 @@ class Editor(QWidget):
         raise IndexError and take the editor down.
         """
         frames = clip["frames"]
-        index = self.frame.value()
+        index = self.cursor.value()
         return frames[index] if 0 <= index < len(frames) else None
 
     def select_frame(self):
         if self.loading:
             return
         self.show_elements()
-        self.frame.setValue(self.frame_index())
+        self.cursor.setValue(self.frame_index())
 
     # --- keypoint animation -------------------------------------------------
     #
@@ -1375,7 +1415,7 @@ class Editor(QWidget):
                 {"row": row, "label": name, "keys": self.keys_on_row(clip, row)}
             )
         self.keyframes.set_state(
-            len(clip["frames"]), self.frame.value(), tracks, self.placement_row()
+            len(clip["frames"]), self.cursor.value(), tracks, self.placement_row()
         )
 
     def keys_on_row(self, clip, row):
@@ -1445,7 +1485,7 @@ class Editor(QWidget):
         self.grow_clip(clip, needed)
         if self.mutate(lambda: self.doc.update("movieclips", clip)):
             self.refresh()
-            self.frame.setValue(min(needed, len(clip["frames"]) - 1))
+            self.cursor.setValue(min(needed, len(clip["frames"]) - 1))
 
     def grow_clip(self, clip, index, update=True):
         """Give the clip a frame at ``index``, adding the frames up to it.
@@ -1484,14 +1524,14 @@ class Editor(QWidget):
         if self.timer.isActive():
             self.toggle_play()
         index = max(0, index)
-        if index >= self.frame.maximum():
+        if index >= self.cursor.maximum():
             # Reaching the far end pushes it further out, so scrubbing towards
             # the end of the timeline is never stopped by a fixed limit.
             self.frame_span = max(
                 self.frame_span, index + self.FRAME_HEADROOM
             )
-            self.frame.setRange(0, self.frame_span)
-        self.frame.setValue(min(index, self.frame.maximum()))
+            self.cursor.setRange(0, self.frame_span)
+        self.cursor.setValue(min(index, self.cursor.maximum()))
 
     def keyframe_selection_changed(self):
         """Keep the tween button in step with the selected keys."""
@@ -1765,7 +1805,7 @@ class Editor(QWidget):
         """Frame and tween operations for the selected range of frames."""
         if self.selected not in self.doc.index:
             return
-        frames = list(frames) or [self.frame.value()]
+        frames = list(frames) or [self.cursor.value()]
         menu = QMenu(self)
         keyed = [f for f in frames if f in self.placement_keys(self.doc.resource(self.selected))]
         if keyed:
@@ -2152,8 +2192,8 @@ class Editor(QWidget):
         # the frames a clip is about to gain are copies of it anyway, which is
         # the transform a change made out here starts from.
         frames = clip["frames"]
-        index = min(self.frame.value(), len(frames) - 1)
-        beyond = self.frame.value() >= len(frames)
+        index = min(self.cursor.value(), len(frames) - 1)
+        beyond = self.cursor.value() >= len(frames)
         element = frames[index]["elements"][self.placement_row()]
         matrix = self.effective_matrix(clip, element)
         parts = easing.decompose(matrix)
@@ -2173,12 +2213,12 @@ class Editor(QWidget):
             # what adds the frames, so the hint says so rather than reporting on
             # the key of a frame that does not exist.
             self.animation_hint.setText(
-                f"Frame {self.frame.value() + 1}: past the end — a change here "
-                f"adds {self.frame.value() + 1 - len(frames)} frames."
+                f"Frame {self.cursor.value() + 1}: past the end — a change here "
+                f"adds {self.cursor.value() + 1 - len(frames)} frames."
             )
             return
         self.animation_hint.setText(
-            f"Frame {self.frame.value() + 1}: "
+            f"Frame {self.cursor.value() + 1}: "
             + ("already has a key." if keyed else "no key yet; applying creates one.")
         )
 
@@ -2193,7 +2233,7 @@ class Editor(QWidget):
             return
         clip = self.doc.resource(self.selected)
         row = self.placement_row()
-        index = self.frame.value()
+        index = self.cursor.value()
         # The clip is grown to hold the cursor before the key is written, so
         # keying past the end extends the animation rather than doing nothing.
         self.grow_clip(clip, index)
@@ -2240,12 +2280,12 @@ class Editor(QWidget):
         # what extends the clip, so the cursor being beyond the end is not a
         # reason to refuse: the clip is grown to meet it. Only the cursor going
         # backwards past the first frame is out of range.
-        index = min(self.frame.value(), len(frames) - 1)
+        index = min(self.cursor.value(), len(frames) - 1)
         if index < 0:
             return False
         reference = (
-            frames[self.frame.value()]
-            if self.frame.value() < len(frames)
+            frames[self.cursor.value()]
+            if self.cursor.value() < len(frames)
             else frames[-1]
         )
         return 0 <= self.placement_row() < len(reference["elements"])
@@ -2285,18 +2325,18 @@ class Editor(QWidget):
         row = self.placement_row()
         # Keying past the end is one of the ways a clip grows, so the frames are
         # added first rather than the key being dropped for being out of range.
-        self.grow_clip(clip, self.frame.value())
-        if row >= len(clip["frames"][self.frame.value()]["elements"]):
+        self.grow_clip(clip, self.cursor.value())
+        if row >= len(clip["frames"][self.cursor.value()]["elements"]):
             self.error(ValueError("that placement is not in this frame"))
             return
-        element = clip["frames"][self.frame.value()]["elements"][row]
+        element = clip["frames"][self.cursor.value()]["elements"][row]
         matrix = self.effective_matrix(clip, element)
         if self.mutate(lambda: self.assign_matrix(clip, element, matrix)):
             self.refresh()
             self.elements.selectRow(row)
             self.preview.selected_placement = row
             self.window().statusBar().showMessage(
-                f"Key set on frame {self.frame.value() + 1}", 4000
+                f"Key set on frame {self.cursor.value() + 1}", 4000
             )
 
     def effective_matrix(self, clip, element):
@@ -2314,10 +2354,10 @@ class Editor(QWidget):
             return
         clip = self.doc.resource(self.selected)
         row = self.placement_row()
-        element = clip["frames"][self.frame.value()]["elements"][row]
+        element = clip["frames"][self.cursor.value()]["elements"][row]
         if element[1] == 65535 and element[2] == 65535:
             self.window().statusBar().showMessage(
-                f"Frame {self.frame.value() + 1} has no key", 4000
+                f"Frame {self.cursor.value() + 1} has no key", 4000
             )
             return
         element[1] = 65535
@@ -2354,7 +2394,7 @@ class Editor(QWidget):
         The last real frame is the one compacted: the cursor may be sitting out
         in the space past the end, where there is no frame to refresh.
         """
-        index = min(self.frame.value(), len(clip["frames"]) - 1)
+        index = min(self.cursor.value(), len(clip["frames"]) - 1)
         if index < 0 or row >= len(clip["frames"][index]["elements"]):
             self.doc.update("movieclips", clip)
             return
@@ -2444,12 +2484,12 @@ class Editor(QWidget):
             hidden.discard(row)
         else:
             hidden.add(row)
-        self.render_frame(value=self.frame.value(), fit=False)
+        self.render_frame(value=self.cursor.value(), fit=False)
 
     def show_all_children(self):
         self.child_visibility.pop(self.selected, None)
         self.fill_visibility()
-        self.render_frame(value=self.frame.value(), fit=False)
+        self.render_frame(value=self.cursor.value(), fit=False)
 
     def timeline_changed(self, *args):
         if self.loading or self.selected not in self.doc.index:
@@ -2571,10 +2611,10 @@ class Editor(QWidget):
         # A new child is placed on the frame the cursor is on, which may be one
         # the clip does not have yet; it is added so the child lands where it
         # was asked for rather than on the last frame.
-        self.grow_clip(obj, self.frame.value(), update=False)
+        self.grow_clip(obj, self.cursor.value(), update=False)
         index = len(obj["children"])
         obj["children"].append({"id": id, "name": name, "blend": 0})
-        obj["frames"][self.frame.value()]["elements"].append([index, 65535, 65535])
+        obj["frames"][self.cursor.value()]["elements"].append([index, 65535, 65535])
         self.doc.update("movieclips", obj)
 
     def view_shape_atlas(self):
@@ -2823,6 +2863,27 @@ class Editor(QWidget):
             menu.addAction(label).triggered.connect(fn)
         menu.exec(position)
 
+    def filter_children(self):
+        needle = self.children_search.text().strip().casefold()
+        for row in range(self.children.rowCount()):
+            values = [self.children.item(row, col).text() for col in (0, 1)
+                      if self.children.item(row, col)]
+            item = self.children.item(row, 0)
+            if item:
+                try:
+                    values.extend(self.doc.names.get(int(item.text()), []))
+                except ValueError:
+                    pass
+            self.children.setRowHidden(row, bool(needle and needle not in " ".join(values).casefold()))
+
+    def first_child_match(self):
+        for row in range(self.children.rowCount()):
+            if not self.children.isRowHidden(row):
+                self.children.selectRow(row)
+                self.children.scrollToItem(self.children.item(row, 0))
+                self.children.setFocus()
+                break
+
     def children_selection_changed(self):
         if (
             self.loading
@@ -2897,10 +2958,10 @@ class Editor(QWidget):
 
     def commit_placement_transform(self, row, matrix):
         if not self.resolve_drafts():
-            self.render_frame(value=self.frame.value(), fit=False)
+            self.render_frame(value=self.cursor.value(), fit=False)
             return
         clip = self.doc.resource(self.selected)
-        fi = self.frame.value()
+        fi = self.cursor.value()
         # A resize made with the cursor past the end grows the clip the same
         # way a move does, so the change is not dropped.
         self.grow_clip(clip, fi)
@@ -2998,7 +3059,7 @@ class Editor(QWidget):
         # a preview is reloaded for resources that hold no frames at all, so
         # the frame being asked about may not exist yet.
         frames = self.obj["frames"]
-        index = min(self.frame.value(), len(frames) - 1)
+        index = min(self.cursor.value(), len(frames) - 1)
         if self.selected in self.doc.index and index >= 0 and row < len(
             frames[index]["elements"]
         ):
@@ -3010,7 +3071,7 @@ class Editor(QWidget):
         if not self.resolve_drafts():
             self.render_frame(fit=False)
             return
-        fi = self.frame.value()
+        fi = self.cursor.value()
         obj = self.doc.resource(self.selected)
         # The cursor may sit past the last frame while the clip is still short;
         # changing something there is exactly how the clip gets its new frames.
@@ -3119,7 +3180,7 @@ class Editor(QWidget):
         w, h, x, y, angle = values
         angle = math.radians(angle)
         cs, sn = math.cos(angle), math.sin(angle)
-        fi = self.frame.value()
+        fi = self.cursor.value()
         clip = self.doc.resource(self.selected)
 
         def change():
@@ -3265,7 +3326,7 @@ class Editor(QWidget):
         if not self.resolve_drafts():
             return
         clip = self.doc.resource(self.selected)
-        fi = self.frame.value()
+        fi = self.cursor.value()
         if not clip["frames"] or not clip["frames"][fi]["elements"]:
             self.error("Import an image or add a placement first.")
             return
@@ -3415,7 +3476,7 @@ class Editor(QWidget):
             if self.mutate(change):
                 self.refresh()
                 self.frames.selectRow(fi)
-                self.frame.setValue(fi)
+                self.cursor.setValue(fi)
         except Exception as ex:
             self.error(ex)
 
@@ -3985,6 +4046,8 @@ class Window(QMainWindow):
                 )
                 self.theme_actions[name] = action
         self.set_theme(str(self.settings.value("theme", "system")))
+        from .studio_tools import install_tools
+        install_tools(self, file, create_menu, resource, view, help_menu)
         self.action(
             resource,
             "create",
@@ -4508,6 +4571,9 @@ class Window(QMainWindow):
         if ed is None:
             return
         focus = QApplication.focusWidget()
+        if focus is ed.children_search:
+            ed.children_search.selectAll()
+            return
         if focus in (ed.children, ed.frames, ed.elements):
             self.find_in_table(focus)
             return
@@ -4520,7 +4586,11 @@ class Window(QMainWindow):
         self.active_changed()
 
     def find_in_table(self, grid):
-        """Pick the first row matching what is typed, columns left to right."""
+        """Use the inline children filter, or find a row in other tables."""
+        if grid is self.current().children:
+            self.current().children_search.setFocus()
+            self.current().children_search.selectAll()
+            return
         ed = self.current()
         term, ok = QInputDialog.getText(
             self,
@@ -4998,7 +5068,7 @@ class Window(QMainWindow):
         QMessageBox.information(
             self,
             "SC Studio",
-            "SC Studio 0.5.1\nNew documents and exported resource graphs use SC6. Existing SC5/SC6 files retain their version.\n\nSC1 is unsupported. Rendering is an approximate preview; RGB effects, stencil masks, blend modes, engine text outlines are stored but not simulated. Common identity-child scaling grids are previewed.\nNative file dialogs use the platform implementation when available.\n\nF1 lists keyboard shortcuts.",
+            "SC Studio 0.6.1\nNew documents and exported resource graphs use SC6. Existing SC5/SC6 files retain their version.\n\nSC1 is unsupported. The editable scene is an approximate preview. Use View → Rendered effects for RGB/alpha effects, blending, stencil masks, text styles and animation export. Game-specific metrics and rendering can differ. Common identity-child scaling grids are previewed. SC1, SCTX, new ASTC compression and direct FLA/XFL import remain unsupported.\nNative file dialogs use the platform implementation when available.\n\nF1 lists keyboard shortcuts.",
         )
 
     def close_tab(self, i, after=None):

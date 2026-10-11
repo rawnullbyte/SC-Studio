@@ -978,7 +978,7 @@ class Document:
                 errors.append("Export string reference out of bounds")
         return errors
 
-    def save(self, path):
+    def save(self, path, compression_level=6):
         errors = self.validate()
         if errors:
             raise ValueError("\n".join(errors[:20]))
@@ -1010,7 +1010,7 @@ class Document:
             for values in self.names.values()
             for n in values
         ]
-        compressed = zstandard.ZstdCompressor(level=6).compress(b"".join(chunks))
+        compressed = zstandard.ZstdCompressor(level=compression_level).compress(b"".join(chunks))
         header["compressed_size"] = len(compressed)
         output = (
             b"SC"

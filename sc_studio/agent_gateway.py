@@ -374,7 +374,7 @@ class AgentGateway(QObject):
 
         if not ed.mutate(change):
             return False
-        ed.frame.setValue(poses[0][0])
+        ed.cursor.setValue(poses[0][0])
         return True
 
     @staticmethod
@@ -564,7 +564,7 @@ class AgentGateway(QObject):
                         return {}
                 else:
                     for frame, _ in poses:
-                        ed.frame.setValue(frame)
+                        ed.cursor.setValue(frame)
                         ed.toggle_keypoint_at(frame, row)
                 clip = ed.doc.resource(ed.selected)
                 if args.get("curve") is not None and len(poses) >= 2:
@@ -575,14 +575,14 @@ class AgentGateway(QObject):
             elif args.get("curve") is not None and len(writes) >= 2:
                 # The named frames become the keys; the curve fills between them.
                 for frame in writes:
-                    ed.frame.setValue(frame)
+                    ed.cursor.setValue(frame)
                     ed.toggle_keypoint_at(frame, row)
                 clip = ed.doc.resource(ed.selected)
                 ed.keyframes.pick_keys([(frame, row) for frame in writes])
                 ed.apply_curve_to_range()
             else:
                 for frame in writes:
-                    ed.frame.setValue(frame)
+                    ed.cursor.setValue(frame)
                     ed.toggle_keypoint_at(frame, row)
             clip = ed.doc.resource(ed.selected)
             result_keys = ed.keyed_frames(clip, row)
@@ -1229,6 +1229,55 @@ class AgentGateway(QObject):
         # Navigation also resolves draft widgets in the normal GUI; do not prompt agents.
         if ed.drafts:
             raise ValueError("Apply or discard unapplied inspector edits in the app before agent changes")
+        if operation == "publish":
+            from .publishing import publish, PublishSettings
+            path = Path(args["path"]).expanduser().resolve()
+            if any(e.doc.path and path == e.doc.path.resolve() for e in self.editors()):
+                raise ValueError("Publish to a separate output path, not an open source document")
+            if path.exists() and not args.get("overwrite", False):
+                raise ValueError("Output exists; pass overwrite=true to replace it")
+            settings = PublishSettings(**args.get("settings", {}))
+            sources = [self.editor(i).doc for i in args.get("document_ids", [])] or [doc]
+            if any(self.editor(i).drafts for i in args.get("document_ids", [])):
+                raise ValueError("Apply source inspector drafts before publishing")
+            destination = Document.load(args["merge_path"]) if args.get("merge_path") else None
+            return publish(sources, path, settings, args.get("resource_ids"), destination)
+        if operation == "render_resource":
+            from .rendering import Renderer
+            renderer = Renderer(doc)
+            image, bounds = renderer.render(args["resource_id"], args.get("frame", 0), scale=args.get("scale", 1))
+            buffer = QBuffer(); buffer.open(QIODevice.OpenModeFlag.WriteOnly); image.save(buffer, "PNG")
+            return {"png": base64.b64encode(bytes(buffer.data())).decode(),
+                    "width": image.width(), "height": image.height(),
+                    "origin": [bounds.left(), bounds.top()]}
+        if operation == "author":
+            from . import authoring
+            action, params = args["action"], args.get("parameters", {})
+            actions = {
+                "parenting": authoring.bake_parenting,
+                "color_tween": authoring.tween_colors,
+                "morph_shapes": authoring.morph_shapes,
+                "mask_range": authoring.mask_range,
+                "nine_slice": authoring.nine_slice,
+                "group_tracks": authoring.group_tracks,
+                "motion_path": authoring.motion_path,
+            }
+            result = {}
+            def apply_authoring():
+                if action == "import_svg":
+                    value = authoring.svg_shape(doc, Path(params["path"]).expanduser().read_bytes(),
+                                                params.get("width"), params.get("height"))
+                elif action == "repack_atlases":
+                    from .publishing import repack_atlases, PublishSettings
+                    settings = PublishSettings(**params); settings.validate()
+                    value = repack_atlases(doc, settings)
+                elif action in actions:
+                    value = actions[action](doc, **params)
+                else:
+                    raise ValueError("Unknown authoring action")
+                result["result"] = value
+            ed.mutate(apply_authoring, raise_errors=True, full_validate=True)
+            return result
         if operation in ("set_keys", "clear_keys", "tween", "move_keys"):
             # These drive the animator's own widgets, so the document has to be
             # the one on screen and no inspector draft may be pending.
@@ -1251,7 +1300,7 @@ class AgentGateway(QObject):
                 frame = args["frame"]
                 if not ed.frame.minimum() <= frame <= ed.frame.maximum():
                     raise ValueError("Frame is out of range")
-                ed.frame.setValue(frame)
+                ed.cursor.setValue(frame)
             if operation == "select_resource":
                 return self.describe(ed)
             ed.render_frame(fit=True)
@@ -1259,7 +1308,7 @@ class AgentGateway(QObject):
             buffer.open(QIODevice.OpenModeFlag.WriteOnly)
             ed.preview.viewport().grab().save(buffer, "PNG")
             return {"png": base64.b64encode(bytes(buffer.data())).decode(),
-                    "resource_id": ed.selected, "frame": ed.frame.value()}
+                    "resource_id": ed.selected, "frame": ed.cursor.value()}
         if operation == "save_document":
             path = args.get("path") or doc.path
             if not path:
@@ -1288,7 +1337,7 @@ class AgentGateway(QObject):
                 raise ValueError("Frame is out of range")
             self.window.editors.setCurrentWidget(ed)
             ed.go_to(id)
-            ed.frame.setValue(frame)
+            ed.cursor.setValue(frame)
             ed.insert_image(data, args.get("name") or Path(args["path"]).stem, values, raise_errors=True)
             return self.describe(ed)
         result = {}

@@ -4,6 +4,34 @@
 
 A Python/PyQt6 desktop editor for Supercell **SC2 versions 5 and 6**. It opens and creates SC files, edits resources, and copies movieclips between opened files together with their dependency graphs.
 
+## Fixed in 0.6.1
+
+The playback slider now covers exactly the existing clip frames and agrees with the frame label throughout playback. It cannot move into authoring headroom. The orange timeline cursor can still move beyond the end; an explicit edit there extends the clip.
+
+The timeline starts in **Fit all** view, including every frame's key markers. Use **+ / −** or **Ctrl+wheel** to zoom, the horizontal scrollbar or **Shift+wheel** to pan, and the vertical scrollbar or plain wheel to reach additional tracks. Zoom anchors at the pointer; playback keeps the current frame visible. Dense fit views use narrow markers; zoom in to pick neighboring keys precisely.
+
+The **Children** panel now has a clearable search field above its list. It filters instance names, resource IDs and export names without changing child indices. Ctrl+F focuses this field, Enter selects the first visible match, and Escape clears it.
+
+## New in 0.6.0
+
+**File → Publish…** (`Ctrl+Alt+P`) selects linked/selected resources from one or more open tabs, optionally merges them into another SC, repacks sampled atlas regions, reduces texture size, creates low-resolution variants, and writes embedded or external KTX textures. Settings can be saved as JSON presets. Publishing works on a separate document; it does not edit the open source files.
+
+**Create** now imports SVG artwork and creates rectangles, rounded rectangles, ellipses, gradient fills and SVG-path artwork. **Author** adds animated grouping, nine-slice cutting, atlas repacking, parenting, motion guides, color tweens, matching-topology shape animation, a text-style dialog, custom cubic easing, and batch export renaming. Each edit is undoable.
+
+**View → Rendered effects / onion skin / export…** (`Ctrl+Alt+R`) renders RGB/alpha color transforms, blend modes, text styles and stencil masks, with playback, scrubbing, onion skin and PNG/GIF/WebP export. This separate viewer provides effects that the editable scene does not simulate. **Ctrl+Shift+P** opens a command palette.
+
+The new portable operations are available through the MCP `author`, `publish` and `render_resource` tools. A command-line publisher is installed too:
+
+```bash
+sc-studio-publish ui.sc -o published.sc
+sc-studio-publish first.sc second.sc -o combined.sc --preset settings.json
+sc-studio-publish additions.sc -o merged.sc --merge original.sc
+```
+
+Linked symbols are the default; `--all` includes all resources. CLI output is a JSON summary. Choose an output filename distinct from the input files. The GUI and MCP enforce this separation.
+
+This is a substantial standalone expansion, **not full Adobe Animate parity**. SC1, SCTX/streaming, new ASTC encoding and direct FLA/XFL import remain unsupported. See [FEATURE_COVERAGE.md](FEATURE_COVERAGE.md) for the complete plugin comparison and remaining differences. Ordinary Save retains the existing lossless handling of untouched chunks; publishing/repacking is a conversion workflow.
+
 ## Screenshots
 
 | Light | Dark |
@@ -127,7 +155,7 @@ The SC2 format stores one discrete transform per frame and has nowhere to record
 
 The compact menu bar has **File, Edit, View, Resource, Create, MCP, Help**. The right sidebar holds one panel at a time, chosen from the **INSPECTOR** dropdown: **Children**, **Properties**, **Timeline**, **JSON**, **Textures** and **Geometry** (**Ctrl+1** through **Ctrl+6**). **Children** leads, since a movieclip is mostly the things it is made of, and it holds the child list with its editing actions. Picking an entry swaps the panel below; the dropdown stays available on every panel. Drag splitters to resize panes, hide browser/inspector from View, or choose Reset layout. File paths and resource IDs/names appear in tooltips; clicking the ID header sorts numerically. The category dropdown lists only Movieclips, Shapes, Textfields, Modifiers, Texture atlases or Exports. Search applies to the chosen category and is debounced for large files; Enter selects the first match, Escape clears search and returns focus to the browser.
 
-**Ctrl+F finds in the pane you are looking at.** In the asset browser it filters assets; in the Children, Frames or Placements list it picks the first row matching what you type and steps through the rest on each press, wrapping at the end; in the JSON editor it is the text find. The prompt names the pane it is searching. **The mouse's side buttons are undo and redo**, which Qt does not map to anything by default.
+**Ctrl+F finds in the pane you are looking at.** In the asset browser it filters assets; in Children it focuses the inline filter; in Frames or Placements it picks matching rows and steps through them on repeated searches; in the JSON editor it is the text find. Table prompts name the pane they search. **The mouse's side buttons are undo and redo**, which Qt does not map to anything by default.
 
 Press **G** anywhere outside a text field to open **Go to ID** and jump straight to a resource ID; **Ctrl+G** does the same and **F1** lists every shortcut. The single letter is ignored while you are typing in a search box, property field, spin box or the JSON editor, where the key belongs to the text instead.
 

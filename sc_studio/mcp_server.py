@@ -503,6 +503,52 @@ transform on the frames you name and can write a curve between them.
         """Save to an explicit path or the existing document path. New documents require a path."""
         return call("save_document", document_id=document_id, path=path)
 
+    @server.tool()
+    def author(action: str, parameters: dict, document_id: str | None = None) -> dict:
+        """Undoable portable authoring operations, one history step each.
+
+        parenting: {clip_id, parents: {child_index: parent_index}} (bakes local to world).
+        color_tween: {clip_id, child_index, start, end, curve?}.
+        morph_shapes: {start_id, end_id, count, curve?, framerate?} -> new clip ID.
+        mask_range: {clip_id, mask_child, content_children: [child indices]}.
+        motion_path: {clip_id, child_index, start, end, points: [[x,y],...], orient?, curve?}.
+        nine_slice: {shape_id, left, top, right, bottom} -> new nine-slice clip ID.
+        group_tracks: {clip_id, children: [child indices], name?} -> nested clip ID.
+        import_svg: {path, width?, height?} -> new shape ID.
+        repack_atlases: PublishSettings fields (max_width, max_height, padding, etc.).
+        Child indices refer to clip.children; they are not resource IDs.
+        """
+        return call("author", action=action, parameters=parameters, document_id=document_id)
+
+    @server.tool()
+    def publish(path: str, settings: dict | None = None, resource_ids: list[int] | None = None,
+                document_ids: list[str] | None = None, merge_path: str | None = None,
+                overwrite: bool = False, document_id: str | None = None) -> dict:
+        """Publish a separate SC output without modifying open documents.
+
+        Settings: version (5/6), linked_only, repack, max_width/max_height,
+        padding, texture_scale, lowres, encoding (RGBA8/RGBA4/RGB565/KTX),
+        external (KTX only), compress_external, write_text, low_precision,
+        short_frames (v5 only), compression_level, replace_exports.
+        resource_ids selects roots from the first source; other sources use
+        linked_only. merge_path supplies an existing destination document.
+        Existing outputs require overwrite=true. Never targets an open file.
+        """
+        return call("publish", path=path, settings=settings or {}, resource_ids=resource_ids,
+                    document_ids=document_ids or [], merge_path=merge_path, overwrite=overwrite,
+                    document_id=document_id)
+
+    @server.tool()
+    def render_resource(resource_id: int, frame: int = 0, scale: float = 1,
+                        document_id: str | None = None) -> Image:
+        """Render a PNG with RGB/alpha transforms, blend modes, text styles and stencil masks.
+
+        This renders artwork without editor selection borders or controls.
+        """
+        result = call("render_resource", resource_id=resource_id, frame=frame,
+                      scale=scale, document_id=document_id)
+        return Image(data=base64.b64decode(result["png"]), format="png")
+
     return server
 
 

@@ -3780,3 +3780,39 @@ def test_list_context_menus_offer_their_own_actions(window, monkeypatch):
     assert {"Add placement", "Remove", "Transform / color…"} == seen[2]
 
 
+
+
+def test_group_scale_by_dragging_the_box_handle(window):
+    """End to end: pick two, grab the group box corner, drag, release.
+
+    The direct-call test never covered the press/drag/release path, which is
+    where the group resize actually lives - and where the drag state was
+    cleared before the matrix was worked out, so the resize committed as a
+    no-op with a revision bump and nothing changed.
+    """
+    d, e = two_placements(window)
+    before = placement_matrices(d)
+    e.preview.selected_rows = {0, 1}
+    e.preview.selected_placement = 0
+    e.preview.viewport().update()
+    application().processEvents()
+    extent = e.preview.selection_extent()
+    assert extent is not None, "two picked placements should give a group box"
+    start = e.preview.mapFromScene(extent.bottomRight())
+    assert e.preview.group_extent_hit(start) == "se"
+    revision = e.revision
+    end = start + QPoint(40, 40)
+    QTest.mousePress(e.preview.viewport(), Qt.MouseButton.LeftButton, pos=start)
+    QTest.mouseMove(e.preview.viewport(), end)
+    QTest.mouseRelease(e.preview.viewport(), Qt.MouseButton.LeftButton, pos=end)
+    application().processEvents()
+    after = placement_matrices(d)
+    assert e.revision == revision + 1, "the drag is one edit"
+    # Both placements scale, not only the one that was grabbed.
+    for was, now in zip(before, after):
+        assert now[0] > was[0] and now[3] > was[3], "every picked placement grew"
+    # The one away from the anchor also moves; the anchor placement stays put.
+    assert after[1][4] != before[1][4] and after[1][5] != before[1][5]
+    assert after[0][4] == pytest.approx(before[0][4])
+    e.undo()
+    assert placement_matrices(d) == before, "one undo restores both"

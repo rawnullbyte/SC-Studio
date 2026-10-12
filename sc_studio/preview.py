@@ -707,17 +707,24 @@ class Preview(QGraphicsView):
     def mouseReleaseEvent(self, event):
         if self.group_resize:
             moved = self.drag_past_slop(event.position().toPoint())
-            self.group_resize = False
-            self.resize_handle = None
-            self.resize_rect = None
-            rows = sorted(self.drag_targets)
-            self.drag_targets = {}
-            self.matrix_override = None
-            if moved:
-                group = self.group_resize_matrix(
+            # The group matrix is worked out before the drag state is cleared:
+            # it anchors on self.resize_rect, so clearing that first made it
+            # fall back to the identity and the resize committed as a no-op.
+            group = (
+                self.group_resize_matrix(
                     self.mapToScene(event.position().toPoint()),
                     bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier),
                 )
+                if moved
+                else None
+            )
+            rows = sorted(self.drag_targets)
+            self.group_resize = False
+            self.resize_handle = None
+            self.resize_rect = None
+            self.drag_targets = {}
+            self.matrix_override = None
+            if group is not None:
                 self.placementsTransformed.emit(rows, group)
             elif self.last:
                 self.show_resource(*self.last, fit=False)

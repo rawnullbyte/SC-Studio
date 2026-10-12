@@ -414,7 +414,8 @@ class Editor(QWidget):
         placements_layout = QVBoxLayout(placements_page)
         self.timeline_pages.addTab(placements_page, "Placements")
         self.children = table(["Resource ID", "Instance name", "Blend", "Visible"], "children")
-        instances_layout.addWidget(QLabel("CHILDREN"))
+        # No "CHILDREN" heading: the INSPECTOR dropdown already names this panel,
+        # and it reads "Children" while this page is showing.
         self.children_search = QLineEdit()
         self.children_search.setPlaceholderText("Search children…  Ctrl+F")
         self.children_search.setToolTip("Filter by instance name, resource ID, or export name. Enter selects the first match.")

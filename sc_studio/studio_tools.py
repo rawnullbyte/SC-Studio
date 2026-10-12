@@ -30,7 +30,7 @@ from PyQt6.QtWidgets import (
 from .workspace import native_picker
 from . import authoring, easing
 from .publishing import PublishSettings, publish, repack_atlases
-from .app import ColorSwatch
+from .widgets import ColorSwatch
 
 
 def swatch(form, label, value):

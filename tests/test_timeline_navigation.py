@@ -3,7 +3,7 @@ import pytest
 from PyQt6.QtCore import QEvent, QPointF, Qt
 from PyQt6.QtGui import QMouseEvent, QWheelEvent
 from sc_studio.preview import AnimatorTimeline
-from sc_studio.app import fill_table
+from sc_studio.widgets import fill_table
 from test_gui import window, application, animatable_clip
 
 

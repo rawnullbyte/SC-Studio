@@ -3552,3 +3552,231 @@ def test_delete_in_the_preview_never_deletes_the_whole_resource(window, monkeypa
     QTest.keyClick(e.preview, Qt.Key.Key_Delete)
     application().processEvents()
     assert 7 in d.index
+
+
+
+def nested_textfield_doc():
+    """A textfield inside a movieclip that is itself inside another movieclip.
+
+    This is the shape the outline bug needed: the helper box is a descendant of
+    two containers, so it inherits two transforms and a plain pen stroke is
+    multiplied by both.
+    """
+    from PyQt6.QtWidgets import QGraphicsRectItem
+
+    d = populated()
+    inner = d.resource(7)
+    inner["children"] = [{"id": 4, "name": "label", "blend": 0}]
+    inner["frames"] = [{"label": "", "elements": [[0, 65535, 65535]]}]
+    inner["exports"] = ["inner"]
+    d.update("movieclips", inner)
+    outer_id = d.new_resource("movieclips")
+    outer = d.resource(outer_id)
+    outer["children"] = [{"id": 7, "name": "inner", "blend": 0}]
+    outer["frames"] = [{"label": "", "elements": [[0, 65535, 65535]]}]
+    d.update("movieclips", outer)
+    return d, outer_id
+
+
+def test_textfield_box_stays_a_hairline_when_a_parent_movieclip_scales(window):
+    """A scaled ancestor must not thicken or stretch the textfield outline.
+
+    The helper box is a scene item nested under every ancestor clip, so a
+    non-cosmetic pen is multiplied by each ancestor transform; that turned the
+    field outline into a stretched band once the clip was resized.
+    """
+    from PyQt6.QtWidgets import QGraphicsRectItem, QGraphicsItem
+
+    d, outer_id = nested_textfield_doc()
+    window.add_doc(d)
+    e = window.current()
+    e.go_to(outer_id)
+    application().processEvents()
+    boxes = [
+        i
+        for i in e.preview.scene().items()
+        if isinstance(i, QGraphicsRectItem) and i.parentItem() is not None
+    ]
+    assert boxes, "the textfield helper box should be in the scene"
+    for box in boxes:
+        assert box.pen().isCosmetic(), "a scaled parent thickens a plain stroke"
+        # It must also be drawn in the textfield's own units, not stretched by
+        # an ancestor: the rect is the authored box, unchanged by nesting.
+        assert box.rect().width() == d.resource(4)["right"] - d.resource(4)["left"]
+        assert box.rect().height() == d.resource(4)["bottom"] - d.resource(4)["top"]
+
+
+def two_placements(window):
+    """A clip with two child placements set apart, for group operations."""
+    d = populated()
+    clip = d.resource(7)
+    clip["frames"] = [{"label": "", "elements": [[0, 0, 65535], [1, 1, 65535]]}]
+    # Give the second placement its own matrix, offset from the first.
+    bank = d.bank(clip["matrix_bank_index"])
+    matrices = [list(m) for m in bank["matrices"]]
+    while len(matrices) < 2:
+        matrices.append([1, 0, 0, 1, 0, 0])
+    matrices[1] = [1, 0, 0, 1, 60, 40]
+    clip["matrix_bank_index"] = d.add_bank(matrices, list(bank.get("colors") or []))
+    d.update("movieclips", clip)
+    window.add_doc(d)
+    e = window.current()
+    e.go_to(7)
+    application().processEvents()
+    return d, e
+
+
+def placement_matrices(d):
+    clip = d.resource(7)
+    bank = d.bank(clip["matrix_bank_index"])
+    return [
+        list(bank["matrices"][e[1]]) if e[1] != 65535 else [1, 0, 0, 1, 0, 0]
+        for e in clip["frames"][0]["elements"]
+    ]
+
+
+def test_canvas_ctrl_click_builds_a_multi_selection(window):
+    """Ctrl-click adds a second placement to the canvas selection."""
+    from PyQt6.QtCore import QPointF
+
+    d, e = two_placements(window)
+    first, second = e.preview.mapFromScene(QPointF(45, 25)), e.preview.mapFromScene(
+        QPointF(65, 45)
+    )
+    QTest.mouseClick(e.preview.viewport(), Qt.MouseButton.LeftButton, pos=first)
+    application().processEvents()
+    picked_first = e.preview.selected_placement
+    QTest.mouseClick(
+        e.preview.viewport(),
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.ControlModifier,
+        pos=second,
+    )
+    application().processEvents()
+    assert e.preview.selected_rows == {0, 1}
+    assert e.preview.selected_placement == 1
+
+
+def test_group_drag_moves_every_picked_placement_in_one_undo_step(window):
+    """Dragging with several picked moves them all, as a single edit."""
+    from PyQt6.QtCore import QPointF
+
+    d, e = two_placements(window)
+    before = placement_matrices(d)
+    e.preview.selected_rows = {0, 1}
+    e.preview.selected_placement = 0
+    revision = e.revision
+    start = e.preview.mapFromScene(QPointF(45, 25))
+    end = start + QPoint(20, 10)
+    QTest.mousePress(e.preview.viewport(), Qt.MouseButton.LeftButton, pos=start)
+    QTest.mouseMove(e.preview.viewport(), end)
+    QTest.mouseRelease(e.preview.viewport(), Qt.MouseButton.LeftButton, pos=end)
+    application().processEvents()
+    after = placement_matrices(d)
+    assert e.revision == revision + 1, "one edit, not one per placement"
+    for was, now in zip(before, after):
+        assert now[4] != was[4] and now[5] != was[5], "every picked one moved"
+    # Both moved by the same offset, so the group kept its shape.
+    assert round(after[0][4] - before[0][4]) == round(after[1][4] - before[1][4])
+    assert round(after[0][5] - before[0][5]) == round(after[1][5] - before[1][5])
+    e.undo()
+    assert placement_matrices(d) == before, "one undo restores the whole group"
+
+
+
+
+def test_group_scale_composes_after_each_placement(window):
+    """A group scale applies after each placement's own transform.
+
+    Qt multiplies row-vectors, so the composed pose is ``own * group``. The
+    other order scales the translation too and drags the group across the
+    canvas while resizing it, which is the mistake this pins.
+    """
+    from PyQt6.QtGui import QTransform
+
+    d, e = two_placements(window)
+    before = placement_matrices(d)
+    # Half scale about the group's top-left: a pure group transform.
+    group = QTransform(0.5, 0, 0, 0.5, 0, 0)
+    e.preview.selected_rows = {0, 1}
+    e.preview.selected_placement = 0
+    e.transform_placements([0, 1], group)
+    application().processEvents()
+    after = placement_matrices(d)
+    for was, now in zip(before, after):
+        expected = QTransform(*was) * group
+        assert now == pytest.approx(
+            [
+                expected.m11(),
+                expected.m12(),
+                expected.m21(),
+                expected.m22(),
+                expected.dx(),
+                expected.dy(),
+            ]
+        )
+    # Composing the other way would have halved the offsets instead of leaving
+    # them, so the group would have collapsed toward the origin.
+    assert after[1][4] == pytest.approx(before[1][4] * 0.5)
+
+
+def test_ctrl_click_children_outlines_them_and_delete_takes_the_current_row(
+    window, monkeypatch
+):
+    """Several picked children are all outlined; Delete stays on the current row.
+
+    Multi-selecting in Children drives the canvas - every picked child's
+    placement in this frame is outlined. Delete there remains the single-row
+    action it always was: this list's marked ranges can outlive the layout they
+    were made in, because the rows are rebuilt with signals blocked, so reading
+    a set here could remove a row the user never picked. Multi-row delete is
+    available where it is safe: the canvas and the Placements list.
+    """
+    d = populated()
+    clip = d.resource(7)
+    clip["children"] = [
+        {"id": 3, "name": "a", "blend": 0},
+        {"id": 4, "name": "b", "blend": 0},
+        {"id": 3, "name": "c", "blend": 0},
+    ]
+    clip["frames"] = [
+        {"label": "", "elements": [[0, 0, 65535], [1, 0, 65535], [2, 0, 65535]]}
+    ]
+    d.update("movieclips", clip)
+    window.add_doc(d)
+    e = window.current()
+    e.go_to(7)
+    application().processEvents()
+    # setCurrentCell collapses a range, so the current cell is set first and
+    # the range marked afterwards - which is what a real drag-select does.
+    e.children.setCurrentCell(0, 0)
+    e.children.setRangeSelected(QTableWidgetSelectionRange(0, 0, 1, 0), True)
+    application().processEvents()
+    assert e.preview.selected_rows == {0, 1}, "both picked children are outlined"
+    e.children.setFocus()
+    window.delete_selection()
+    application().processEvents()
+    assert [c["name"] for c in d.resource(7)["children"]] == ["b", "c"]
+
+
+def test_list_context_menus_offer_their_own_actions(window, monkeypatch):
+    """Each list's right-click menu mirrors its buttons."""
+    from PyQt6.QtWidgets import QMenu
+    from PyQt6.QtCore import QPoint
+
+    d, e = two_placements(window)
+    seen = []
+
+    def fake_exec(menu, position):
+        seen.append({a.text() for a in menu.actions()})
+
+    monkeypatch.setattr(QMenu, "exec", fake_exec)
+    point = e.children.viewport().rect().center()
+    e.children_context_menu(point)
+    e.frames_context_menu(point)
+    e.placements_context_menu(point)
+    assert {"Add child…", "Delete", "Duplicate", "Rename…", "Open child"} <= seen[0]
+    assert {"New frame", "Duplicate frame", "Delete frame"} == seen[1]
+    assert {"Add placement", "Remove", "Transform / color…"} == seen[2]
+
+

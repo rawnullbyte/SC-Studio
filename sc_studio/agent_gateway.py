@@ -1052,7 +1052,7 @@ class AgentGateway(QObject):
             future.set_exception(error)
 
     def execute(self, operation, args):
-        from .app import jsonable
+        from .widgets import jsonable
         # Tools that group a family of edits behind one name with an action, so
         # an agent does not have to find five near-identical tools.
         actions = {

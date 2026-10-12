@@ -30,6 +30,7 @@ from PyQt6.QtGui import (
     QPixmap,
     QImage,
     QPalette,
+    QTransform,
     QFontDatabase,
     QTextCursor,
 )
@@ -83,6 +84,18 @@ from .workspace import (
     set_graph_clipboard,
 )
 from .preview import AnimatorTimeline, Preview
+from .widgets import (
+    AlignControl,
+    ColorSwatch,
+    ResourceItem,
+    Task,
+    _uv,
+    fill_table,
+    jsonable,
+    save_picker,
+    table,
+    typing_into,
+)
 from . import textures
 from . import easing
 from . import themes as theme_schemes
@@ -91,178 +104,6 @@ from . import themes as theme_schemes
 # with a colour picker rather than as the integer they are stored as.
 COLOR_KEYS = ("font_color", "outline_color")
 
-# The two packed alignment fields: horizontal in the low two bits, vertical in
-# the next two, with the high nibble reserved (styles/unknown).
-ALIGN_HORIZONTAL = ("Left", "Center", "Right", "Justify")
-ALIGN_VERTICAL = ("Top", "Center", "Bottom", "Bottom (alternate)")
-
-
-def _uv(value, size):
-    """A pixel coordinate as the 0..65535 texture coordinate the format stores."""
-    if size <= 0:
-        return 0
-    return round(max(0, min(size, value)) / size * 65535)
-
-
-def save_picker(parent, title, initial="", filters=""):
-    return native_picker(parent, title, initial, filters, save=True)
-
-
-class ResourceItem(QTreeWidgetItem):
-    def __lt__(self, other):
-        column = self.treeWidget().sortColumn() if self.treeWidget() else 0
-        if column == 1:
-            try:
-                return int(self.text(column)) < int(other.text(column))
-            except ValueError:
-                pass
-        return self.text(column).casefold() < other.text(column).casefold()
-
-
-class Signals(QObject):
-    done = pyqtSignal(object)
-    failed = pyqtSignal(str)
-
-
-class Task(QRunnable):
-    def __init__(self, fn):
-        super().__init__()
-        self.fn = fn
-        self.signals = Signals()
-
-    def run(self):
-        try:
-            self.signals.done.emit(self.fn())
-        except Exception as e:
-            self.signals.failed.emit(str(e))
-
-
-def jsonable(obj):
-    if isinstance(obj, dict):
-        return {k: jsonable(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple, FrameSequence, FrameElements)):
-        return [jsonable(v) for v in obj]
-    return obj
-
-
-def fill_table(table, rows):
-    table.blockSignals(True)
-    table.setRowCount(len(rows))
-    for i, row in enumerate(rows):
-        for j, value in enumerate(row):
-            table.setItem(i, j, QTableWidgetItem(str(value)))
-    if (
-        table.horizontalHeaderItem(0)
-        and table.horizontalHeaderItem(0).text() == "Frame"
-    ):
-        for i in range(table.rowCount()):
-            for j in (0, 2):
-                table.item(i, j).setFlags(
-                    table.item(i, j).flags() & ~Qt.ItemFlag.ItemIsEditable
-                )
-    if (
-        table.horizontalHeaderItem(0)
-        and table.horizontalHeaderItem(0).text() == "Texture atlas"
-    ):
-        for i in range(table.rowCount()):
-            table.item(i, 2).setFlags(
-                table.item(i, 2).flags() & ~Qt.ItemFlag.ItemIsEditable
-            )
-    table.blockSignals(False)
-    table.resizeColumnsToContents()
-
-
-def table(headers, name=""):
-    widget = QTableWidget(0, len(headers))
-    widget.setObjectName(name or headers[0].split()[0].lower())
-    widget.setHorizontalHeaderLabels(headers)
-    widget.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-    return widget
-
-
-class ColorSwatch(QPushButton):
-    """A packed ARGB colour shown as a swatch that opens the colour picker.
-
-    The value is the same integer the file stores; only the presentation is a
-    colour. ``toggled`` is emitted when the value changes, named to match what
-    the property form already listens for so it needs no special casing.
-    """
-
-    toggled = pyqtSignal(bool)
-
-    def __init__(self, value, parent=None):
-        super().__init__(parent)
-        self._value = int(value)
-        self.setMinimumWidth(96)
-        self.clicked.connect(self.pick)
-        self._refresh()
-
-    def value(self):
-        return self._value
-
-    def setValue(self, value):
-        self._value = int(value)
-        self._refresh()
-
-    def _refresh(self):
-        colour = QColor.fromRgba(self._value)
-        # The swatch carries its own colour so it reads without applying the
-        # theme; the label keeps the alpha visible, which a brush cannot show.
-        self.setStyleSheet(
-            f"QPushButton {{ background-color: {colour.name()}; "
-            f"color: {'#000' if colour.lightness() > 128 else '#fff'}; }}"
-        )
-        self.setText(f"{self._value:08X}")
-        self.setToolTip(f"argb {self._value}")
-
-    def pick(self):
-        colour = QColorDialog.getColor(
-            QColor.fromRgba(self._value), self, "Choose colour",
-            QColorDialog.ColorDialogOption.ShowAlphaChannel,
-        )
-        if colour.isValid() and colour.rgba() != self._value:
-            self._value = colour.rgba()
-            self._refresh()
-            self.toggled.emit(True)
-
-
-class AlignControl(QWidget):
-    """The packed textfield alignment bitfield as two named dropdowns.
-
-    Horizontal is the low two bits and vertical the next two; the high nibble is
-    left untouched, so a file that carries other flags in there round-trips.
-    """
-
-    currentIndexChanged = pyqtSignal(int)
-
-    def __init__(self, value, parent=None):
-        super().__init__(parent)
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        self.horizontal = QComboBox()
-        self.horizontal.addItems(ALIGN_HORIZONTAL)
-        self.vertical = QComboBox()
-        self.vertical.addItems(ALIGN_VERTICAL)
-        layout.addWidget(self.horizontal)
-        layout.addWidget(self.vertical)
-        self.setValue(value)
-        self.horizontal.currentIndexChanged.connect(self._changed)
-        self.vertical.currentIndexChanged.connect(self._changed)
-
-    def _changed(self, *_):
-        self.currentIndexChanged.emit(self.horizontal.currentIndex())
-
-    def value(self):
-        # Preserve the high nibble the two named fields do not cover.
-        return (self._high & 0xF0) | (self.horizontal.currentIndex() & 3) | (
-            (self.vertical.currentIndex() & 3) << 2
-        )
-
-    def setValue(self, value):
-        self._high = int(value)
-        with QSignalBlocker(self.horizontal), QSignalBlocker(self.vertical):
-            self.horizontal.setCurrentIndex(value & 3)
-            self.vertical.setCurrentIndex((value >> 2) & 3)
 
 
 class Editor(QWidget):
@@ -377,9 +218,11 @@ class Editor(QWidget):
         )
         cv.addWidget(self.breadcrumb)
         self.preview = Preview()
-        self.preview.placementSelected.connect(self.select_placement)
+        self.preview.placementSelected.connect(self.canvas_placement_selected)
         self.preview.placementMoved.connect(self.move_placement)
         self.preview.placementTransformed.connect(self.commit_placement_transform)
+        self.preview.placementsMoved.connect(self.move_placements)
+        self.preview.placementsTransformed.connect(self.transform_placements)
         self.preview.placementContext.connect(self.viewer_context_menu)
         self.preview.atlasContext.connect(self.atlas_context_menu)
         self.preview.atlasShapeOpened.connect(self.open_atlas_shape)
@@ -609,6 +452,14 @@ class Editor(QWidget):
             extra.addWidget(button)
         instances_layout.addLayout(extra)
         self.frames = table(["Frame", "Label", "Placements"], "frames")
+        # Right-click on any of the clip's lists offers that list's own actions,
+        # so they are reachable where the pointer already is.
+        for grid, handler in (
+            (self.children, self.children_context_menu),
+            (self.frames, self.frames_context_menu),
+        ):
+            grid.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            grid.customContextMenuRequested.connect(handler)
         frames_layout.addWidget(QLabel("Choose a frame to preview and edit"))
         frames_layout.addWidget(self.frames)
         fr = QHBoxLayout()
@@ -622,6 +473,10 @@ class Editor(QWidget):
             fr.addWidget(b)
         frames_layout.addLayout(fr)
         self.elements = table(["Child index", "Matrix index", "Color index"], "placements")
+        self.elements.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.elements.customContextMenuRequested.connect(
+            self.placements_context_menu
+        )
         placements_layout.addWidget(
             QLabel("Current frame placements · 65535 = identity")
         )
@@ -1109,6 +964,63 @@ class Editor(QWidget):
             return None
         return self.obj["children"][index]["id"]
 
+    def highlighted_rows(self, grid):
+        """Every row the grid has picked, ascending, empty when none is.
+
+        The tables select whole rows, so a clicked range is read from the
+        selection model rather than from the current row alone - that is what
+        makes Ctrl- and Shift-click mean something. Rows come out of the
+        selected *ranges* rather than ``selectedRows``: a cell-range selection
+        (what Shift-click and Ctrl+A produce, and what Ctrl+C copies) does not
+        mark whole rows as selected, so ``selectedRows`` would miss it.
+        """
+        rows = set()
+        for area in grid.selectionModel().selection():
+            rows.update(range(area.top(), area.bottom() + 1))
+        return sorted(rows)
+
+    def selected_child_rows(self):
+        """Rows marked in the Children list, or the current row when none is.
+
+        The marked ranges win when there are any; otherwise this is the current
+        row, which is what a plain click sets.
+        """
+        rows = self.highlighted_rows(self.children)
+        if rows:
+            return rows
+        row = self.children.currentRow()
+        return [row] if row >= 0 else []
+
+    def selected_placement_rows(self):
+        """Rows picked in the Placements list, or the focused one."""
+        rows = self.highlighted_rows(self.elements)
+        if rows:
+            return rows
+        row = self.elements.currentRow()
+        return [row] if row >= 0 else []
+
+    def clip_lists_with_focus(self):
+        """Which clip list the keyboard is in: children, placements or preview.
+
+        Focus identity alone is not enough to decide this. The panel holding the
+        list can take focus itself, and a canvas click moves it to the preview,
+        so a caller that asked only ``focusWidget() is self.children`` saw no
+        list at all and fell through to the resource action. Naming the surface
+        here keeps that decision in one place.
+        """
+        focus = QApplication.focusWidget()
+        if focus is self.preview or (
+            focus is not None and self.preview.isAncestorOf(focus)
+        ):
+            return "preview"
+        for name, grid in (
+            ("children", self.children),
+            ("placements", self.elements),
+        ):
+            if focus is grid or (focus is not None and grid.isAncestorOf(focus)):
+                return name
+        return None
+
     def context_menu(self, position):
         owner = self.window()
         menu = QMenu(self)
@@ -1124,6 +1036,68 @@ class Editor(QWidget):
             action = menu.addAction(title)
             action.triggered.connect(lambda checked=False, callback=fn: callback())
         menu.exec(self.tree.viewport().mapToGlobal(position))
+
+    def list_context_menu(self, grid, position, entries):
+        """Right-click menu for one of the clip's lists.
+
+        Mirrors that list's own buttons, so every action on it is reachable
+        without moving the pointer to the button row. Standard right-click
+        behaviour: a click inside an existing multi-selection keeps it and acts
+        on all of it, otherwise the row under the cursor becomes the selection
+        first.
+        """
+        item = grid.itemAt(position)
+        row = item.row() if item is not None else -1
+        if row >= 0:
+            picked = set(self.highlighted_rows(grid))
+            if row not in picked:
+                grid.clearSelection()
+                grid.selectRow(row)
+            grid.setCurrentCell(row, max(0, grid.currentColumn()))
+        menu = QMenu(grid)
+        for title, fn in entries:
+            action = menu.addAction(title)
+            action.setEnabled(row >= 0 or bool(self.highlighted_rows(grid)))
+            action.triggered.connect(lambda checked=False, callback=fn: callback())
+        menu.exec(grid.viewport().mapToGlobal(position))
+
+    def children_context_menu(self, position):
+        self.list_context_menu(
+            self.children,
+            position,
+            [
+                ("Add child…", self.add_child),
+                ("Delete", self.remove_child),
+                ("Duplicate", self.duplicate_child),
+                ("Rename…", self.rename_child),
+                ("Open child", self.open_child),
+                ("Send back", lambda: self.reorder_child(False)),
+                ("Bring front", lambda: self.reorder_child(True)),
+                ("Show all", self.show_all_children),
+            ],
+        )
+
+    def frames_context_menu(self, position):
+        self.list_context_menu(
+            self.frames,
+            position,
+            [
+                ("New frame", lambda: self.add_frame(False)),
+                ("Duplicate frame", lambda: self.add_frame(True)),
+                ("Delete frame", self.remove_frame),
+            ],
+        )
+
+    def placements_context_menu(self, position):
+        self.list_context_menu(
+            self.elements,
+            position,
+            [
+                ("Add placement", self.add_element),
+                ("Remove", self.remove_element),
+                ("Transform / color…", self.edit_transform),
+            ],
+        )
 
     def go_to(self, id, remember=True):
         if id not in self.doc.index:
@@ -3139,17 +3113,25 @@ class Editor(QWidget):
             or self.doc.index[self.selected][0] != "movieclips"
         ):
             return
-        ci = self.children.currentRow()
+        picked = set(self.selected_child_rows())
+        primary = self.children.currentRow()
         frame = self.cursor_frame(self.obj)
         elements = frame["elements"] if frame is not None else []
-        row = next((i for i, e in enumerate(elements) if e[0] == ci), -1)
+        # Every placement in this frame whose child is picked, so choosing
+        # several children outlines all of them in the canvas rather than only
+        # the last one clicked.
+        rows = [i for i, e in enumerate(elements) if e[0] in picked]
         with QSignalBlocker(self.elements):
-            if row >= 0:
-                self.elements.selectRow(row)
+            if rows:
+                self.elements.clearSelection()
+                for r in rows:
+                    self.elements.selectRow(r)
+                self.elements.setCurrentCell(primary_row := rows[-1], 0)
             else:
                 self.elements.clearSelection()
                 self.elements.setCurrentCell(-1, -1)
-        self.preview.selected_placement = row if row >= 0 else None
+        self.preview.selected_rows = set(rows)
+        self.preview.selected_placement = rows[-1] if rows else None
         self.preview.viewport().update()
         # The transform fields describe the placement the panels are acting on,
         # so picking a child in the list moves them here too rather than leaving
@@ -3180,16 +3162,33 @@ class Editor(QWidget):
         if ci < 0 or not self.resolve_drafts():
             return
         obj = self.doc.resource(self.selected)
-        child = copy.deepcopy(obj["children"][ci])
-        child["name"] = (child["name"] or "child") + "_copy"
-        index = len(obj["children"])
-        obj["children"].append(child)
-        for frame in obj["frames"]:
-            frame["elements"].extend(
-                [[index, e[1], e[2]] for e in list(frame["elements"]) if e[0] == ci]
-            )
+        # Every picked child gets a copy, so a set of instances can be
+        # duplicated in one step rather than one at a time.
+        rows = (
+            self.selected_child_rows() if child_index is None else [ci]
+        )
+        rows = sorted({c for c in rows if 0 <= c < len(obj["children"])})
+        if not rows:
+            return
+        # The copies are appended in the order the rows appear, so the last one
+        # lands highest and selects predictably.
+        for source in rows:
+            child = copy.deepcopy(obj["children"][source])
+            child["name"] = (child["name"] or "child") + "_copy"
+            index = len(obj["children"])
+            obj["children"].append(child)
+            for frame in obj["frames"]:
+                frame["elements"].extend(
+                    [[index, e[1], e[2]] for e in list(frame["elements"]) if e[0] == source]
+                )
+        index = len(obj["children"]) - 1
         if self.mutate(lambda: self.doc.update("movieclips", obj)):
             self.refresh()
+            # Cleared first: after the rows were rebuilt a previous range can
+            # still be marked, and selecting the copy without clearing left the
+            # old row picked alongside it - so the next single-row action, a
+            # click then Delete, took both.
+            self.children.clearSelection()
             self.children.selectRow(index)
 
     def reorder_child(self, front):
@@ -3209,6 +3208,12 @@ class Editor(QWidget):
             self.children.selectRow(ci)
 
     def commit_placement_transform(self, row, matrix):
+        """Set one placement's transform outright.
+
+        The single-item resize already knows the final pose, so this is an
+        absolute set; a group transform is relative to each placement because
+        they all share one box, which is what ``transform_placements`` does.
+        """
         if not self.resolve_drafts():
             self.render_frame(value=self.cursor.value(), fit=False)
             return
@@ -3229,39 +3234,125 @@ class Editor(QWidget):
             self.preview.selected_placement = row
             self.preview.viewport().update()
 
+    def transform_placements(self, rows, group):
+        """Apply a scene-space transform to several placements at once.
+
+        ``group`` is a QTransform in the clip's own space - the group box's
+        scale about its anchor - so each placement's new transform is its own
+        current one composed with the group. One mutation, so one undo step.
+        """
+        rows = [r for r in rows if r is not None]
+        if not rows:
+            return
+        if not self.resolve_drafts():
+            self.render_frame(value=self.cursor.value(), fit=False)
+            return
+        clip = self.doc.resource(self.selected)
+        fi = self.cursor.value()
+        # A resize made with the cursor past the end grows the clip the same
+        # way a move does, so the change is not dropped.
+        self.grow_clip(clip, fi)
+        elements = clip["frames"][fi]["elements"]
+        group_matrix = [
+            group.m11(),
+            group.m12(),
+            group.m21(),
+            group.m22(),
+            group.dx(),
+            group.dy(),
+        ]
+        changed = []
+        for row in rows:
+            if row >= len(elements):
+                continue
+            element = elements[row]
+            current = QTransform(
+                *(
+                    list(self.doc.bank(clip["matrix_bank_index"])["matrices"][element[1]])
+                    if element[1] != 65535
+                    else [1, 0, 0, 1, 0, 0]
+                )
+            )
+            # The group applies after the placement's own transform: a
+            # placement is already in clip space, so its new pose is its own
+            # matrix followed by the group's. Qt multiplies row-vectors, so that
+            # order is ``current * group``, not the other way round.
+            composed = current * group
+            changed.append(
+                (
+                    element,
+                    [
+                        composed.m11(),
+                        composed.m12(),
+                        composed.m21(),
+                        composed.m22(),
+                        composed.dx(),
+                        composed.dy(),
+                    ],
+                )
+            )
+        if not changed:
+            self.error(ValueError(f"placement {rows[0]} is not in frame {fi + 1}"))
+            return
+        if self.mutate(lambda: self.assign_matrices(clip, changed)):
+            self.refresh()
+            self.select_placement(rows[-1])
+            self.preview.selected_placement = rows[-1]
+            self.preview.viewport().update()
+
     def remove_child(self, child_index=None):
         # QPushButton.clicked and QAction.triggered both carry a checked bool,
         # which Qt hands to a slot that takes an argument. Without this the
         # button deleted child 0 whatever was picked, because False reads as 0.
         if child_index is None or isinstance(child_index, bool):
-            child_index = self.children.currentRow()
-        i = child_index
-        if i < 0:
-            return
+            rows = self.selected_child_rows()
+        else:
+            rows = [child_index]
+        self.remove_child_rows(rows)
 
+    def remove_child_rows(self, rows):
+        """Remove several children, and their placements, in one edit."""
+        doomed = sorted({c for c in rows if c is not None and c >= 0})
+        if not doomed:
+            return
+        i = doomed[0]
         if not self.resolve_drafts():
             return
         obj = self.doc.resource(self.selected)
         if not 0 <= i < len(obj["children"]):
             return
-        name = obj["children"][i]["name"] or f"child {i}"
-        obj["children"].pop(i)
+        # Everything picked in the list goes, not just the current row. Done
+        # downwards so the earlier indices still mean the same child as they are
+        # removed, and with one renormalisation pass at the end.
+        doomed = [c for c in doomed if c < len(obj["children"])]
+        if not doomed:
+            return
+        names = [
+            obj["children"][c]["name"] or f"child {c}" for c in doomed
+        ]
+        for c in reversed(doomed):
+            obj["children"].pop(c)
+        drop = set(doomed)
         for frame in obj["frames"]:
-            frame["elements"] = [e for e in frame["elements"] if e[0] != i]
-            for e in frame["elements"]:
-                if e[0] > i:
-                    e[0] -= 1
+            kept = [e for e in frame["elements"] if e[0] not in drop]
+            for e in kept:
+                # Every removed child below this one shifts it down.
+                e[0] -= sum(1 for c in doomed if c < e[0])
+            frame["elements"] = kept
         if self.mutate(lambda: self.doc.update("movieclips", obj)):
             hidden = self.child_visibility.get(self.selected, set())
             self.child_visibility[self.selected] = {
-                c - 1 if c > i else c for c in hidden if c != i
+                c - sum(1 for d in doomed if d < c) for c in hidden if c not in drop
             }
             self.refresh()
-            self.children.selectRow(min(i, self.children.rowCount() - 1))
+            self.children.selectRow(
+                min(min(doomed), max(0, self.children.rowCount() - 1))
+            )
             # No confirmation dialog: the change is one undo step, so Ctrl+Z
             # takes it straight back. Saying what went keeps it discoverable.
+            label = names[0] if len(names) == 1 else f"{len(names)} children"
             self.window().statusBar().showMessage(
-                f"Removed {name} from every frame · Ctrl+Z to undo", 4000
+                f"Removed {label} from every frame · Ctrl+Z to undo", 4000
             )
 
     def add_frame(self, duplicate):
@@ -3298,9 +3389,12 @@ class Editor(QWidget):
         self.clip_edit(change)
 
     def remove_element(self):
-        row = self.elements.currentRow()
+        self.remove_element_rows(self.selected_placement_rows())
+
+    def remove_element_rows(self, rows):
         i = self.frame_index()
-        if row < 0:
+        rows = [r for r in rows if r is not None]
+        if not rows:
             return
         if (
             self.selected not in self.doc.index
@@ -3309,57 +3403,116 @@ class Editor(QWidget):
             return
         obj = self.doc.resource(self.selected)
         frames = obj["frames"]
-        if not 0 <= i < len(frames) or row >= len(frames[i]["elements"]):
+        if not 0 <= i < len(frames):
             return
-        child = frames[i]["elements"][row][0]
-        others = frames[i]["elements"][:row] + frames[i]["elements"][row + 1 :]
-        still_placed = any(
-            element[0] == child
-            for n, frame in enumerate(frames)
-            for element in (others if n == i else frame["elements"])
-        )
-        frames[i]["elements"].pop(row)
+        elements = frames[i]["elements"]
+        doomed = sorted({r for r in rows if 0 <= r < len(elements)})
+        if not doomed:
+            return
+        drop = set(doomed)
+        children = {elements[r][0] for r in doomed}
+        kept = [e for r, e in enumerate(elements) if r not in drop]
         # A child nothing places any more has no route back through the preview
         # or the frames, so it only lingers in the Children list. That is the
         # entry the request was to be rid of; drop it in the same undo step.
-        removed = None
-        if child < len(obj["children"]) and not still_placed:
-            removed = obj["children"][child]["name"] or f"child {child}"
-            obj["children"].pop(child)
-            # Children after the hole sit one lower, so their placements move.
-            for frame in frames:
-                for element in frame["elements"]:
-                    if element[0] > child:
-                        element[0] -= 1
+        gone = []
+        for child in sorted(children, reverse=True):
+            if child >= len(obj["children"]):
+                continue
+            still_placed = any(e[0] == child for e in kept) or any(
+                e[0] == child
+                for n, frame in enumerate(frames)
+                if n != i
+                for e in frame["elements"]
+            )
+            if not still_placed:
+                gone.append(obj["children"][child]["name"] or f"child {child}")
+                obj["children"].pop(child)
+                for frame in frames:
+                    for element in frame["elements"]:
+                        if element[0] > child:
+                            element[0] -= 1
+        frames[i]["elements"] = kept
         if self.mutate(lambda: self.doc.update("movieclips", obj)):
             self.refresh()
-            if removed:
+            if gone:
+                label = gone[0] if len(gone) == 1 else f"{len(gone)} children"
                 self.window().statusBar().showMessage(
-                    f"Removed the placement and its unused child {removed}"
+                    f"Removed the placement and its unused child {label}"
                     " · Ctrl+Z to undo",
                     4000,
                 )
 
+    def canvas_placement_selected(self, row):
+        """The canvas picked a placement: mirror it into the lists.
+
+        This must not rebuild the canvas selection. The preview has already set
+        ``selected_rows`` for the whole pick - including a Ctrl-click that kept
+        the earlier rows - so narrowing it to the one row here would undo the
+        Ctrl-click that produced this signal.
+        """
+        self.sync_lists_to_selection()
+
     def select_placement(self, row):
+        """Pick a single placement from the app side, canvas and lists together."""
         self.preview.selected_placement = row
+        self.preview.selected_rows = {row} if row is not None else set()
         self.preview.viewport().update()
         if self.timer.isActive():
             self.toggle_play()
         self.set_panel(0)
         self.elements.selectRow(row)
-        # The cursor can sit past the last frame while the clip is short, and
-        # a preview is reloaded for resources that hold no frames at all, so
-        # the frame being asked about may not exist yet.
-        frames = self.obj["frames"]
-        index = min(self.cursor.value(), len(frames) - 1)
-        if self.selected in self.doc.index and index >= 0 and row < len(
-            frames[index]["elements"]
-        ):
-            ci = frames[index]["elements"][row][0]
-            with QSignalBlocker(self.children):
-                self.children.selectRow(ci)
+        self.sync_lists_to_selection()
+
+    def sync_lists_to_selection(self):
+        """Follow the canvas's picked placements in the two clip lists.
+
+        Placements mirrors the whole set, since that list is per-placement and
+        the two agree row for row. Children follows only the primary: it is the
+        clip's child list, not a per-placement one, and writing a whole set
+        there left rows picked after the canvas pick was over, so a later
+        single-row action - a plain click then Delete - acted on all of them.
+        A multi-child selection is the user's to make in that list.
+        """
+        if self.selected not in self.doc.index:
+            return
+        if self.doc.index[self.selected][0] != "movieclips":
+            return
+        row = self.preview.selected_placement
+        rows = set(self.preview.selected_rows)
+        if row is not None:
+            rows.add(row)
+        rows = {r for r in rows if r is not None}
+        frame = self.cursor_frame(self.obj)
+        elements = frame["elements"] if frame is not None else []
+        rows = {r for r in rows if 0 <= r < len(elements)}
+        children = self.obj["children"]
+        with QSignalBlocker(self.children), QSignalBlocker(self.elements):
+            self.children.clearSelection()
+            self.elements.clearSelection()
+            for r in sorted(rows):
+                self.elements.selectRow(r)
+            if row is not None and 0 <= row < len(elements):
+                ci = elements[row][0]
+                if 0 <= ci < len(children):
+                    self.children.selectRow(ci)
+        if self.timer.isActive():
+            self.toggle_play()
+        self.set_panel(0)
+        self.load_animation_fields()
 
     def move_placement(self, row, dx, dy):
+        self.move_placements([row], dx, dy)
+
+    def move_placements(self, rows, dx, dy):
+        """Offset several placements by the same amount, as one edit.
+
+        A group drag moves every picked placement; doing it as one mutation
+        keeps it one undo step instead of one per row.
+        """
+        rows = [r for r in rows if r is not None]
+        if not rows:
+            return
         if not self.resolve_drafts():
             self.render_frame(fit=False)
             return
@@ -3368,27 +3521,33 @@ class Editor(QWidget):
         # The cursor may sit past the last frame while the clip is still short;
         # changing something there is exactly how the clip gets its new frames.
         self.grow_clip(obj, fi)
-        if row >= len(obj["frames"][fi]["elements"]):
+        elements = obj["frames"][fi]["elements"]
+        moving = []
+        for row in rows:
+            if row >= len(elements):
+                continue
+            element = elements[row]
+            matrix = (
+                list(self.doc.bank(obj["matrix_bank_index"])["matrices"][element[1]])
+                if element[1] != 65535
+                else [1, 0, 0, 1, 0, 0]
+            )
+            matrix[4] += dx
+            matrix[5] += dy
+            moving.append((element, matrix))
+        if not moving:
             self.error(
-                ValueError(f"placement {row} is not in frame {fi + 1}")
+                ValueError(f"placement {rows[0]} is not in frame {fi + 1}")
             )
             return
-        element = obj["frames"][fi]["elements"][row]
-        matrix = (
-            list(self.doc.bank(obj["matrix_bank_index"])["matrices"][element[1]])
-            if element[1] != 65535
-            else [1, 0, 0, 1, 0, 0]
-        )
-        matrix[4] += dx
-        matrix[5] += dy
         # Moving a placement cannot rename anything, so the browser list is
         # left alone; rebuilding it was the bulk of the lag after a drag.
         if self.mutate(
-            lambda: self.assign_matrix(obj, element, matrix), rebuild_browser=False
+            lambda: self.assign_matrices(obj, moving), rebuild_browser=False
         ):
             self.refresh()
-            self.elements.selectRow(row)
-            self.preview.selected_placement = row
+            self.elements.selectRow(min(rows))
+            self.preview.selected_placement = rows[-1]
 
     def size_dialog(self, title, width, height, x=0, y=0, rotation=0):
         dialog = QDialog(self)
@@ -3747,6 +3906,16 @@ class Editor(QWidget):
         Runs at the end of an edit, so each frame element is remapped once even
         when a tween added many matrices.
         """
+        self.assign_matrices(clip, [(element, matrix)])
+
+    def assign_matrices(self, clip, assignments):
+        """Point several elements at new matrices in one bank compaction.
+
+        ``assign_matrix`` compacts the whole bank on every call, so assigning a
+        whole selection one element at a time would compact once per placement.
+        This does it once for the set, which is what keeps a group drag a single
+        edit rather than N of them.
+        """
         usedm = sorted(
             {e[1] for f in clip["frames"] for e in f["elements"] if e[1] != 65535}
         )
@@ -3766,8 +3935,9 @@ class Editor(QWidget):
             for e in f["elements"]:
                 e[1] = mi.get(e[1], 65535)
                 e[2] = ci.get(e[2], 65535)
-        element[1] = len(matrices)
-        matrices.append(matrix)
+        for element, matrix in assignments:
+            element[1] = len(matrices)
+            matrices.append(matrix)
         clip["matrix_bank_index"] = self.doc.add_bank(matrices, colors)
         self.doc.update("movieclips", clip)
 
@@ -3783,14 +3953,32 @@ class Editor(QWidget):
             return
         clip = self.doc.resource(self.selected)
         fi = self.cursor.value()
-        if not clip["frames"] or not clip["frames"][fi]["elements"]:
+        frames = clip["frames"]
+        # The cursor is allowed past the last frame - that is where an edit
+        # extends the clip - so indexing it directly raised IndexError as soon
+        # as the playhead sat in that headroom.
+        if not frames:
+            self.error("Import an image or add a placement first.")
+            return
+        fi = min(fi, len(frames) - 1)
+        elements = frames[fi]["elements"]
+        if not elements:
             self.error("Import an image or add a placement first.")
             return
         row = self.elements.currentRow()
-        if row < 0:
-            row = len(clip["frames"][fi]["elements"]) - 1
-        element = clip["frames"][fi]["elements"][row]
-        child_id = clip["children"][element[0]]["id"]
+        if not 0 <= row < len(elements):
+            row = len(elements) - 1
+        element = elements[row]
+        children = clip["children"]
+        # A placement stores a child index, and that index can point past the
+        # end after children were removed; reading the child by it raised
+        # IndexError rather than saying what was wrong.
+        if not 0 <= element[0] < len(children):
+            self.error(
+                "This placement refers to a child that is no longer in this movieclip."
+            )
+            return
+        child_id = children[element[0]]["id"]
         item = next(
             (
                 item
@@ -3868,9 +4056,17 @@ class Editor(QWidget):
                 )
                 else {"matrices": [], "colors": []}
             )
-            matrix = old["matrices"][e[1]] if e[1] != 65535 else [1, 0, 0, 1, 0, 0]
+            # A stale matrix or colour index points past the bank, which raised
+            # IndexError instead of opening the dialog on the identity pose.
+            matrix = (
+                old["matrices"][e[1]]
+                if e[1] != 65535 and e[1] < len(old["matrices"])
+                else [1, 0, 0, 1, 0, 0]
+            )
             color = (
-                old["colors"][e[2]] if e[2] != 65535 else [255, 255, 255, 255, 0, 0, 0]
+                old["colors"][e[2]]
+                if e[2] != 65535 and e[2] < len(old["colors"])
+                else [255, 255, 255, 255, 0, 0, 0]
             )
             dialog = QDialog(self)
             dialog.setWindowTitle("Placement transform and color")
@@ -5081,15 +5277,50 @@ class Window(QMainWindow):
             return
         # A child focused in the Children or Placements list is what Delete is
         # about: it removes that instance from every frame, which is the
-        # child-list action, not deleting the resource it instances. The preview
-        # is an editing surface too, so Delete there acts on the picked object
-        # and on nothing else - it must never fall through to deleting the whole
-        # resource, which is the one thing a press in the canvas cannot mean.
+        # child-list action, not deleting the resource it instances. Every
+        # picked row goes, so a Ctrl-clicked set is removed together.
+        #
+        # Which clip list a press means is decided by where the rows are picked
+        # rather than by asking which widget has focus. Focus identity is not
+        # dependable here - the panel itself can hold it, and the preview takes
+        # it on a canvas click - so a test that could not rely on it deleted the
+        # wrong thing. A picked row is unambiguous; focus is not.
+        # The current row is the robust signal here; the picked ranges and the
+        # focus widget both proved unreliable, so the row decides the surface
+        # and its picked range - if any - says what to take.
+        inside = ed.clip_lists_with_focus()
+        if inside == "children":
+            # Single row only. A marked range in this list can outlive the
+            # layout it was made in (the rows are rebuilt with signals blocked),
+            # so reading a set here could remove a row the user never picked.
+            # Multi-select in the Children list still drives the canvas; only
+            # Delete stays on the current row.
+            row = ed.children.currentRow()
+            rows = [row] if row >= 0 else []
+        elif inside == "placements":
+            rows = ed.selected_placement_rows()
+        else:
+            rows = []
+        if rows and inside == "placements":
+            ed.remove_element_rows(rows)
+            return
+        if rows and inside == "children":
+            ed.remove_child_rows(rows)
+            return
+        if inside is None and ed.children.currentRow() >= 0:
+            ed.remove_child_rows([ed.children.currentRow()])
+            return
+        # The canvas is an editing surface too: Delete there acts on the picked
+        # placements and on nothing else. It must never fall through to deleting
+        # the whole resource, the one thing a press in the canvas cannot mean.
+        if ed.preview.hasFocus() or inside == "preview":
+            rows = ed.selected_placement_rows()
+            if rows:
+                ed.remove_element_rows(rows)
+            return
         child = ed.focused_child_index()
         if child >= 0:
             ed.remove_child(child)
-            return
-        if ed.preview.hasFocus():
             return
         ids = ed.selected_ids()
         if not ids:

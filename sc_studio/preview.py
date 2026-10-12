@@ -172,6 +172,10 @@ class Preview(QGraphicsView):
     atlasShapeOpened = pyqtSignal(int)
 
     placementTransformed = pyqtSignal(int, object)
+    # The batched forms. A drag carries whole rows rather than one, so the app
+    # can make the edit once instead of once per placement.
+    placementsMoved = pyqtSignal(object, float, float)
+    placementsTransformed = pyqtSignal(object, object)
 
     def contextMenuEvent(self, event):
         if self.atlas_regions is not None:
@@ -260,7 +264,13 @@ class Preview(QGraphicsView):
         if event.key() in directions and self.selected_item() is not None:
             dx, dy = directions[event.key()]
             step = 10 if event.modifiers() & Qt.KeyboardModifier.ShiftModifier else 1
-            self.placementMoved.emit(self.selected_placement, dx * step, dy * step)
+            rows = sorted(self.selected_rows) or [self.selected_placement]
+            if len(rows) > 1:
+                self.placementsMoved.emit(rows, dx * step, dy * step)
+            else:
+                self.placementMoved.emit(
+                    self.selected_placement, dx * step, dy * step
+                )
             event.accept()
             return
         super().keyPressEvent(event)
@@ -280,8 +290,41 @@ class Preview(QGraphicsView):
             else None
         )
 
+    def items_for_rows(self, rows):
+        """The visible top-level items for a set of placement rows.
+
+        ``data(0)`` carries the row only on a direct child of the clip being
+        viewed (a nested container has no row of its own), so this walks
+        ``instances`` the same way ``selected_item`` does and keeps every match
+        rather than the first.
+        """
+        wanted = set(rows)
+        return [
+            item
+            for item, _ in self.instances.values()
+            if item.isVisible() and item.data(0) in wanted
+        ]
+
+    def selection_extent(self):
+        """The scene-space union of every selected item, or None."""
+        items = self.items_for_rows(self.selected_rows)
+        if not items:
+            return None
+        extent = QRectF()
+        for item in items:
+            box = item.mapToScene(item.boundingRect()).boundingRect()
+            extent = box if extent.isNull() else extent.united(box)
+        return extent
+
     def resize_handles(self, item):
-        r = item.boundingRect()
+        return self.rect_handles(item.boundingRect())
+
+    def rect_handles(self, r):
+        """The eight named handle points of a rect, in that rect's own space.
+
+        Shared by a single item's outline and the group box, so the two agree on
+        where a handle is and what dragging one means.
+        """
         return {
             "nw": r.topLeft(),
             "n": QPointF(r.center().x(), r.top()),
@@ -299,6 +342,23 @@ class Preview(QGraphicsView):
             return None
         for name, point in self.resize_handles(item).items():
             screen = self.mapFromScene(item.mapToScene(point))
+            if (screen - position).manhattanLength() <= 10:
+                return name
+        return None
+
+    def group_extent_hit(self, position):
+        """The group handle under the cursor, when several rows are selected.
+
+        The box is in scene space with no item transform of its own, so the
+        handles map to screen directly.
+        """
+        if len(self.selected_rows) < 2:
+            return None
+        extent = self.selection_extent()
+        if extent is None:
+            return None
+        for name, point in self.rect_handles(extent).items():
+            screen = self.mapFromScene(point)
             if (screen - position).manhattanLength() <= 10:
                 return name
         return None
@@ -354,24 +414,72 @@ class Preview(QGraphicsView):
         )
 
     def preview_transform(self, matrix):
-        self.matrix_override = (
-            self.selected_placement,
-            [
-                matrix.m11(),
-                matrix.m12(),
-                matrix.m21(),
-                matrix.m22(),
-                matrix.dx(),
-                matrix.dy(),
-            ],
-        )
+        self.set_preview_overrides({self.selected_placement: matrix})
+
+    def set_preview_overrides(self, matrices):
+        """Hold live transforms for a render without writing them to the file.
+
+        Keyed by placement row, so one selected placement and a whole group use
+        the same mechanism; the render walk applies whichever it finds.
+        """
+        self.matrix_override = {
+            row: [
+                m.m11(),
+                m.m12(),
+                m.m21(),
+                m.m22(),
+                m.dx(),
+                m.dy(),
+            ]
+            for row, m in matrices.items()
+        }
         if self.last:
             doc, id, frame = self.last
             self.show_resource(doc, id, frame, fit=False)
 
+    def row_items(self):
+        """Top-level row -> item, for every visible item that carries a row."""
+        return {
+            int(item.data(0)): item
+            for item, _ in self.instances.values()
+            if item.isVisible() and item.data(0) is not None
+        }
+
+    def pick_row(self, row, modifiers):
+        """Update the selection for a click on ``row``, honouring modifiers.
+
+        Plain click replaces the selection, Ctrl toggles one row, Shift extends
+        from the primary. The primary is the last row picked: it is what the
+        per-object resize handles and the animator's transform fields follow,
+        while ``selected_rows`` is everything a drag or Delete acts on.
+        """
+        ctrl = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+        shift = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+        if ctrl:
+            if row in self.selected_rows:
+                self.selected_rows.discard(row)
+                if self.selected_placement == row:
+                    self.selected_placement = (
+                        max(self.selected_rows) if self.selected_rows else None
+                    )
+            else:
+                self.selected_rows.add(row)
+                self.selected_placement = row
+        elif shift and self.selected_placement is not None:
+            low, high = sorted((self.selected_placement, row))
+            self.selected_rows.update(range(low, high + 1))
+        else:
+            # A plain press on something already picked keeps the whole
+            # selection, so grabbing any member of a group and dragging it moves
+            # the group rather than collapsing to the one grabbed.
+            if row not in self.selected_rows:
+                self.selected_rows = {row}
+            self.selected_placement = row
+
     def mousePressEvent(self, event):
         self.dragged = None
         self.resize_handle = None
+        self.group_resize = False
         self.drag_origin = event.position().toPoint()
         if (
             event.button() == Qt.MouseButton.LeftButton
@@ -379,6 +487,21 @@ class Preview(QGraphicsView):
             and not event.modifiers() & Qt.KeyboardModifier.AltModifier
         ):
             point = self.mapToScene(event.position().toPoint())
+            # The group box is drawn in place of the per-object handles when
+            # several rows are picked, so its handles are tested first.
+            handle = self.group_extent_hit(event.position().toPoint())
+            if handle:
+                self.group_resize = True
+                self.resize_handle = handle
+                self.resize_rect = self.selection_extent()
+                self.drag_start = point
+                self.drag_targets = {
+                    row: (item, QTransform(item.transform()))
+                    for row, item in self.row_items().items()
+                    if row in self.selected_rows
+                }
+                event.accept()
+                return
             handle = self.resize_hit(event.position().toPoint())
             if handle:
                 self.dragged = self.selected_item()
@@ -393,19 +516,31 @@ class Preview(QGraphicsView):
                 while item and item.data(0) is None:
                     item = item.parentItem()
                 if item is not None:
-                    self.dragged = item
-                    self.selected_placement = int(item.data(0))
+                    row = int(item.data(0))
+                    self.pick_row(row, event.modifiers())
+                    top_level = any(
+                        group is item for group, _ in self.instances.values()
+                    )
                     self.drag_start = point
+                    self.drag_targets = {
+                        r: (i, QTransform(i.transform()))
+                        for r, i in self.row_items().items()
+                        if r in self.selected_rows
+                    }
+                    # Dragging offsets every picked placement from where it
+                    # started, so a group keeps its shape while it moves.
+                    self.dragged = item if top_level else None
                     self.drag_matrix = QTransform(item.transform())
-                    self.placementSelected.emit(self.selected_placement)
-                    if not any(group is item for group, _ in self.instances.values()):
-                        self.dragged = None
+                    if self.selected_placement is not None:
+                        self.placementSelected.emit(self.selected_placement)
+                    if not top_level:
                         event.accept()
                         return
                     self.viewport().update()
                     event.accept()
                     return
             self.selected_placement = None
+            self.selected_rows = set()
             self.viewport().update()
         # A drag on empty space pans the view. Qt rewrites the scene rect as it
         # scrolls, so the free area has to be restored on every move, while the
@@ -444,9 +579,66 @@ class Preview(QGraphicsView):
         """
         return point != getattr(self, "drag_origin", point)
 
+    def group_resize_matrix(self, point, shift=False):
+        """The scene-space matrix that scales the picked group about its anchor.
+
+        The group box is already in scene space and the picked placements are
+        top-level, so one matrix in that space applies to all of them: each
+        placement's new transform is its own start transform composed with this.
+        """
+        r, handle = self.resize_rect, self.resize_handle
+        if r is None or r.width() <= 0 or r.height() <= 0:
+            return QTransform()
+        local = self.snap_to_pixel(point)
+        ax = (
+            r.right()
+            if "w" in handle
+            else r.left() if "e" in handle else r.center().x()
+        )
+        ay = (
+            r.bottom()
+            if "n" in handle
+            else r.top() if "s" in handle else r.center().y()
+        )
+        sx = (
+            max(0.01, (ax - local.x()) / r.width())
+            if "w" in handle
+            else max(0.01, (local.x() - ax) / r.width()) if "e" in handle else 1
+        )
+        sy = (
+            max(0.01, (ay - local.y()) / r.height())
+            if "n" in handle
+            else max(0.01, (local.y() - ay) / r.height()) if "s" in handle else 1
+        )
+        if shift:
+            sx = sy = sx if "e" in handle or "w" in handle else sy
+        # Scaling about an anchor leaves the anchor fixed: p' = (p - a)*s + a,
+        # which in this row-vector form puts the whole offset in the
+        # translation, the same shape resize_matrix uses.
+        return QTransform(sx, 0, 0, sy, ax * (1 - sx), ay * (1 - sy))
+
+    def group_resize_override(self, point, shift=False):
+        """Per-row matrices for a group scale, keyed by placement row."""
+        group = self.group_resize_matrix(point, shift)
+        return {
+            row: start * group for row, (_, start) in self.drag_targets.items()
+        }
+
     def mouseMoveEvent(self, event):
         if self.panning and getattr(self, "dragged", None) is None:
             self.keep_free()
+        if self.group_resize:
+            if not self.drag_past_slop(event.position().toPoint()):
+                event.accept()
+                return
+            self.set_preview_overrides(
+                self.group_resize_override(
+                    self.mapToScene(event.position().toPoint()),
+                    bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier),
+                )
+            )
+            event.accept()
+            return
         if getattr(self, "dragged", None) is not None:
             if self.resize_handle:
                 # A press on a handle that never moves is not a resize either.
@@ -463,7 +655,6 @@ class Preview(QGraphicsView):
                 )
                 event.accept()
                 return
-            m = self.drag_matrix
             # The offset is whole screen pixels, and snapping rounds it onto the
             # asset grid, so the movement is locked to whole scene pixels rather
             # than to a fraction of one. Nothing happens until the pointer
@@ -472,16 +663,19 @@ class Preview(QGraphicsView):
                 event.accept()
                 return
             dx, dy = self.drag_translation(event.position().toPoint())
-            self.dragged.setTransform(
-                QTransform(
-                    m.m11(),
-                    m.m12(),
-                    m.m21(),
-                    m.m22(),
-                    m.dx() + dx,
-                    m.dy() + dy,
+            # Every picked placement keeps its shape: each is offset from the
+            # transform it had when the drag started, not from the last move.
+            for row, (item, start) in self.drag_targets.items():
+                item.setTransform(
+                    QTransform(
+                        start.m11(),
+                        start.m12(),
+                        start.m21(),
+                        start.m22(),
+                        start.dx() + dx,
+                        start.dy() + dy,
+                    )
                 )
-            )
             self.viewport().update()
             event.accept()
             return
@@ -511,6 +705,24 @@ class Preview(QGraphicsView):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if self.group_resize:
+            moved = self.drag_past_slop(event.position().toPoint())
+            self.group_resize = False
+            self.resize_handle = None
+            self.resize_rect = None
+            rows = sorted(self.drag_targets)
+            self.drag_targets = {}
+            self.matrix_override = None
+            if moved:
+                group = self.group_resize_matrix(
+                    self.mapToScene(event.position().toPoint()),
+                    bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier),
+                )
+                self.placementsTransformed.emit(rows, group)
+            elif self.last:
+                self.show_resource(*self.last, fit=False)
+            event.accept()
+            return
         if getattr(self, "dragged", None) is not None:
             if self.resize_handle:
                 # A press on a handle that never moved is not a resize. The
@@ -553,11 +765,18 @@ class Preview(QGraphicsView):
             # check is what stops a plain click from nudging it.
             dx, dy = self.drag_translation(event.position().toPoint())
             row = self.selected_placement
+            rows = sorted(self.drag_targets)
             self.dragged = None
+            self.drag_targets = {}
             if self.drag_past_slop(event.position().toPoint()) and (
                 abs(dx) > 0.01 or abs(dy) > 0.01
             ):
-                self.placementMoved.emit(row, dx, dy)
+                # One edit for the whole set, so a group drag is one undo step
+                # rather than one per placement.
+                if len(rows) > 1:
+                    self.placementsMoved.emit(rows, dx, dy)
+                else:
+                    self.placementMoved.emit(row, dx, dy)
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -600,25 +819,43 @@ class Preview(QGraphicsView):
                                 ]
                             )
                         )
-        row = getattr(self, "selected_placement", None)
-        if row is not None:
-            for item, _ in self.instances.values():
-                if item.isVisible() and item.data(0) == row:
-                    pen = QPen(QColor("#63b5ff"))
-                    pen.setCosmetic(True)
-                    painter.setPen(pen)
+        pen = QPen(QColor("#63b5ff"))
+        radius = 4 / max(self.transform().m11(), 1e-9)
+        selected = self.items_for_rows(self.selected_rows)
+        if selected:
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            for item in selected:
+                painter.drawPolygon(item.mapToScene(item.boundingRect()))
+            painter.setBrush(QColor("#63b5ff"))
+            if len(selected) > 1:
+                # Several placements: one box around them all, with handles that
+                # scale the group about its centre. Per-object handles would be
+                # ambiguous - eight squares per placement, all doing different
+                # things - so only the group box carries them.
+                extent = self.selection_extent()
+                if extent is not None:
                     painter.setBrush(Qt.BrushStyle.NoBrush)
-                    painter.drawPolygon(item.mapToScene(item.boundingRect()))
-                    radius = 4 / max(self.transform().m11(), 1e-9)
+                    painter.drawRect(extent)
                     painter.setBrush(QColor("#63b5ff"))
-                    for point in self.resize_handles(item).values():
-                        p = item.mapToScene(point)
+                    for point in self.rect_handles(extent).values():
                         painter.drawRect(
                             QRectF(
-                                p.x() - radius, p.y() - radius, radius * 2, radius * 2
+                                point.x() - radius,
+                                point.y() - radius,
+                                radius * 2,
+                                radius * 2,
                             )
                         )
-                    break
+            else:
+                for point in self.resize_handles(selected[0]).values():
+                    p = selected[0].mapToScene(point)
+                    painter.drawRect(
+                        QRectF(
+                            p.x() - radius, p.y() - radius, radius * 2, radius * 2
+                        )
+                    )
 
     def __init__(self):
         super().__init__()
@@ -646,6 +883,18 @@ class Preview(QGraphicsView):
         # Device-pixel position of the last press, so a click that never moves
         # the pointer is told apart from a real drag.
         self.drag_origin = None
+        # The primary row is the last one picked; it is what the resize handles
+        # and the animator's transform fields follow. selected_rows is every row
+        # picked, which is what a drag and Delete act on. Keeping the primary a
+        # scalar leaves the whole single-selection path - selected_item, the
+        # resize rect and matrix, the live override - exactly as it was.
+        self.selected_rows = set()
+        # Per-row transform snapshots taken at press, so a group drag offsets
+        # every placement from where it started rather than compounding.
+        self.drag_targets = {}
+        # True while a group-box handle is being dragged rather than one
+        # placement's own handle, which take different paths to a matrix.
+        self.group_resize = False
         # Off for a sheet fitted to the view, so keep_free() never widens the
         # browsable area away from the image.
         self.free_camera = True
@@ -834,6 +1083,7 @@ class Preview(QGraphicsView):
         self.doc = doc
         self.editable = False
         self.selected_placement = None
+        self.selected_rows = set()
         self.scene().clear()
         self.instances.clear()
         self.scene_key = None
@@ -1031,6 +1281,7 @@ class Preview(QGraphicsView):
             self.instances.clear()
             self.scene_key = key
             self.selected_placement = None
+            self.selected_rows = set()
         for item, _ in self.instances.values():
             item.setVisible(False)
         self.messages = []
@@ -1175,8 +1426,8 @@ class Preview(QGraphicsView):
                     matrix = bank["matrices"][mi]
                 else:
                     matrix = self.inherited_matrix(obj, frame, i)
-                if not path and self.matrix_override and self.matrix_override[0] == i:
-                    matrix = self.matrix_override[1]
+                if not path and self.matrix_override and i in self.matrix_override:
+                    matrix = self.matrix_override[i]
                 # The common SC nine-slice asset is a clip with identity shape children
                 # whose bitmap commands are already cut at the grid boundaries.
                 child_grid = grid_deformation if matrix == [1, 0, 0, 1, 0, 0] else None
@@ -1270,7 +1521,14 @@ class Preview(QGraphicsView):
                 obj["right"] - obj["left"],
                 obj["bottom"] - obj["top"],
             )
-            bounds = self.scene().addRect(box, QPen(QColor("#68778e")))
+            # Cosmetic, so the helper stays a hairline whatever it inherits. A
+            # textfield nested in a movieclip that is then scaled inside
+            # another movieclip otherwise draws a stroke multiplied by every
+            # ancestor transform - the outline thickens into a band and stops
+            # marking the field box it is there to mark.
+            outline = QPen(QColor("#68778e"))
+            outline.setCosmetic(True)
+            bounds = self.scene().addRect(box, outline)
             bounds.setParentItem(group)
             # The textfield is measured by its field box, not by its glyphs, so
             # the grey box, the blue selection outline and the resize handles

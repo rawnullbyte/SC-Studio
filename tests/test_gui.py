@@ -3495,3 +3495,38 @@ def test_dragging_a_resize_handle_still_resizes(window):
     element = clip["frames"][0]["elements"][0]
     matrix = d.bank(clip["matrix_bank_index"])["matrices"][element[1]]
     assert matrix[0] != 1.0 and matrix[3] != 1.0, "the drag scaled the placement"
+
+
+
+
+def test_delete_key_works_on_a_placement_picked_in_the_preview(window):
+    """Del on an object picked in the preview removes that child.
+
+    Clicking a placement there is how most of these edits start, but the
+    preview was neither a shortcut target nor a focus the child index was read
+    from, so the key did nothing until the editor was reached another way.
+    """
+    from PyQt6.QtCore import QPointF
+
+    d, e = single_sprite(window)
+    clip = d.resource(7)
+    clip["frames"] = [{"label": "", "elements": [[0, 0, 65535], [1, 0, 65535]]}]
+    d.update("movieclips", clip)
+    e.refresh()
+    application().processEvents()
+    QTest.mouseClick(
+        e.preview.viewport(),
+        Qt.MouseButton.LeftButton,
+        pos=e.preview.mapFromScene(QPointF(45, 25)),
+    )
+    application().processEvents()
+    # Which of the two overlapping placements wins the hit test does not
+    # matter; that Del removes the child the picked placement stands for does.
+    picked = e.preview.selected_placement
+    assert picked in (0, 1)
+    child = d.resource(7)["frames"][0]["elements"][picked][0]
+    doomed = d.resource(7)["children"][child]["name"]
+    QTest.keyClick(e.preview, Qt.Key.Key_Delete)
+    application().processEvents()
+    assert doomed not in [c["name"] for c in d.resource(7)["children"]]
+    assert len(d.resource(7)["children"]) == 1

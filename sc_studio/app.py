@@ -1070,10 +1070,12 @@ class Editor(QWidget):
 
         The Children list row is that index directly. The Placements table
         addresses the current frame's placements, whose first column is the
-        child index, so a focused placement resolves to the same child. Copy,
-        Duplicate and Delete take a focused child to mean that child rather than
-        the whole clip - the resource you are looking at, not the one it lives
-        in.
+        child index, so a focused placement resolves to the same child. A
+        placement picked in the preview is the same answer, by the same route,
+        because clicking an object there is how most of these edits start.
+        Copy, Duplicate and Delete take a focused child to mean that child
+        rather than the whole clip - the resource you are looking at, not the
+        one it lives in.
         """
         if (
             self.selected not in self.doc.index
@@ -1086,11 +1088,15 @@ class Editor(QWidget):
         if focus is self.children:
             row = self.children.currentRow()
             return row if 0 <= row < len(children) else -1
-        if focus is self.elements:
+        if focus is self.elements or self.preview.hasFocus():
             frame = self.cursor_frame(clip)
             elements = frame["elements"] if frame is not None else []
-            row = self.elements.currentRow()
-            if not 0 <= row < len(elements):
+            row = (
+                self.elements.currentRow()
+                if focus is self.elements
+                else self.preview.selected_placement
+            )
+            if row is None or not 0 <= row < len(elements):
                 return -1
             index = elements[row][0]
             return index if 0 <= index < len(children) else -1
@@ -4794,7 +4800,14 @@ class Window(QMainWindow):
         self.info.setText(f"SC{ed.doc.version} · {len(ed.doc.index):,} objects")
         self.actions["browser"].setChecked(not ed.splitter.widget(0).isHidden())
         self.actions["inspector"].setChecked(not ed.splitter.widget(2).isHidden())
-        for grid in (ed.tree, ed.keyframes, ed.children, ed.elements, ed.frames):
+        for grid in (
+            ed.tree,
+            ed.keyframes,
+            ed.children,
+            ed.elements,
+            ed.frames,
+            ed.preview,
+        ):
             if self.delete_shortcut not in grid.actions():
                 grid.addAction(self.delete_shortcut)
 

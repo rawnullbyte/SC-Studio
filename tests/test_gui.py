@@ -3530,3 +3530,25 @@ def test_delete_key_works_on_a_placement_picked_in_the_preview(window):
     application().processEvents()
     assert doomed not in [c["name"] for c in d.resource(7)["children"]]
     assert len(d.resource(7)["children"]) == 1
+
+
+
+def test_delete_in_the_preview_never_deletes_the_whole_resource(window, monkeypatch):
+    """Delete with the preview focused and nothing picked does nothing.
+
+    Once the preview became a Delete target, a press on empty canvas fell
+    through to the browser-selection branch and offered to delete the open
+    movieclip - the one meaning a press in the canvas cannot have.
+    """
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("Delete in the preview must not delete the resource")
+
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(refuse))
+    d, e = single_sprite(window)
+    e.preview.setFocus()
+    e.preview.selected_placement = None
+    application().processEvents()
+    QTest.keyClick(e.preview, Qt.Key.Key_Delete)
+    application().processEvents()
+    assert 7 in d.index

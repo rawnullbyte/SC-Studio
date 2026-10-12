@@ -189,13 +189,14 @@ filter in Children, matching rows in Frames/Placements, text in the JSON editor.
 and redo**, which Qt does not map by default. **F1** lists every shortcut.
 
 **Single letters are shortcuts, except while typing.** **G** opens *Go to ID*,
-**X** opens *Find usages* on whatever is focused — a child in the Children or
-Placements list, otherwise the open resource.
+**X** opens *Find usages* on whatever is focused — a placement picked in the
+preview or the list, otherwise the open resource.
 
-**Copy, Duplicate and Delete follow the pane you are in.** With Children or
-Placements focused they act on that child; with a frame picked, or the timeline
-focused, Delete removes that frame, the picked keys, or the frame under the
-playhead — never the movieclip.
+**Copy, Duplicate and Delete follow the pane you are in.** A placement picked in
+the preview counts as focused, so **Del** removes whatever you clicked in the
+canvas. With Children or Placements focused they act on that child; with a frame
+picked, or the timeline focused, Delete removes that frame, the picked keys, or
+the frame under the playhead — never the movieclip.
 
 A **Snap to pixels** toggle (on by default, remembered) lands dragged placements
 on whole asset pixels. A click that does not move the pointer never moves a

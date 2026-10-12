@@ -5081,10 +5081,15 @@ class Window(QMainWindow):
             return
         # A child focused in the Children or Placements list is what Delete is
         # about: it removes that instance from every frame, which is the
-        # child-list action, not deleting the resource it instances.
+        # child-list action, not deleting the resource it instances. The preview
+        # is an editing surface too, so Delete there acts on the picked object
+        # and on nothing else - it must never fall through to deleting the whole
+        # resource, which is the one thing a press in the canvas cannot mean.
         child = ed.focused_child_index()
         if child >= 0:
             ed.remove_child(child)
+            return
+        if ed.preview.hasFocus():
             return
         ids = ed.selected_ids()
         if not ids:

@@ -9,13 +9,13 @@
 - Added geometry **Copy vertices** / **Paste vertices** to transplant a vertex list between shapes, **Export PNG…** for a shape's rendered image, and a plain **X** shortcut to open Find usages on the focused child.
 - Added this release's focused GUI coverage and a `tests/conftest.py` that forces the offscreen Qt platform so the suite never opens real windows.
 - Fixed the Children list's **Delete** button deleting the first child whatever row was picked: `QPushButton.clicked` passes its checked state, which `remove_child` read as a child index (`False` is `0`). The same signal now reaches the Children, Placements and Frames lists, so **Del** removes the focused child.
-- Copy, Duplicate, Delete and Find usages now act on a placement picked **in the preview**, not just on one picked in a list. The preview was neither a Delete shortcut target nor a focus the child index was read from, so **Del** on an object clicked in the viewer did nothing.
+- Copy, Duplicate, Delete and Find usages now act on a placement picked **in the preview**, not just on one picked in a list. The preview was neither a Delete shortcut target nor a focus the child index was read from, so **Del** on an object clicked in the viewer did nothing. Delete in the preview acts on the picked object and nothing else — never on the whole resource.
 - Removed the confirmation dialog when deleting a child. The change is one undo step, so Ctrl+Z takes it straight back, and the status bar says what was removed instead.
 - Removing the last placement of a child now removes the child too: SC has no per-frame child list, so an unplaced entry only lingered in the Children list with no way back from any frame.
 - Fixed a placement being nudged by a plain click. With snapping on, a zero-movement press was rounded onto the pixel grid, which moved a placement already sitting between pixels; only movement off the press pixel is a drag now. A press on a resize handle does nothing too, rather than committing float noise as a resize.
 - Fixed publishing external KTX sidecars failing on Windows: sidecar keys are stored POSIX-style but the save path re-derived them with `str(Path(...))`, which renders backslashes there and missed every key.
 
-Validation: **215 passed, 5 skipped** in the full suite (`python -m pytest tests/`). The three fixture-dependent skips that need real SC files remain. `test_table_tsv_paste_and_preview_frame_sync` passes in a full run but not in isolation; that ordering sensitivity predates this release.
+Validation: **216 passed, 5 skipped** in the full suite (`python -m pytest tests/`). The three fixture-dependent skips that need real SC files remain. `test_table_tsv_paste_and_preview_frame_sync` passes in a full run but not in isolation; that ordering sensitivity predates this release.
 
 # 0.6.1
 

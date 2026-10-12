@@ -290,6 +290,29 @@ def test_sctx_sidecar_copy(tmp_path):
     assert (out.parent / rel).read_bytes() == b"SCTX-test-payload"
 
 
+def test_sidecar_keys_are_separator_independent(tmp_path):
+    """Sidecar keys are POSIX, so a Windows save must still find them.
+
+    The save path re-derives a lookup key from ``external_texture``; doing
+    that with ``str(Path(...))`` yields backslashes on Windows and misses
+    every key, which only the Windows CI lane caught.
+    """
+    from sc_studio.document import sidecar_key
+
+    assert sidecar_key("textures/abc.zktx") == "textures/abc.zktx"
+    assert sidecar_key(Path("textures") / "abc.zktx") == "textures/abc.zktx"
+
+    d = populated()
+    d.tables["Textures"]["textures"][0]["highres"]["data"] = b""
+    d.tables["Textures"]["textures"][0]["highres"]["external_texture"] = (
+        "textures/abc.zktx"
+    )
+    d.sidecars["textures/abc.zktx"] = b"SCTX-payload"
+    assert d.path is None
+    d.save(tmp_path / "out.sc")
+    assert (tmp_path / "textures" / "abc.zktx").read_bytes() == b"SCTX-payload"
+
+
 def test_texture_deduplication():
     s = populated()
     d = populated()

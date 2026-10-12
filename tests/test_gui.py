@@ -4,7 +4,7 @@ from collections import deque
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import time
 import pytest
-from PyQt6.QtCore import QSettings, Qt
+from PyQt6.QtCore import QPoint, QSettings, Qt
 from PyQt6.QtGui import QPalette
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import (
@@ -158,6 +158,33 @@ def test_g_reports_and_survives_a_missing_resource(window, monkeypatch):
     assert "9999" in window.statusBar().currentMessage()
 
 
+def test_x_opens_find_usages_for_the_focused_child(window, monkeypatch):
+    """Plain X opens usages on the focused child, like G opens Go to ID."""
+    from PyQt6.QtWidgets import QDialog
+
+    w = window
+    d = populated(6)
+    clip = d.resource(7)
+    clip["children"] = [{"id": 4, "name": "tf", "blend": 0}]
+    clip["frames"] = [
+        {"label": "", "elements": [[0, 65535, 65535]]} for _ in range(4)
+    ]
+    d.update("movieclips", clip)
+    w.add_doc(d)
+    e = w.current()
+    e.go_to(7)
+    application().processEvents()
+    titles = []
+    monkeypatch.setattr(
+        QDialog, "exec", lambda self: titles.append(self.windowTitle()) or 0
+    )
+    e.children.setFocus()
+    e.children.selectRow(0)
+    QTest.keyClick(w, Qt.Key.Key_X)
+    # The child's resource (textfield 4), not the open movieclip 7.
+    assert titles == ["Find usages — #4"]
+
+
 def test_g_is_typing_inside_text_fields(window):
     window.add_doc(populated())
     e = window.current()
@@ -233,6 +260,39 @@ def test_text_shortcuts_do_not_copy_or_paste_resources(window):
     assert e.drafts == {"properties"}
     e.apply_properties()
     assert e.doc.resource(4)["text"] == "Pasted text"
+
+
+def test_textfield_color_and_alignment_use_real_widgets(window):
+    """Colours are picked, alignment is chosen; neither is a raw number."""
+    from sc_studio.app import AlignControl, ColorSwatch
+
+    w = window
+    w.add_doc(populated())
+    e = w.current()
+    e.go_to(4)
+    application().processEvents()
+    swatch = e.property_widgets["font_color"][0]
+    align = e.property_widgets["align"][0]
+    assert isinstance(swatch, ColorSwatch)
+    assert isinstance(align, AlignControl)
+    # The number is still available, in the tooltip, for anyone who wants it.
+    assert swatch.toolTip() == "argb 4294967295"
+    swatch.setValue(0xFF3366CC)
+    align.horizontal.setCurrentIndex(1)
+    align.vertical.setCurrentIndex(2)
+    e.apply_properties()
+    obj = e.doc.resource(4)
+    assert obj["font_color"] == 0xFF3366CC
+    assert obj["align"] & 3 == 1
+    assert (obj["align"] >> 2) & 3 == 2
+    # The high nibble the two dropdowns do not cover is preserved.
+    obj["align"] = 0x30
+    e.doc.update("textfields", obj)
+    e.go_to(4)
+    application().processEvents()
+    e.property_widgets["align"][0].vertical.setCurrentIndex(0)
+    e.apply_properties()
+    assert e.doc.resource(4)["align"] == 0x30
 
 
 def test_table_tsv_paste_and_preview_frame_sync(window):
@@ -329,6 +389,70 @@ def test_geometry_switch_preserves_draft_on_correct_command(window, monkeypatch)
     e.commands.selectRow(1)
     assert d.resource(3)["commands"][0]["vertices"][0][0] == 42
     assert d.resource(3)["commands"][1]["vertices"][0][0] == 0
+
+
+def test_vertices_copy_and_paste_between_shapes(window):
+    """A shape's vertex list can be transplanted onto another shape."""
+    w = window
+    d = populated()
+    # A second shape whose command has fewer vertices than the source.
+    d.update(
+        "shapes",
+        {
+            "id": 6,
+            "commands": [
+                {"unk1": 0, "texture_index": 0, "vertices": [[0, 0, 0, 0], [5, 0, 65535, 0]]}
+            ],
+            "exports": [],
+        },
+    )
+    w.add_doc(d)
+    e = w.current()
+    e.go_to(3)
+    e.set_panel(5)
+    application().processEvents()
+    e.vertices.setFocus()
+    w.route("copy")
+    source = d.resource(3)["commands"][0]["vertices"]
+    assert len(source) == 3
+    e.go_to(6)
+    application().processEvents()
+    assert e.vertices.rowCount() == 2
+    e.vertices.setFocus()
+    e.vertices.setCurrentCell(0, 0)
+    w.route("paste")
+    application().processEvents()
+    # The list replaced the command wholesale, growing the rows to match.
+    assert e.vertices.rowCount() == 3
+    e.apply_geometry()
+    application().processEvents()
+    assert d.resource(6)["commands"][0]["vertices"] == [
+        [0.0, 0.0, 0, 0],
+        [20.0, 0.0, 65535, 0],
+        [0.0, 20.0, 0, 65535],
+    ]
+
+
+def test_a_shape_image_can_be_exported(window, tmp_path, monkeypatch):
+    """Export PNG writes the shape's own rendered artwork."""
+    import sc_studio.app as appmod
+
+    w = window
+    w.add_doc(populated())
+    e = w.current()
+    e.go_to(3)
+    e.set_panel(5)
+    application().processEvents()
+    target = tmp_path / "shape.png"
+    monkeypatch.setattr(appmod, "save_picker", lambda *a, **k: (str(target), ""))
+    e.export_shape_image()
+    assert target.exists() and target.stat().st_size > 0
+    from PyQt6.QtGui import QImage
+
+    image = QImage(str(target))
+    # The fixture shape is a 20x20 triangle; the export renders its own bounds.
+    assert image.width() >= 20 and image.height() >= 20
+    assert "Exported" in w.statusBar().currentMessage()
 
 
 def test_multi_selection_copy_clipboard_transport(window):
@@ -715,6 +839,51 @@ def test_lazy_frame_views_match_eager_and_json(window):
     assert json.loads(e.code.toPlainText()) == d.resource(7)
 
 
+def test_importing_an_animated_gif_creates_keyed_frames(window, tmp_path, monkeypatch):
+    """A GIF becomes one movieclip frame per source frame, one packed atlas."""
+    from PIL import Image
+
+    import sc_studio.app as appmod
+
+    w = window
+    w.add_doc(animatable_clip(1))
+    e = w.current()
+    e.go_to(7)
+    application().processEvents()
+    gif = tmp_path / "anim.gif"
+    frames = [Image.new("RGBA", (10, 8), (i * 30, 0, 255 - i * 30, 255)) for i in range(4)]
+    frames[0].save(
+        gif,
+        save_all=True,
+        append_images=frames[1:],
+        duration=100,
+        loop=0,
+        disposal=2,
+    )
+    monkeypatch.setattr(appmod, "native_picker", lambda *a, **k: (str(gif), ""))
+    monkeypatch.setattr(
+        appmod.Editor,
+        "animation_dialog",
+        lambda self, frames, fps: {"prefix": "frame", "suffix": "_anim", "fps": 12.5},
+    )
+    e.import_animation()
+    application().processEvents()
+    clip = e.doc.resource(7)
+    assert len(clip["frames"]) == 4
+    assert clip["framerate"] == 12
+    names = [c["name"] for c in clip["children"]][1:]
+    assert names == ["frame0_anim", "frame1_anim", "frame2_anim", "frame3_anim"]
+    # One new atlas holding every frame.
+    atlas = e.doc.tables["Textures"]["textures"][-1]["highres"]
+    assert atlas["width"] >= 20 and atlas["height"] >= 8
+    # Each frame places its own new image, and the frame that existed before
+    # keeps the placement it already had.
+    for index, frame in enumerate(clip["frames"]):
+        placed = [element for element in frame["elements"] if element[0] == 1 + index]
+        assert len(placed) == 1
+    assert clip["frames"][0]["elements"][0][0] == 0
+
+
 def test_canvas_drag_moves_placement_and_undo(window):
     from PyQt6.QtCore import QPointF
 
@@ -737,11 +906,59 @@ def test_canvas_drag_moves_placement_and_undo(window):
     matrix = d.bank(clip["matrix_bank_index"])["matrices"][
         clip["frames"][0]["elements"][0][1]
     ]
-    assert matrix[4:] == pytest.approx([40 + delta.x(), 20 + delta.y()])
+    # Snapping is on by default, so the move lands on whole scene pixels: the
+    # raw view delta is rounded onto the asset grid the file stores.
+    assert matrix[4:] == pytest.approx([round(40 + delta.x()), round(20 + delta.y())])
     assert e.preview.transform().m11() == pytest.approx(scale)
     e.undo()
     clip = d.resource(7)
     assert d.bank(clip["matrix_bank_index"])["matrices"][0][4:] == [40, 20]
+
+
+def test_snap_to_pixels_can_be_turned_off_for_free_movement(window):
+    """With snapping off a drag follows the screen grid, not the asset grid."""
+    from PyQt6.QtCore import QPoint, QPointF
+
+    d = populated()
+    clip = d.resource(7)
+    clip["frames"] = [{"label": "", "elements": [[0, 0, 65535]]}]
+    d.update("movieclips", clip)
+    window.add_doc(d)
+    e = window.current()
+    e.go_to(7)
+    application().processEvents()
+    assert e.snap_pixels.isChecked() and e.preview.snap_movement
+    e.snap_pixels.setChecked(False)
+    assert not e.preview.snap_movement
+    # A view scale that is not 1:1 so a whole screen-pixel drag is a fraction
+    # of a scene pixel, which is where snapping and free movement differ.
+    e.preview.scale(1.3, 1.3)
+    start = e.preview.mapFromScene(QPointF(45, 25))
+    end = start + QPoint(20, 15)
+    raw = e.preview.mapToScene(end) - e.preview.mapToScene(start)
+    QTest.mousePress(e.preview.viewport(), Qt.MouseButton.LeftButton, pos=start)
+    QTest.mouseMove(e.preview.viewport(), end)
+    QTest.mouseRelease(e.preview.viewport(), Qt.MouseButton.LeftButton, pos=end)
+    clip = d.resource(7)
+    matrix = d.bank(clip["matrix_bank_index"])["matrices"][
+        clip["frames"][0]["elements"][0][1]
+    ]
+    assert matrix[4:] == pytest.approx([40 + raw.x(), 20 + raw.y()])
+
+
+def test_the_snap_choice_is_remembered_between_tabs_and_runs(window):
+    """The toggle is one session-wide setting, not per tab."""
+    assert window.snap_pixels is True
+    w = window
+    w.new()
+    e = w.current()
+    assert e.preview.snap_movement and e.snap_pixels.isChecked()
+    e.snap_pixels.setChecked(False)
+    assert w.snap_pixels is False
+    # A new tab starts from the saved choice.
+    w.new()
+    assert not w.current().preview.snap_movement
+    assert not w.current().snap_pixels.isChecked()
 
 
 def test_add_child_also_places_it_in_current_frame(window):
@@ -852,6 +1069,76 @@ def test_drag_resize_corner_commits_one_edit_and_undo(window):
         40,
         20,
     ]
+
+
+def test_a_textfield_is_measured_by_its_box_not_its_glyphs(window):
+    """The field's outline is the authored box, even when the text overflows it.
+
+    A textfield's rendered text is usually taller than the box authored for it,
+    so measuring the placement by the glyph extent drew a selection outline and
+    put the resize handles in the wrong place, and a vertical resize scaled
+    about the wrong edge.
+    """
+    w = window
+    d = populated(6)
+    clip = d.resource(7)
+    clip["children"] = [{"id": 4, "name": "tf", "blend": 0}]
+    clip["frames"] = [
+        {"label": "", "elements": [[0, 65535, 65535]]} for _ in range(4)
+    ]
+    d.update("movieclips", clip)
+    w.add_doc(d)
+    e = w.current()
+    e.go_to(7)
+    e.select_placement(0)
+    application().processEvents()
+    # The fixture textfield is authored left/top/right/bottom = 0, 0, 100, 30.
+    box = e.preview.selected_item().boundingRect()
+    assert (box.width(), box.height()) == pytest.approx((101.0, 31.0), abs=0.01)
+
+
+def test_textfield_alignment_shows_in_the_preview(window):
+    """Horizontal and vertical alignment move the text, as they do in game."""
+    from PyQt6.QtWidgets import QGraphicsTextItem
+
+    w = window
+    d = populated(6)
+    clip = d.resource(7)
+    clip["children"] = [{"id": 4, "name": "tf", "blend": 0}]
+    clip["frames"] = [
+        {"label": "", "elements": [[0, 65535, 65535]]} for _ in range(4)
+    ]
+    d.update("movieclips", clip)
+    w.add_doc(d)
+    e = w.current()
+    e.go_to(7)
+    e.select_placement(0)
+    application().processEvents()
+
+    def text_item():
+        return next(
+            item
+            for item in e.preview.scene().items()
+            if isinstance(item, QGraphicsTextItem)
+        )
+
+    assert text_item().document().defaultTextOption().alignment() & (
+        Qt.AlignmentFlag.AlignLeft
+    )
+    # Centre horizontally, bottom vertically, in a box tall enough to move in.
+    obj = e.doc.resource(4)
+    obj["align"] = 1 | (2 << 2)
+    obj["bottom"] = 200
+    e.doc.update("textfields", obj)
+    e.go_to(4)
+    e.go_to(7)
+    application().processEvents()
+    item = text_item()
+    assert item.document().defaultTextOption().alignment() & (
+        Qt.AlignmentFlag.AlignHCenter
+    )
+    # Bottom alignment pushes the text down inside the box.
+    assert item.pos().y() > 0
 
 
 def test_resize_escape_cancels_and_shift_preserves_aspect(window):
@@ -1722,6 +2009,89 @@ def test_transform_fields_key_position_rotation_and_scale(window):
     assert e.key_fields["Rotation"].value() == pytest.approx(0.0, abs=0.01)
 
 
+def test_transform_fields_follow_the_selected_placement(window):
+    """Picking another child shows that child's transform, not the last one's.
+
+    The fields describe the placement the animator is acting on, so selecting a
+    different row in Placements or Children has to reload them; leaving the
+    previous child's numbers on screen made an edit write to the wrong object.
+    """
+    w = window
+    d = animatable_clip(4)
+    clip = d.resource(7)
+    clip["children"].append({"id": 4, "name": "second", "blend": 0})
+    clip["frames"] = [
+        {"label": f"f{i}", "elements": [[0, 65535, 65535], [1, 65535, 65535]]}
+        for i in range(4)
+    ]
+    d.update("movieclips", clip)
+    w.add_doc(d)
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    key_at(e, 0, 100.0)
+    assert e.key_fields["X"].value() == pytest.approx(100.0)
+    # Selecting the other placement in the Placements table reloads the fields.
+    e.elements.selectRow(1)
+    application().processEvents()
+    assert e.placement_row() == 1
+    assert e.key_fields["X"].value() == pytest.approx(0.0)
+    # And picking a child in the Children list does the same.
+    e.elements.selectRow(0)
+    application().processEvents()
+    assert e.key_fields["X"].value() == pytest.approx(100.0)
+    e.children.setCurrentCell(1, 0)
+    e.children.selectRow(1)
+    application().processEvents()
+    assert e.key_fields["X"].value() == pytest.approx(0.0)
+
+
+def test_copy_from_the_children_list_copies_that_child(window, monkeypatch):
+    """Ctrl+C over a focused child copies the child, not the open movieclip."""
+    w = window
+    d = animatable_clip(4)
+    clip = d.resource(7)
+    clip["children"].append({"id": 4, "name": "second", "blend": 0})
+    clip["frames"] = [
+        {"label": f"f{i}", "elements": [[0, 65535, 65535], [1, 65535, 65535]]}
+        for i in range(4)
+    ]
+    d.update("movieclips", clip)
+    w.add_doc(d)
+    e = w.current()
+    e.go_to(7)
+    application().processEvents()
+    e.children.setFocus()
+    e.children.selectRow(0)
+    w.copy()
+    wait_until(lambda: not w.jobs)
+    doc, roots = w.clipboard
+    # The packed graph is rooted on the child's resource (the shape), not the
+    # movieclip the child sits in.
+    assert [doc.index[root][0] for root in roots] == ["shapes"]
+    assert all(kind == "shapes" for kind, _ in doc.index.values())
+    # Duplicate and Delete act on the child instance, not the resource.
+    before = len(e.obj["children"])
+    e.children.setFocus()
+    e.children.selectRow(0)
+    w.duplicate()
+    application().processEvents()
+    assert len(e.obj["children"]) == before + 1
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes),
+    )
+    e.children.setFocus()
+    e.children.selectRow(0)
+    w.delete_selection()
+    application().processEvents()
+    # The child was unplaced; the movieclip itself is untouched.
+    assert len(e.obj["children"]) == before
+    assert e.selected == 7
+
+
 def test_strip_band_selects_a_range_including_keys(window):
     w = window
     w.add_doc(animatable_clip(6))
@@ -1980,6 +2350,44 @@ def test_a_movieclip_keeps_at_least_one_frame(window):
     assert len(e.obj["frames"]) == 2
     e.remove_frame()
     assert len(e.obj["frames"]) == 1
+
+
+def test_delete_with_a_frame_focused_removes_that_frame_not_the_clip(window, monkeypatch):
+    """Delete on the Frames list is the frame action, never the resource.
+
+    The browser fallback used to delete the whole open movieclip, so pressing
+    Delete with a frame picked took out something other than the frame.
+    """
+    w = window
+    w.add_doc(animatable_clip(6))
+    e = w.current()
+    e.go_to(7)
+    application().processEvents()
+    monkeypatch.setattr(
+        QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes
+    )
+    e.frames.setCurrentCell(3, 0)
+    e.frames.setFocus()
+    w.delete_selection()
+    application().processEvents()
+    assert len(e.obj["frames"]) == 5
+    assert e.selected == 7, "the movieclip was deleted instead of a frame"
+
+
+def test_delete_with_the_timeline_focused_removes_the_playhead_frame(window):
+    """With nothing picked on the timeline, Delete takes the frame under it."""
+    w = window
+    w.add_doc(animatable_clip(6))
+    e = w.current()
+    e.go_to(7)
+    application().processEvents()
+    e.goto_frame(2)
+    e.keyframes.setFocus()
+    assert not e.keyframes.selected_keys() and not e.keyframes.selected_frames()
+    w.delete_selection()
+    application().processEvents()
+    assert len(e.obj["frames"]) == 5
+    assert e.selected == 7
 
 
 def test_camera_stays_free_of_the_artwork_bounds(window):
@@ -2402,8 +2810,35 @@ def test_keys_can_be_moved_as_a_group(window):
     assert e.keyframes.selected_keys() == {(1, 0), (3, 0), (5, 0), (7, 0)}
 
 
-def test_a_key_cannot_be_dropped_onto_another_key(window):
-    """Dropping a key on an occupied frame leaves both where they were."""
+def test_dropping_a_key_onto_another_swaps_their_places(window):
+    """A key dragged onto an occupied frame trades frames with that key.
+
+    Both poses survive, so this is how two keys are put in each other's place
+    rather than the drag being refused.
+    """
+    w = window
+    w.add_doc(animatable_clip(8))
+    e = w.current()
+    e.go_to(7)
+    e.elements.selectRow(0)
+    application().processEvents()
+    for frame, value in ((0, 0.0), (2, 20.0), (4, 40.0)):
+        key_at(e, frame, value)
+    drag_key(e, 2, 4)
+    # Frames 0, 2 and 4 still each hold one of the original three poses; only
+    # the poses on 2 and 4 have changed places, so nothing is lost.
+    assert e.keyframes.keys_of(0) == {0, 2, 4}
+    xs = tween_x(e)
+    assert xs[2] == 40.0, f"the key from frame 4 should now sit on frame 2: {xs}"
+    assert xs[4] == 20.0, f"the key from frame 2 should now sit on frame 4: {xs}"
+
+
+def test_a_block_dragged_onto_another_key_is_still_refused(window):
+    """Several picked keys moving as one have no swap reading, so they refuse.
+
+    A rigid shift landing on a key that is staying put is ambiguous - there is
+    no one key to trade places with - so the move is left where it was.
+    """
     w = window
     w.add_doc(animatable_clip(8))
     e = w.current()
@@ -2413,11 +2848,12 @@ def test_a_key_cannot_be_dropped_onto_another_key(window):
     for frame, value in ((0, 0.0), (2, 20.0), (4, 40.0)):
         key_at(e, frame, value)
     before = tween_x(e)
-    drag_key(e, 2, 4)
-    # The old code overwrote the key already on frame 4 and cleared frame 2,
-    # so one pose was lost; now the drag simply does not land.
+    e.keyframes.picked_keys = {(0, 0), (2, 0)}
+    e.move_keypoint(2, 4)
+    application().processEvents()
     assert e.keyframes.keys_of(0) == {0, 2, 4}
     assert tween_x(e) == before
+    assert "already has a key" in window.statusBar().currentMessage()
 
 
 def test_keys_with_no_gap_say_there_is_nothing_to_tween(window):
@@ -2843,3 +3279,219 @@ def test_mouse_side_buttons_are_undo_and_redo(window):
     assert pose() is None, "the back side button undid the edit"
     press(Qt.MouseButton.ForwardButton)
     assert pose() == 42.0, "the forward side button redid it"
+
+
+
+
+
+def three_children(window):
+    """A clip whose Children list has three distinctly named entries."""
+    d = populated()
+    clip = d.resource(7)
+    clip["children"] = [
+        {"id": 3, "name": "alpha", "blend": 0},
+        {"id": 4, "name": "beta", "blend": 0},
+        {"id": 3, "name": "gamma", "blend": 0},
+    ]
+    d.update("movieclips", clip)
+    window.add_doc(d)
+    e = window.current()
+    e.go_to(7)
+    application().processEvents()
+    return d, e
+
+
+def child_names(d):
+    return [c["name"] for c in d.resource(7)["children"]]
+
+
+def test_child_delete_button_removes_the_picked_child(window):
+    """A checked bool must not be mistaken for a child index.
+
+    QPushButton.clicked carries its checked state, which Qt passes to a slot
+    that takes an argument; ``False`` then read as index 0, so Delete took out
+    the first child whatever row was picked.
+    """
+    from PyQt6.QtWidgets import QPushButton
+
+    d, e = three_children(window)
+    e.children.setFocus()
+    e.children.selectRow(2)
+    application().processEvents()
+    button = next(
+        b
+        for b in e.findChildren(QPushButton)
+        if b.text() == "Delete" and b.parent().objectName() != "assetBrowser"
+    )
+    button.click()
+    application().processEvents()
+    assert child_names(d) == ["alpha", "beta"]
+    # The list follows the model without a second edit.
+    assert [e.children.item(r, 1).text() for r in range(e.children.rowCount())] == [
+        "alpha",
+        "beta",
+    ]
+
+
+def test_delete_key_removes_the_picked_child(window):
+    """Delete reaches the Children list and takes the row the keyboard is on."""
+    d, e = three_children(window)
+    e.children.setFocus()
+    e.children.selectRow(2)
+    application().processEvents()
+    QTest.keyClick(e.children, Qt.Key.Key_Delete)
+    application().processEvents()
+    assert child_names(d) == ["alpha", "beta"] and e.selected == 7
+
+
+def test_deleting_a_child_needs_no_confirmation_and_undoes(window, monkeypatch):
+    """The dialog is gone; the status bar says what happened, Ctrl+Z brings it back."""
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("child delete must not open a confirmation dialog")
+
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(refuse))
+    d, e = three_children(window)
+    e.children.setFocus()
+    e.children.selectRow(1)
+    QTest.keyClick(e.children, Qt.Key.Key_Delete)
+    application().processEvents()
+    assert child_names(d) == ["alpha", "gamma"]
+    assert "undo" in window.statusBar().currentMessage().lower()
+    e.undo()
+    assert child_names(d) == ["alpha", "beta", "gamma"]
+
+
+def test_removing_the_last_placement_of_a_child_drops_the_child(window):
+    """SC has no per-frame child list, so an unplaced child has no way back.
+
+    Removing its last placement left an entry in the Children list that no
+    frame placed, which is the entry the request was to be rid of.
+    """
+    d = populated()
+    clip = d.resource(7)
+    clip["frames"] = [{"label": "", "elements": [[0, 0, 65535], [1, 0, 65535]]}]
+    d.update("movieclips", clip)
+    window.add_doc(d)
+    e = window.current()
+    e.go_to(7)
+    e.elements.selectRow(1)
+    application().processEvents()
+    e.remove_element()
+    application().processEvents()
+    assert child_names(d) == ["sprite"]
+    assert d.resource(7)["frames"][0]["elements"] == [[0, 0, 65535]]
+    assert 4 in d.index, "the shared textfield asset is kept"
+    e.undo()
+    assert child_names(d) == ["sprite", "label"]
+
+
+def test_removing_one_of_several_placements_keeps_the_child(window):
+    """A child still placed in another frame is not orphaned and must stay."""
+    d = populated()
+    clip = d.resource(7)
+    clip["frames"] = [
+        {"label": "", "elements": [[0, 0, 65535], [1, 0, 65535]]},
+        {"label": "", "elements": [[1, 0, 65535]]},
+    ]
+    d.update("movieclips", clip)
+    window.add_doc(d)
+    e = window.current()
+    e.go_to(7)
+    e.elements.selectRow(1)
+    application().processEvents()
+    e.remove_element()
+    application().processEvents()
+    assert child_names(d) == ["sprite", "label"]
+    assert d.resource(7)["frames"][0]["elements"] == [[0, 0, 65535]]
+
+
+def placement_matrix(d):
+    clip = d.resource(7)
+    element = clip["frames"][0]["elements"][0]
+    return list(d.bank(clip["matrix_bank_index"])["matrices"][element[1]])
+
+
+def test_clicking_a_placement_does_not_nudge_it(window):
+    """Snapping rounds a zero-offset press onto the grid, which moved things.
+
+    A placement already sitting between two pixels was dragged onto one by a
+    click that never moved the pointer, because rounding the zero delta is not
+    zero. Only movement off the press pixel counts as a drag.
+    """
+    from PyQt6.QtCore import QPointF
+
+    d, e = single_sprite(window)
+    # Sit the placement between pixels, where snapping has something to do.
+    e.commit_placement_transform(0, [1, 0, 0, 1, 40.4, 20.25])
+    application().processEvents()
+    assert placement_matrix(d)[4:] == pytest.approx([40.4, 20.25])
+    revision = e.revision
+    point = e.preview.mapFromScene(QPointF(45, 25))
+    QTest.mousePress(e.preview.viewport(), Qt.MouseButton.LeftButton, pos=point)
+    QTest.mouseRelease(e.preview.viewport(), Qt.MouseButton.LeftButton, pos=point)
+    application().processEvents()
+    assert e.revision == revision, "a click that never moved is not an edit"
+    assert placement_matrix(d)[4:] == pytest.approx([40.4, 20.25])
+
+
+def test_a_real_drag_still_snaps(window):
+    """The slop guard must not stop an actual drag from snapping."""
+    from PyQt6.QtCore import QPointF
+
+    d, e = single_sprite(window)
+    e.commit_placement_transform(0, [1, 0, 0, 1, 40.4, 20.25])
+    application().processEvents()
+    start = e.preview.mapFromScene(QPointF(45, 25))
+    QTest.mousePress(e.preview.viewport(), Qt.MouseButton.LeftButton, pos=start)
+    QTest.mouseMove(e.preview.viewport(), start + QPoint(15, 0))
+    QTest.mouseRelease(
+        e.preview.viewport(), Qt.MouseButton.LeftButton, pos=start + QPoint(15, 0)
+    )
+    application().processEvents()
+    moved = placement_matrix(d)
+    assert moved[4] != 40.4 and float(moved[4]).is_integer(), "the drag snapped"
+
+
+
+
+
+
+def test_clicking_a_resize_handle_does_not_resize(window):
+    """A press on a handle with no movement is not a resize.
+
+    The recomputed matrix differs from the stored one by float noise, so
+    committing it made a bare click dirty the document for nothing.
+    """
+    from PyQt6.QtCore import QPointF
+
+    d, e = single_sprite(window)
+    revision = e.revision
+    item = e.preview.selected_item()
+    point = e.preview.mapFromScene(item.mapToScene(item.boundingRect().bottomRight()))
+    QTest.mousePress(e.preview.viewport(), Qt.MouseButton.LeftButton, pos=point)
+    QTest.mouseRelease(e.preview.viewport(), Qt.MouseButton.LeftButton, pos=point)
+    application().processEvents()
+    assert e.preview.resize_handle in (None, "se")
+    assert e.revision == revision, "a click on a handle with no movement is not an edit"
+
+
+def test_dragging_a_resize_handle_still_resizes(window):
+    """The slop guard must not stop a real resize drag."""
+    from PyQt6.QtCore import QPointF
+
+    d, e = single_sprite(window)
+    start = e.preview.mapFromScene(
+        e.preview.selected_item().mapToScene(
+            e.preview.selected_item().boundingRect().bottomRight()
+        )
+    )
+    end = start + QPoint(20, 20)
+    QTest.mousePress(e.preview.viewport(), Qt.MouseButton.LeftButton, pos=start)
+    QTest.mouseMove(e.preview.viewport(), end)
+    QTest.mouseRelease(e.preview.viewport(), Qt.MouseButton.LeftButton, pos=end)
+    application().processEvents()
+    clip = d.resource(7)
+    element = clip["frames"][0]["elements"][0]
+    matrix = d.bank(clip["matrix_bank_index"])["matrices"][element[1]]
+    assert matrix[0] != 1.0 and matrix[3] != 1.0, "the drag scaled the placement"

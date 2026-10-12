@@ -71,6 +71,7 @@ from PyQt6.QtWidgets import (
     QStyle,
     QSizePolicy,
     QToolButton,
+    QComboBox,
 )
 from .document import Document, KINDS, MKEYS, CHUNKS, FrameSequence, FrameElements
 from .workspace import (
@@ -85,6 +86,22 @@ from .preview import AnimatorTimeline, Preview
 from . import textures
 from . import easing
 from . import themes as theme_schemes
+
+# Textfield fields that hold a packed 0xAARRGGBB colour and are therefore edited
+# with a colour picker rather than as the integer they are stored as.
+COLOR_KEYS = ("font_color", "outline_color")
+
+# The two packed alignment fields: horizontal in the low two bits, vertical in
+# the next two, with the high nibble reserved (styles/unknown).
+ALIGN_HORIZONTAL = ("Left", "Center", "Right", "Justify")
+ALIGN_VERTICAL = ("Top", "Center", "Bottom", "Bottom (alternate)")
+
+
+def _uv(value, size):
+    """A pixel coordinate as the 0..65535 texture coordinate the format stores."""
+    if size <= 0:
+        return 0
+    return round(max(0, min(size, value)) / size * 65535)
 
 
 def save_picker(parent, title, initial="", filters=""):
@@ -161,6 +178,91 @@ def table(headers, name=""):
     widget.setHorizontalHeaderLabels(headers)
     widget.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
     return widget
+
+
+class ColorSwatch(QPushButton):
+    """A packed ARGB colour shown as a swatch that opens the colour picker.
+
+    The value is the same integer the file stores; only the presentation is a
+    colour. ``toggled`` is emitted when the value changes, named to match what
+    the property form already listens for so it needs no special casing.
+    """
+
+    toggled = pyqtSignal(bool)
+
+    def __init__(self, value, parent=None):
+        super().__init__(parent)
+        self._value = int(value)
+        self.setMinimumWidth(96)
+        self.clicked.connect(self.pick)
+        self._refresh()
+
+    def value(self):
+        return self._value
+
+    def setValue(self, value):
+        self._value = int(value)
+        self._refresh()
+
+    def _refresh(self):
+        colour = QColor.fromRgba(self._value)
+        # The swatch carries its own colour so it reads without applying the
+        # theme; the label keeps the alpha visible, which a brush cannot show.
+        self.setStyleSheet(
+            f"QPushButton {{ background-color: {colour.name()}; "
+            f"color: {'#000' if colour.lightness() > 128 else '#fff'}; }}"
+        )
+        self.setText(f"{self._value:08X}")
+        self.setToolTip(f"argb {self._value}")
+
+    def pick(self):
+        colour = QColorDialog.getColor(
+            QColor.fromRgba(self._value), self, "Choose colour",
+            QColorDialog.ColorDialogOption.ShowAlphaChannel,
+        )
+        if colour.isValid() and colour.rgba() != self._value:
+            self._value = colour.rgba()
+            self._refresh()
+            self.toggled.emit(True)
+
+
+class AlignControl(QWidget):
+    """The packed textfield alignment bitfield as two named dropdowns.
+
+    Horizontal is the low two bits and vertical the next two; the high nibble is
+    left untouched, so a file that carries other flags in there round-trips.
+    """
+
+    currentIndexChanged = pyqtSignal(int)
+
+    def __init__(self, value, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.horizontal = QComboBox()
+        self.horizontal.addItems(ALIGN_HORIZONTAL)
+        self.vertical = QComboBox()
+        self.vertical.addItems(ALIGN_VERTICAL)
+        layout.addWidget(self.horizontal)
+        layout.addWidget(self.vertical)
+        self.setValue(value)
+        self.horizontal.currentIndexChanged.connect(self._changed)
+        self.vertical.currentIndexChanged.connect(self._changed)
+
+    def _changed(self, *_):
+        self.currentIndexChanged.emit(self.horizontal.currentIndex())
+
+    def value(self):
+        # Preserve the high nibble the two named fields do not cover.
+        return (self._high & 0xF0) | (self.horizontal.currentIndex() & 3) | (
+            (self.vertical.currentIndex() & 3) << 2
+        )
+
+    def setValue(self, value):
+        self._high = int(value)
+        with QSignalBlocker(self.horizontal), QSignalBlocker(self.vertical):
+            self.horizontal.setCurrentIndex(value & 3)
+            self.vertical.setCurrentIndex((value >> 2) & 3)
 
 
 class Editor(QWidget):
@@ -308,9 +410,17 @@ class Editor(QWidget):
         self.cursor.setRange(0, 0)
         self.frame_label = QLabel("Frame 1 / 1")
         fit = QPushButton("Fit")
+        # Dragging a placement lands on whole asset pixels by default. The saved
+        # value is applied by the Window once this editor is parented; here it
+        # just matches the preview's own default so the two never disagree.
+        self.snap_pixels = QCheckBox("Snap to pixels")
+        self.snap_pixels.setToolTip("Movement lands on whole asset pixels")
+        self.snap_pixels.setChecked(self.preview.snap_movement)
+        self.snap_pixels.toggled.connect(self.set_snap_pixels)
         controls.addWidget(self.play)
         controls.addWidget(self.frame, 1)
         controls.addWidget(self.frame_label)
+        controls.addWidget(self.snap_pixels)
         controls.addWidget(fit)
         # The transport lives in its own fixed-height panel so the row below it
         # cannot shift the slider or the buttons while a clip plays.
@@ -590,7 +700,10 @@ class Editor(QWidget):
         for title, fn in [
             ("Add vertex", self.add_vertex),
             ("Delete vertex", self.remove_vertex),
+            ("Copy vertices", self.copy_vertices),
+            ("Paste vertices", lambda: self.paste_vertices(self.vertices)),
             ("Apply geometry", self.apply_geometry),
+            ("Export PNG…", self.export_shape_image),
         ]:
             button = QPushButton(title)
             button.clicked.connect(fn)
@@ -651,9 +764,10 @@ class Editor(QWidget):
         self.frames.cellChanged.connect(self.timeline_changed)
         self.frames.itemSelectionChanged.connect(self.select_frame)
         self.elements.cellChanged.connect(self.timeline_changed)
-        # Picking a different placement in the timeline changes which rows the
-        # keyframe strip shows keys for, so the strip follows the selection.
-        self.elements.itemSelectionChanged.connect(self.refresh_keyframe_strip)
+        # Picking a different placement changes which rows the keyframe strip
+        # shows keys for, and whose transform the animator's fields describe, so
+        # both follow the selection rather than only the strip.
+        self.elements.itemSelectionChanged.connect(self.placement_selection_changed)
         self.populate()
 
     def eventFilter(self, watched, event):
@@ -951,6 +1065,44 @@ class Editor(QWidget):
         ids = [data[1] for data in values if data and data[0] == "resource"]
         return ids or ([self.selected] if self.selected in self.doc.index else [])
 
+    def focused_child_index(self):
+        """The child-list index the keyboard is on, or -1.
+
+        The Children list row is that index directly. The Placements table
+        addresses the current frame's placements, whose first column is the
+        child index, so a focused placement resolves to the same child. Copy,
+        Duplicate and Delete take a focused child to mean that child rather than
+        the whole clip - the resource you are looking at, not the one it lives
+        in.
+        """
+        if (
+            self.selected not in self.doc.index
+            or self.doc.index[self.selected][0] != "movieclips"
+        ):
+            return -1
+        clip = self.obj
+        children = clip.get("children") or []
+        focus = QApplication.focusWidget()
+        if focus is self.children:
+            row = self.children.currentRow()
+            return row if 0 <= row < len(children) else -1
+        if focus is self.elements:
+            frame = self.cursor_frame(clip)
+            elements = frame["elements"] if frame is not None else []
+            row = self.elements.currentRow()
+            if not 0 <= row < len(elements):
+                return -1
+            index = elements[row][0]
+            return index if 0 <= index < len(children) else -1
+        return -1
+
+    def focused_child_id(self):
+        """The resource id of the focused child instance, or None."""
+        index = self.focused_child_index()
+        if index < 0:
+            return None
+        return self.obj["children"][index]["id"]
+
     def context_menu(self, position):
         owner = self.window()
         menu = QMenu(self)
@@ -1124,29 +1276,44 @@ class Editor(QWidget):
                     or value is None
                 ):
                     continue
-                if isinstance(value, int):
+                if key in COLOR_KEYS and isinstance(value, int):
+                    # An ARGB colour edited as a swatch, not as the number it
+                    # packs to; the number stays in the tooltip for anyone who
+                    # needs the exact value.
+                    widget = self.color_swatch(value)
+                elif key == "align" and isinstance(value, int):
+                    # Alignment is a packed bitfield, not a number to do
+                    # arithmetic on, so it is edited on two named dropdowns.
+                    widget = self.align_control(value)
+                elif isinstance(value, int):
                     widget = (
                         QLineEdit(str(value)) if abs(value) > 2147483647 else QSpinBox()
                     )
                     if isinstance(widget, QSpinBox):
                         widget.setRange(-2147483647, 2147483647)
                         widget.setValue(value)
+                    widget.setEnabled(key not in ("id", "frames_count"))
+                    signal = (
+                        widget.valueChanged
+                        if isinstance(widget, QSpinBox)
+                        else widget.textEdited
+                    )
+                    signal.connect(lambda *_: self.mark_draft("properties"))
                 elif isinstance(value, float):
                     widget = QDoubleSpinBox()
                     widget.setRange(-1e9, 1e9)
                     widget.setDecimals(6)
                     widget.setValue(value)
+                    widget.setEnabled(key not in ("id", "frames_count"))
+                    widget.valueChanged.connect(
+                        lambda *_: self.mark_draft("properties")
+                    )
                 else:
                     widget = QLineEdit(str(value))
-                widget.setEnabled(key not in ("id", "frames_count"))
+                    widget.setEnabled(key not in ("id", "frames_count"))
+                    widget.textEdited.connect(lambda *_: self.mark_draft("properties"))
                 self.form.addRow(key.replace("_", " ").title(), widget)
                 self.property_widgets[key] = (widget, type(value))
-                signal = (
-                    widget.valueChanged
-                    if isinstance(widget, (QSpinBox, QDoubleSpinBox))
-                    else widget.textEdited
-                )
-                signal.connect(lambda *_: self.mark_draft("properties"))
             export = QLineEdit(", ".join(obj.get("exports", [])))
             self.form.addRow("Export names", export)
             self.property_widgets["exports"] = (export, list)
@@ -1225,12 +1392,28 @@ class Editor(QWidget):
         )
         self.preview_resource = self.selected
 
+    def color_swatch(self, value):
+        """A colour swatch wired to the draft tracking the form uses."""
+        widget = ColorSwatch(value)
+        widget.toggled.connect(lambda *_: self.mark_draft("properties"))
+        return widget
+
+    def align_control(self, value):
+        """The two alignment dropdowns, wired to draft tracking."""
+        widget = AlignControl(value)
+        widget.currentIndexChanged.connect(lambda *_: self.mark_draft("properties"))
+        return widget
+
     def apply_properties(self):
         if self.selected is None:
             return
         try:
             obj = self.doc.resource(self.selected)
             for key, (w, t) in self.property_widgets.items():
+                if isinstance(w, (ColorSwatch, AlignControl)):
+                    # Both already hand back the integer the file stores.
+                    obj[key] = w.value()
+                    continue
                 v = w.value() if isinstance(w, (QSpinBox, QDoubleSpinBox)) else w.text()
                 obj[key] = (
                     [n.strip() for n in v.split(",") if n.strip()]
@@ -1466,6 +1649,39 @@ class Editor(QWidget):
         self.preview.selected_placement = row
         self.preview.viewport().update()
         self.load_animation_fields()
+
+    def placement_selection_changed(self):
+        """A different placement is picked: follow it with strip and fields.
+
+        Selecting another row changes which keys the strip shows and whose
+        transform the animator's X/Y/Rotation/Scale fields describe, so both are
+        reloaded. It does not move the selection in the preview: choosing in the
+        table is a different gesture from clicking the canvas, and stealing the
+        preview highlight would make the two disagree.
+        """
+        if self.loading:
+            return
+        self.refresh_keyframe_strip()
+        self.load_animation_fields()
+
+    def set_snap_pixels(self, checked):
+        """Apply the snap toggle to every tab and remember it for the session.
+
+        The setting is one choice for the session, not per tab, so a change
+        reaches every open editor rather than only the one whose box was
+        clicked; otherwise switching tabs would silently change behaviour.
+        """
+        window = self.window()
+        self.preview.snap_movement = bool(checked)
+        if hasattr(window, "snap_pixels"):
+            window.snap_pixels = bool(checked)
+            window.settings.setValue("snap_pixels", bool(checked))
+            for index in range(window.editors.count()):
+                other = window.editors.widget(index)
+                other.preview.snap_movement = bool(checked)
+                if other is not self:
+                    with QSignalBlocker(other.snap_pixels):
+                        other.snap_pixels.setChecked(bool(checked))
 
     def move_keypoint_on_track(self, source, target, row):
         """Move a key on a specific track, not only the selected one."""
@@ -2052,9 +2268,13 @@ class Editor(QWidget):
         landed = {(frame + delta, kind) for frame, kind in moving}
         if min(frame for frame, _ in landed) < 0:
             return
-        # A key may not be dropped on top of one that is staying put: dropping
-        # it there would quietly replace that key's pose. The drag simply does
-        # not land, and the key keeps the position it last had.
+        # A key dropped on top of one that is staying put would replace that
+        # key's pose if written straight over it. For a single key that is the
+        # gesture of putting two keys in each other's place, so the two poses
+        # are exchanged and both survive. A block of keys has no such reading -
+        # a rigid shift landing on other keys is genuinely ambiguous - so a
+        # block that collides keeps the refusal, as does anything that is not a
+        # clean one-for-one swap.
         staying = {
             (frame, kind)
             for _, kind in moving
@@ -2062,56 +2282,78 @@ class Editor(QWidget):
             if (frame, kind) not in set(moving)
         }
         blocked = landed & staying
+        swap = None
         if blocked:
-            self.window().statusBar().showMessage(
-                f"Frame {min(frame for frame, _ in blocked) + 1} already has a key; "
-                "the move was left where it was",
-                4000,
-            )
-            return
+            if len(moving) == 1 and len(blocked) == 1:
+                swap = next(iter(blocked))
+            else:
+                self.window().statusBar().showMessage(
+                    f"Frame {min(frame for frame, _ in blocked) + 1} already has a "
+                    "key; the move was left where it was",
+                    4000,
+                )
+                return
 
         bank = self.clip_bank(clip)
         colours = bank.get("colors") or []
+        # Every pose that moves, as (source frame, destination frame, track). A
+        # swap adds the key that was landed on, travelling the other way to the
+        # frame the dragged key came from.
+        transfers = [(frame, frame + delta, kind) for frame, kind in moving]
+        if swap is not None:
+            transfers.append((swap[0], moving[0][0], swap[1]))
         # Read every pose before anything is written, since the source frames
         # are cleared as part of the same change.
         poses = {}
-        for frame, kind in moving:
-            if not 0 <= frame < len(clip["frames"]):
+        for source_frame, _, kind in transfers:
+            if not 0 <= source_frame < len(clip["frames"]):
                 return
-            if kind >= len(clip["frames"][frame]["elements"]):
+            if kind >= len(clip["frames"][source_frame]["elements"]):
                 return
-            origin = clip["frames"][frame]["elements"][kind]
+            origin = clip["frames"][source_frame]["elements"][kind]
             if origin[1] == 65535 and origin[2] == 65535:
                 continue
-            poses[(frame, kind)] = (
-                self.matrix_at(clip, frame, kind),
+            poses[(source_frame, kind)] = (
+                self.matrix_at(clip, source_frame, kind),
                 list(colours[origin[2]])
                 if origin[2] != 65535 and origin[2] < len(colours)
                 else None,
             )
 
         def change():
-            for (frame, kind), (matrix, colour) in poses.items():
-                clip["frames"][frame]["elements"][kind][1] = 65535
-                clip["frames"][frame]["elements"][kind][2] = 65535
-            for (frame, kind), (matrix, colour) in poses.items():
-                after = frame + delta
+            for source_frame, _, kind in transfers:
+                clip["frames"][source_frame]["elements"][kind][1] = 65535
+                clip["frames"][source_frame]["elements"][kind][2] = 65535
+            for source_frame, after, kind in transfers:
+                pose = poses.get((source_frame, kind))
+                if pose is None:
+                    continue
+                matrix, colour = pose
                 destination = clip["frames"][after]["elements"][kind]
                 destination[1] = self.intern_matrix(clip, matrix)
                 if colour is not None:
                     destination[2] = self.intern_color(clip, colour)
 
+        # The selection follows the dragged key to wherever it ended up: the
+        # frame it was dropped on, not the frame it started from.
+        settled = {(swap[0], swap[1])} if swap is not None else landed
         if self.mutate(lambda: (change(), self.doc.update("movieclips", clip))[1]):
-            self.keyframes.picked_keys = landed
+            self.keyframes.picked_keys = settled
             self.refresh()
             self.elements.selectRow(row)
             self.preview.selected_placement = row
-            moved = len(poses)
-            self.window().statusBar().showMessage(
-                f"Moved {moved} key{'s' if moved != 1 else ''} to start at "
-                f"frame {min(f for f, _ in landed) + 1}",
-                4000,
-            )
+            if swap is not None:
+                self.window().statusBar().showMessage(
+                    f"Swapped keys at frames {source + 1} and {swap[0] + 1}",
+                    4000,
+                )
+            else:
+                moved = len(poses)
+                self.window().statusBar().showMessage(
+                    f"Moved {moved} key{'s' if moved != 1 else ''} to start at "
+                    f"frame {min(f for f, _ in landed) + 1}",
+                    4000,
+                )
 
     def clip_bank(self, clip):
         """The clip's transform bank, or an empty one when it has none yet.
@@ -2903,6 +3145,10 @@ class Editor(QWidget):
                 self.elements.setCurrentCell(-1, -1)
         self.preview.selected_placement = row if row >= 0 else None
         self.preview.viewport().update()
+        # The transform fields describe the placement the panels are acting on,
+        # so picking a child in the list moves them here too rather than leaving
+        # the previous child's numbers on screen.
+        self.load_animation_fields()
 
     def rename_child(self):
         row = self.children.currentRow()
@@ -2923,8 +3169,8 @@ class Editor(QWidget):
         if row >= 0 and self.selected in self.doc.index:
             self.go_to(self.doc.resource(self.selected)["children"][row]["id"])
 
-    def duplicate_child(self):
-        ci = self.children.currentRow()
+    def duplicate_child(self, child_index=None):
+        ci = self.children.currentRow() if child_index is None else child_index
         if ci < 0 or not self.resolve_drafts():
             return
         obj = self.doc.resource(self.selected)
@@ -2977,24 +3223,22 @@ class Editor(QWidget):
             self.preview.selected_placement = row
             self.preview.viewport().update()
 
-    def remove_child(self):
-        i = self.children.currentRow()
+    def remove_child(self, child_index=None):
+        # QPushButton.clicked and QAction.triggered both carry a checked bool,
+        # which Qt hands to a slot that takes an argument. Without this the
+        # button deleted child 0 whatever was picked, because False reads as 0.
+        if child_index is None or isinstance(child_index, bool):
+            child_index = self.children.currentRow()
+        i = child_index
         if i < 0:
             return
 
         if not self.resolve_drafts():
             return
         obj = self.doc.resource(self.selected)
-        name = obj["children"][i]["name"] or f"child {i}"
-        if (
-            QMessageBox.question(
-                self,
-                "Delete child",
-                f"Remove {name} and its placements from every frame?\nThe shared asset itself is kept.",
-            )
-            != QMessageBox.StandardButton.Yes
-        ):
+        if not 0 <= i < len(obj["children"]):
             return
+        name = obj["children"][i]["name"] or f"child {i}"
         obj["children"].pop(i)
         for frame in obj["frames"]:
             frame["elements"] = [e for e in frame["elements"] if e[0] != i]
@@ -3008,6 +3252,11 @@ class Editor(QWidget):
             }
             self.refresh()
             self.children.selectRow(min(i, self.children.rowCount() - 1))
+            # No confirmation dialog: the change is one undo step, so Ctrl+Z
+            # takes it straight back. Saying what went keeps it discoverable.
+            self.window().statusBar().showMessage(
+                f"Removed {name} from every frame · Ctrl+Z to undo", 4000
+            )
 
     def add_frame(self, duplicate):
         i = self.frame_index()
@@ -3045,8 +3294,45 @@ class Editor(QWidget):
     def remove_element(self):
         row = self.elements.currentRow()
         i = self.frame_index()
-        if row >= 0:
-            self.clip_edit(lambda o: o["frames"][i]["elements"].pop(row))
+        if row < 0:
+            return
+        if (
+            self.selected not in self.doc.index
+            or self.doc.index[self.selected][0] != "movieclips"
+        ):
+            return
+        obj = self.doc.resource(self.selected)
+        frames = obj["frames"]
+        if not 0 <= i < len(frames) or row >= len(frames[i]["elements"]):
+            return
+        child = frames[i]["elements"][row][0]
+        others = frames[i]["elements"][:row] + frames[i]["elements"][row + 1 :]
+        still_placed = any(
+            element[0] == child
+            for n, frame in enumerate(frames)
+            for element in (others if n == i else frame["elements"])
+        )
+        frames[i]["elements"].pop(row)
+        # A child nothing places any more has no route back through the preview
+        # or the frames, so it only lingers in the Children list. That is the
+        # entry the request was to be rid of; drop it in the same undo step.
+        removed = None
+        if child < len(obj["children"]) and not still_placed:
+            removed = obj["children"][child]["name"] or f"child {child}"
+            obj["children"].pop(child)
+            # Children after the hole sit one lower, so their placements move.
+            for frame in frames:
+                for element in frame["elements"]:
+                    if element[0] > child:
+                        element[0] -= 1
+        if self.mutate(lambda: self.doc.update("movieclips", obj)):
+            self.refresh()
+            if removed:
+                self.window().statusBar().showMessage(
+                    f"Removed the placement and its unused child {removed}"
+                    " · Ctrl+Z to undo",
+                    4000,
+                )
 
     def select_placement(self, row):
         self.preview.selected_placement = row
@@ -3234,6 +3520,170 @@ class Editor(QWidget):
             self.frames.selectRow(fi)
             self.elements.selectRow(self.elements.rowCount() - 1)
             self.render_frame(fit=True)
+
+    def animation_dialog(self, frames, fps):
+        """Ask how to name and time an imported animation.
+
+        The frame names are built as prefix + number + suffix so a run of
+        imported frames can be told apart in the child list and the browser
+        without renaming them one at a time afterwards.
+        """
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Import animation")
+        form = QFormLayout(dialog)
+        prefix = QLineEdit("frame")
+        suffix = QLineEdit("")
+        rate = QDoubleSpinBox()
+        rate.setRange(1.0, 120.0)
+        rate.setDecimals(2)
+        rate.setValue(fps)
+        form.addRow("Name prefix", prefix)
+        form.addRow("Name suffix", suffix)
+        form.addRow("Framerate", rate)
+        form.addRow(
+            QLabel(
+                f"{len(frames)} frames will each become a movieclip frame, named\n"
+                "prefix + frame number + suffix, packed into one texture atlas."
+            )
+        )
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return {
+            "prefix": prefix.text(),
+            "suffix": suffix.text(),
+            "fps": rate.value(),
+        }
+
+    def import_animation(self):
+        """Import a GIF or animated WebP as a movieclip animation.
+
+        Every source frame becomes a movieclip frame showing that frame's
+        image, packed into a single atlas with one shape per frame. The frames
+        are named from the dialog so a run of them stays legible, and any
+        placements already in the clip are kept alongside the new images.
+        """
+        if (
+            self.selected not in self.doc.index
+            or self.doc.index[self.selected][0] != "movieclips"
+        ):
+            self.error("Select or create a movieclip first, then import an animation.")
+            return
+        if not self.resolve_drafts():
+            return
+        path, _ = native_picker(
+            self,
+            "Import animation into movieclip",
+            "",
+            "Animations (*.gif *.webp *.apng *.png)",
+        )
+        if not path:
+            return
+        try:
+            frames, duration = textures.decode_animation(path)
+            if len(frames) < 2:
+                self.error(
+                    ValueError(
+                        "that file holds a single frame; use Import image instead"
+                    )
+                )
+                return
+            default_fps = 1000.0 / (duration / len(frames)) if duration else 30.0
+            options = self.animation_dialog(frames, min(120.0, max(1.0, default_fps)))
+            if options is None:
+                return
+            self.insert_animation(frames, options, Path(path).stem)
+        except Exception as ex:
+            self.error(ex)
+
+    def insert_animation(self, frames, options, stem="animation", raise_errors=False):
+        """Place decoded frames into the open movieclip as a keyed animation.
+
+        Every frame becomes a movieclip frame showing that frame's image, packed
+        into a single atlas with one shape per frame. Any placements a frame
+        already had are kept, so importing into a clip that is already rigged
+        adds the animation rather than replacing it.
+        """
+        if (
+            self.selected not in self.doc.index
+            or self.doc.index[self.selected][0] != "movieclips"
+        ):
+            raise ValueError("Select a movieclip to import an animation into")
+        placements, sheet, sheet_w, sheet_h = textures.pack_frames(frames)
+        if sheet is None:
+            return
+        data = textures.frame_atlas_bytes(sheet)
+        clip = self.doc.resource(self.selected)
+        base = len(clip["children"])
+
+        def change():
+            atlas = len(self.doc.tables["Textures"]["textures"])
+            self.doc.tables["Textures"]["textures"].append(
+                {"highres": data, "lowres": None}
+            )
+            self.doc.dirty.add("Textures")
+            for index, frame in enumerate(frames):
+                px, py = placements[index]
+                name = (
+                    f"{options['prefix']}{index}{options['suffix']}"
+                    or f"{stem}{index}"
+                )
+                shape_id = self.doc.new_resource("shapes")
+                w, h = frame.width, frame.height
+                self.doc.update(
+                    "shapes",
+                    {
+                        "id": shape_id,
+                        "exports": [],
+                        "commands": [
+                            {
+                                "unk1": 0,
+                                "texture_index": atlas,
+                                # Quad at the origin; only the UVs point into the
+                                # frame's slice of the atlas, so the placement
+                                # needs no offset to show it.
+                                "vertices": [
+                                    [0, 0, _uv(px, sheet_w), _uv(py, sheet_h)],
+                                    [w, 0, _uv(px + w, sheet_w), _uv(py, sheet_h)],
+                                    [0, h, _uv(px, sheet_w), _uv(py + h, sheet_h)],
+                                    [
+                                        w,
+                                        h,
+                                        _uv(px + w, sheet_w),
+                                        _uv(py + h, sheet_h),
+                                    ],
+                                ],
+                            }
+                        ],
+                    },
+                )
+                clip["children"].append({"id": shape_id, "name": name, "blend": 0})
+                while len(clip["frames"]) <= index:
+                    clip["frames"].append({"label": "", "elements": []})
+                frame_slot = clip["frames"][index]
+                # Only this frame's image is added here, so a frame shows
+                # exactly one picture while anything already placed stays.
+                frame_slot["elements"] = list(frame_slot["elements"]) + [
+                    [base + index, 65535, 65535]
+                ]
+                frame_slot["label"] = name
+            clip["framerate"] = int(round(options["fps"]))
+            self.doc.update("movieclips", clip)
+
+        if self.mutate(change, raise_errors=raise_errors):
+            self.refresh()
+            self.set_panel(0)
+            self.frames.selectRow(0)
+            self.render_frame(fit=True)
+            self.window().statusBar().showMessage(
+                f"Imported {len(frames)} frames at {int(round(options['fps']))} fps",
+                6000,
+            )
 
     def intern_matrices(self, clip, matrices):
         """Append several matrices at once and return their local indices.
@@ -3752,6 +4202,61 @@ class Editor(QWidget):
         except Exception as e:
             self.error(e)
 
+    def copy_vertices(self):
+        """Copy the focused command's whole vertex list, ready to paste elsewhere.
+
+        A Copy over the vertex table takes the whole list, whether or not a cell
+        is selected: the vertex list is a portable unit, so it can be pasted
+        onto another shape's command and the geometry is transplanted.
+        """
+        if self.selected not in self.doc.index:
+            return
+        rows = [
+            "\t".join(
+                self.vertices.item(r, c).text() if self.vertices.item(r, c) else ""
+                for c in range(self.vertices.columnCount())
+            )
+            for r in range(self.vertices.rowCount())
+        ]
+        if rows:
+            QApplication.clipboard().setText("\n".join(rows))
+            self.window().statusBar().showMessage(f"Copied {len(rows)} vertices", 4000)
+
+    def paste_vertices(self, grid):
+        """Replace the current command's vertices with the pasted list.
+
+        The pasted list becomes the command wholesale, so the row count may grow
+        or shrink: pasting a whole shape's vertices onto another shape is the
+        point, and refusing because the target happened to have fewer rows made
+        that impossible.
+        """
+        if self.selected not in self.doc.index:
+            return
+        text = QApplication.clipboard().text().strip()
+        rows = [line.split("\t") for line in text.splitlines() if line.strip()]
+        if not rows:
+            return
+        width = grid.columnCount()
+        # Rebuilding the rows emits the table's own signals, which resolve
+        # geometry drafts and can rebuild the panel underneath this call. The
+        # loading flag is the editor's existing "a rebuild is in progress"
+        # latch, so it is held across the rebuild and released after.
+        self.loading = True
+        try:
+            with QSignalBlocker(grid):
+                grid.setRowCount(len(rows))
+                for y, values in enumerate(rows):
+                    for c in range(width):
+                        value = values[c] if c < len(values) else "0"
+                        grid.setItem(y, c, QTableWidgetItem(value))
+            grid.selectRow(0)
+        finally:
+            self.loading = False
+        self.mark_draft("geometry")
+        self.window().statusBar().showMessage(
+            f"Pasted {len(rows)} vertices; Apply geometry writes them", 5000
+        )
+
     def export_texture(self):
         if self.texture_index is None:
             return
@@ -3766,6 +4271,69 @@ class Editor(QWidget):
                 ).save(path)
             except Exception as e:
                 self.error(e)
+
+    def export_shape_image(self):
+        """Write the open shape's rendered image to a PNG.
+
+        The shape is rasterized exactly as the viewer draws it - the same
+        triangle-strip surfaces, at the shape's own resolution rather than the
+        zoomed view - so what lands on disk is the artwork, not a screenshot.
+        """
+        if (
+            self.selected not in self.doc.index
+            or self.doc.index[self.selected][0] != "shapes"
+        ):
+            self.window().statusBar().showMessage(
+                "Select a shape to export its image", 4000
+            )
+            return
+        obj = self.doc.resource(self.selected)
+        if not obj.get("commands"):
+            self.window().statusBar().showMessage(
+                "This shape has no geometry to render", 4000
+            )
+            return
+        path, _ = save_picker(self, "Export shape image", "", "PNG (*.png)")
+        if not path:
+            return
+        try:
+            left, top, scale, width, height = self.render_shape_bounds(obj)
+            # Render at full scale for the file; the viewer's surface is capped
+            # so a huge mesh stays interactive, and that cap should not shrink
+            # what is written out.
+            image = QImage(
+                max(1, math.ceil(width) + 1),
+                max(1, math.ceil(height) + 1),
+                QImage.Format.Format_ARGB32_Premultiplied,
+            )
+            image.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(image)
+            painter.translate(-left, -top)
+            try:
+                for command in obj["commands"]:
+                    atlas = self.preview.atlas(command["texture_index"])
+                    vertices = command["vertices"]
+                    for i in range(len(vertices) - 2):
+                        self.preview.render_triangle(
+                            painter, vertices[i : i + 3], atlas
+                        )
+            finally:
+                painter.end()
+            if not image.save(path):
+                raise ValueError("could not write the image")
+            self.window().statusBar().showMessage(
+                f"Exported shape image to {path}", 6000
+            )
+        except Exception as e:
+            self.error(e)
+
+    def render_shape_bounds(self, obj):
+        """The shape's origin and pixel size, from its own vertices."""
+        verts = [v for command in obj["commands"] for v in command["vertices"]]
+        left, top = min(v[0] for v in verts), min(v[1] for v in verts)
+        width = max(v[0] for v in verts) - left
+        height = max(v[1] for v in verts) - top
+        return left, top, 1.0, width, height
 
     def replace_texture(self):
         if self.texture_index is None:
@@ -3870,6 +4438,8 @@ class Window(QMainWindow):
         self.clipboard = None
         self.jobs = []
         self.actions = {}
+        # Snap is on by default; the saved choice is honoured when present.
+        self.snap_pixels = self.settings.value("snap_pixels", True, type=bool)
         self.agent_gateway = None
         self.setAcceptDrops(True)
         app = QApplication.instance()
@@ -3922,6 +4492,13 @@ class Window(QMainWindow):
             "Import image into movieclip…",
             lambda: self.current() and self.current().import_image(),
             "Ctrl+Alt+I",
+        )
+        self.action(
+            resource,
+            "import_animation",
+            "Import animation (GIF/WebP)…",
+            lambda: self.current() and self.current().import_animation(),
+            "Ctrl+Alt+A",
         )
         self.action(file, "new", "&New", self.new, "Ctrl+N")
         self.action(file, "open", "&Open…", self.open, "Ctrl+O")
@@ -4217,7 +4794,7 @@ class Window(QMainWindow):
         self.info.setText(f"SC{ed.doc.version} · {len(ed.doc.index):,} objects")
         self.actions["browser"].setChecked(not ed.splitter.widget(0).isHidden())
         self.actions["inspector"].setChecked(not ed.splitter.widget(2).isHidden())
-        for grid in (ed.tree, ed.keyframes):
+        for grid in (ed.tree, ed.keyframes, ed.children, ed.elements, ed.frames):
             if self.delete_shortcut not in grid.actions():
                 grid.addAction(self.delete_shortcut)
 
@@ -4228,6 +4805,12 @@ class Window(QMainWindow):
         self.editors.setCurrentWidget(editor)
         editor.tree.setFocus()
         self.title(editor)
+        # The snap choice is saved once for the session; each new tab starts
+        # from it (and from whatever the last toggle set) rather than from the
+        # widget's own default.
+        with QSignalBlocker(editor.snap_pixels):
+            editor.snap_pixels.setChecked(self.snap_pixels)
+        editor.preview.snap_movement = self.snap_pixels
         sizes = self.settings.value("splitter", [265, 565, 350])
         try:
             editor.splitter.setSizes([int(x) for x in sizes])
@@ -4369,7 +4952,12 @@ class Window(QMainWindow):
         ed = self.current()
         if ed is None or not ed.resolve_drafts():
             return
-        ids = ed.selected_ids()
+        # A child focused in the Children or Placements list is what Copy is
+        # about: it copies the resource that child instances, not the movieclip
+        # it sits in. Everywhere else the browser selection, or the open
+        # resource, is what is copied.
+        child = ed.focused_child_id()
+        ids = [child] if child is not None else ed.selected_ids()
         if not ids:
             return
 
@@ -4433,6 +5021,13 @@ class Window(QMainWindow):
         ed = self.current()
         if ed is None or not ed.resolve_drafts():
             return
+        # Duplicating a focused child is the child-list action, which copies the
+        # instance into the same movieclip; duplicating a resource makes a new
+        # resource. The two are different enough that focus picks which one.
+        child = ed.focused_child_index()
+        if child >= 0:
+            ed.duplicate_child(child)
+            return
         ids = ed.selected_ids()
         if ids:
             mapping = {}
@@ -4453,9 +5048,30 @@ class Window(QMainWindow):
         if ed is None or not ed.resolve_drafts():
             return
         # Delete belongs to whatever has the keyboard. With the timeline
-        # focused it removes the picked keys, not the selected resources, so a
-        # range of keys can be cleared in one gesture.
-        if ed.keyframes.hasFocus() and ed.delete_selected_keys():
+        # focused it removes the picked keys or the marked frame range; with
+        # neither picked it removes the frame under the playhead, which is the
+        # frame the timeline is showing. In no case does it delete the resource:
+        # falling through to the browser selection is what made a frame press
+        # take out the whole movieclip.
+        if ed.keyframes.hasFocus():
+            if ed.delete_selected_keys():
+                return
+            ed.remove_frames([ed.cursor.value()])
+            return
+        # The Frames table names a frame of the open clip, so Delete there is
+        # the frame action, not deleting the resource. Without this the browser
+        # fallback below deleted the whole movieclip, which is why a frame press
+        # could take out something other than the frame that was picked.
+        focus = QApplication.focusWidget()
+        if focus is ed.frames:
+            ed.remove_frame()
+            return
+        # A child focused in the Children or Placements list is what Delete is
+        # about: it removes that instance from every frame, which is the
+        # child-list action, not deleting the resource it instances.
+        child = ed.focused_child_index()
+        if child >= 0:
+            ed.remove_child(child)
             return
         ids = ed.selected_ids()
         if not ids:
@@ -4490,6 +5106,13 @@ class Window(QMainWindow):
             return
         if isinstance(focus, QTableWidget):
             if command == "copy":
+                if focus is ed.vertices:
+                    # The vertex list is a portable unit: copying it takes the
+                    # whole list, so it can be pasted onto another shape's
+                    # command. A click that leaves a current cell selected is
+                    # still "copy these vertices", not "copy this one value".
+                    ed.copy_vertices()
+                    return
                 ranges = focus.selectedRanges()
                 if ranges:
                     area = ranges[0]
@@ -4504,8 +5127,17 @@ class Window(QMainWindow):
                             )
                         )
                     QApplication.clipboard().setText("\n".join(rows))
+                elif focus is ed.children or focus is ed.elements:
+                    # A whole row is not marked out as a cell range, so a Copy
+                    # on the Children or Placements list with nothing swept
+                    # copies the child that row stands for rather than doing
+                    # nothing. An explicit range still copies its text.
+                    self.copy()
             elif command == "paste":
-                self.paste_cells(focus)
+                if focus is ed.vertices:
+                    ed.paste_vertices(focus)
+                else:
+                    self.paste_cells(focus)
             elif command == "selectAll":
                 focus.selectAll()
             elif command == "undo":
@@ -4529,7 +5161,6 @@ class Window(QMainWindow):
             ed.redo()
         elif command == "selectAll":
             ed.tree.selectAll()
-
     def paste_cells(self, grid):
         ed = self.current()
         text = QApplication.clipboard().text()
@@ -4640,6 +5271,22 @@ class Window(QMainWindow):
             )
         ):
             self.go_to_id()
+            return True
+        # Plain X opens Find usages on whatever is focused, the same way G opens
+        # Go to ID: a child focused in the Children or Placements list, or the
+        # open resource otherwise. Ctrl+Shift+R and Shift+F12 still reach the
+        # dialog through their own actions.
+        if (
+            event.type() == QEvent.Type.KeyPress
+            and event.key() == Qt.Key.Key_X
+            and not event.modifiers()
+            and QApplication.activeModalWidget() is None
+            and self.editors.count()
+            and not typing_into(
+                watched if isinstance(watched, QWidget) else QApplication.focusWidget()
+            )
+        ):
+            self.references()
             return True
         if event.type() == QEvent.Type.KeyPress:
             # Extra shortcuts, tried in the order they were declared, so one
@@ -4758,6 +5405,10 @@ class Window(QMainWindow):
         ed = self.current()
         if ed is None:
             return
+        # A focused child is what Find usages is about when the keyboard is on
+        # the Children or Placements list; elsewhere the selected resource is.
+        if target is None:
+            target = ed.focused_child_id()
         target = ed.selected if target is None else target
         if target not in ed.doc.index:
             return
@@ -4982,10 +5633,13 @@ class Window(QMainWindow):
                 shortcut.toString(QKeySequence.SequenceFormat.NativeText)
                 for shortcut in action.shortcuts()
             )
-            # G is routed by the window event filter rather than by the action,
-            # so it is listed here to keep the dialog matching real behaviour.
+            # G and X are routed by the window event filter rather than by the
+            # action, so they are listed here to keep the dialog matching real
+            # behaviour.
             if key == "goto":
                 keys = ", ".join(filter(None, [keys, "G"]))
+            elif key == "references":
+                keys = ", ".join(filter(None, [keys, "X"]))
             if keys:
                 rows.append((keys, action.text().replace("&", "")))
         dialog = QDialog(self)

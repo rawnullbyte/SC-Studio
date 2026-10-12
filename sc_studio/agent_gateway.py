@@ -1340,6 +1340,34 @@ class AgentGateway(QObject):
             ed.cursor.setValue(frame)
             ed.insert_image(data, args.get("name") or Path(args["path"]).stem, values, raise_errors=True)
             return self.describe(ed)
+        if operation == "import_animation":
+            from . import textures
+            id = args["movieclip_id"]
+            if doc.index[id][0] != "movieclips":
+                raise ValueError("Select a movieclip for animation import")
+            frames, duration = textures.decode_animation(
+                Path(args["path"]).expanduser()
+            )
+            if len(frames) < 2:
+                raise ValueError("That file holds a single frame; use import_image")
+            if len(frames) > 512:
+                raise ValueError("Animation exceeds the 512-frame import limit")
+            default_fps = 1000.0 / (duration / len(frames)) if duration else 30.0
+            options = {
+                "prefix": args.get("prefix", "frame"),
+                "suffix": args.get("suffix", ""),
+                "fps": float(args.get("fps") or min(120.0, max(1.0, default_fps))),
+            }
+            self.window.editors.setCurrentWidget(ed)
+            ed.go_to(id)
+            ed.cursor.setValue(0)
+            ed.insert_animation(
+                frames,
+                options,
+                Path(args["path"]).stem,
+                raise_errors=True,
+            )
+            return self.describe(ed)
         result = {}
 
         def change():

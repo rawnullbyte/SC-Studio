@@ -1,3 +1,21 @@
+# 0.6.2
+
+- Dragging a key onto an occupied frame now swaps the two poses instead of refusing; a multi-key selection still refuses a colliding drop, with the reason in the status bar.
+- The animator's X/Y/Rotation/Scale fields follow the selected placement, so selecting another child or placement shows that object's transform instead of the last one's.
+- Copy, Duplicate and Delete act on the focused child when the Children or Placements list has focus. Delete on the Frames list or the timeline removes the picked frame, never the open movieclip.
+- Added a **Snap to pixels** toggle (on by default, remembered) so a dragged placement lands on whole asset pixels.
+- Textfield font and outline colors are edited with a color swatch, and alignment with two named dropdowns, in the Properties panel and the Text style dialog; the preview now applies alignment, and a textfield is measured and resized by its authored box rather than its glyph height.
+- Added **Import animation (GIF/WebP)…** (Ctrl+Alt+A): one movieclip frame per source frame, packed into one atlas, with configurable frame-name prefix/suffix and framerate. Video formats are not decoded.
+- Added geometry **Copy vertices** / **Paste vertices** to transplant a vertex list between shapes, **Export PNG…** for a shape's rendered image, and a plain **X** shortcut to open Find usages on the focused child.
+- Added this release's focused GUI coverage and a `tests/conftest.py` that forces the offscreen Qt platform so the suite never opens real windows.
+- Fixed the Children list's **Delete** button deleting the first child whatever row was picked: `QPushButton.clicked` passes its checked state, which `remove_child` read as a child index (`False` is `0`). The same signal now reaches the Children, Placements and Frames lists, so **Del** removes the focused child.
+- Removed the confirmation dialog when deleting a child. The change is one undo step, so Ctrl+Z takes it straight back, and the status bar says what was removed instead.
+- Removing the last placement of a child now removes the child too: SC has no per-frame child list, so an unplaced entry only lingered in the Children list with no way back from any frame.
+- Fixed a placement being nudged by a plain click. With snapping on, a zero-movement press was rounded onto the pixel grid, which moved a placement already sitting between pixels; only movement off the press pixel is a drag now. A press on a resize handle does nothing too, rather than committing float noise as a resize.
+- Fixed publishing external KTX sidecars failing on Windows: sidecar keys are stored POSIX-style but the save path re-derived them with `str(Path(...))`, which renders backslashes there and missed every key.
+
+Validation: **212 passed, 5 skipped** in the full suite (`python -m pytest tests/`). The three fixture-dependent skips that need real SC files remain. `test_table_tsv_paste_and_preview_frame_sync` passes in a full run but not in isolation; that ordering sensitivity predates this release.
+
 # 0.6.1
 
 - Fixed playback progress range and frame-label synchronization; the transport slider now stops at the last real frame.

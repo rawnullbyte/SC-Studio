@@ -33,6 +33,16 @@ MKEYS = ["a", "b", "c", "d", "tx", "ty"]
 CKEYS = ["r_mul", "g_mul", "b_mul", "alpha", "r_add", "g_add", "b_add"]
 
 
+def sidecar_key(name):
+    """The sidecars dict key for a relative external-texture path.
+
+    Sidecar keys are always stored POSIX-style, since they are written into
+    the SC file and into workspace archives. ``str(Path(name))`` would render
+    the separator as a backslash on Windows and miss every key.
+    """
+    return Path(name).as_posix()
+
+
 class FrameElements:
     """Read-only frame data, decoded only when preview/inspector needs its placements."""
 
@@ -764,7 +774,7 @@ class Document:
             data = texture.get(variant)
             if data and data.get("external_texture"):
                 rel = data["external_texture"]
-                payload = source.sidecars.get(rel)
+                payload = source.sidecars.get(sidecar_key(rel))
                 if payload is None:
                     if source.path is None:
                         raise ValueError(f"Missing external texture: {rel}")
@@ -1032,7 +1042,7 @@ class Document:
                     if rel.is_absolute() or ".." in rel.parts:
                         raise ValueError("Unsafe external texture path")
                     dest = path.parent / rel
-                    payload = self.sidecars.get(str(rel))
+                    payload = self.sidecars.get(sidecar_key(rel))
                     if payload is None:
                         if self.path is None:
                             raise ValueError(f"Missing external texture {rel}")

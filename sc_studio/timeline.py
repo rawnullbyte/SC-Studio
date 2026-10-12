@@ -645,16 +645,22 @@ class AnimatorTimeline(QWidget):
             # A key can only be dropped on a frame that belongs to the clip; a
             # drag further out extends it first, and the move follows once the
             # frames are there.
+            before = set(self.picked_keys)
             if target >= self.frame_count:
                 self.extendRequested.emit(target + 1)
-                self.dragging = (target, row)
                 self.moveRequested.emit(frame, target, row)
             elif target != frame:
-                self.dragging = (target, row)
                 self.moveRequested.emit(frame, target, row)
-            # The selection is left to the editor, which moves every key that
-            # was picked and reports where they ended up: shifting it here too
-            # would push the selection a step further on than the keys went.
+            # The anchor follows the drag only when the key actually moved. The
+            # editor writes the landed keys back into its selection on a move
+            # and leaves it untouched when it refuses one, so an unchanged
+            # selection means the key is still on the frame it started from and
+            # the anchor must stay there too; otherwise the next step would drag
+            # from a frame the key is not on.
+            if self.picked_keys != before:
+                self.dragging = (target, row)
+            # The selection itself is the editor's, which moves every key that
+            # was picked and reports where they ended up.
             return
         self.setCursor(
             Qt.CursorShape.SizeHorCursor

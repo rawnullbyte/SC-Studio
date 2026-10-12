@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sc-studio"
-version = "0.6.1"
+version = "0.6.2"
 requires-python = ">=3.10"
 description = "PyQt6 SC2 v5/v6 resource and movieclip editor"
 readme = "README.md"

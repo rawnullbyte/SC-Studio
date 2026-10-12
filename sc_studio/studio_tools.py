@@ -30,6 +30,14 @@ from PyQt6.QtWidgets import (
 from .workspace import native_picker
 from . import authoring, easing
 from .publishing import PublishSettings, publish, repack_atlases
+from .app import ColorSwatch
+
+
+def swatch(form, label, value):
+    """A colour row in an authoring dialog, matching the inspector's swatch."""
+    field = ColorSwatch(value)
+    form.addRow(label, field)
+    return field
 
 
 def dialog(parent, title):
@@ -571,12 +579,10 @@ def text_style(window):
     v.setCurrentIndex((obj["align"] >> 2) & 3)
     colors = []
     for key, label in [
-        ("font_color", "Text color (ARGB)"),
-        ("outline_color", "Outline color (ARGB)"),
+        ("font_color", "Text color"),
+        ("outline_color", "Outline color"),
     ]:
-        field = QLineEdit(f"{obj[key]:08x}")
-        f.addRow(label, field)
-        colors.append((key, field))
+        colors.append((key, swatch(f, label, obj[key])))
     flags = [
         (bit, checkbox(f, label, bool(obj["styles"] & bit)))
         for bit, label in [
@@ -606,7 +612,7 @@ def text_style(window):
             | sum(bit for bit, field in flags if field.isChecked()),
         )
         for key, field in colors:
-            obj[key] = int(field.text().removeprefix("#"), 16)
+            obj[key] = field.value()
         ed.doc.update("textfields", obj)
 
     ed.mutate(apply)

@@ -8,7 +8,7 @@ from pathlib import Path
 import struct
 import zstandard
 from PIL import Image
-from .document import Document, MKEYS
+from .document import Document, MKEYS, sidecar_key
 from . import textures
 
 
@@ -62,9 +62,10 @@ class PublishSettings:
 
 
 def decode_texture(doc, data):
-    if data.get("external_texture") in doc.sidecars:
+    name = data.get("external_texture")
+    if name and sidecar_key(name) in doc.sidecars:
         data = dict(
-            data, data=doc.sidecars[data["external_texture"]], external_texture=None
+            data, data=doc.sidecars[sidecar_key(name)], external_texture=None
         )
     return textures.image(data, doc.path.parent if doc.path else Path("."))
 

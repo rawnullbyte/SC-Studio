@@ -484,6 +484,14 @@ transform on the frames you name and can write a curve between them.
                     frame=frame, name=name, width=width, height=height, x=x, y=y, angle=angle)
 
     @server.tool()
+    def import_animation(path: str, movieclip_id: int, prefix: str = "frame",
+                         suffix: str = "", fps: float | None = None,
+                         document_id: str | None = None) -> dict:
+        """Import a GIF/animated WebP as one movieclip frame per source frame, into a single atlas. Frames are named prefix+index+suffix. fps defaults to the file's own timing."""
+        return call("import_animation", document_id=document_id, path=path,
+                    movieclip_id=movieclip_id, prefix=prefix, suffix=suffix, fps=fps)
+
+    @server.tool()
     def undo(document_id: str | None = None) -> dict:
         """Undo the last committed edit in a document."""
         return call("undo", document_id=document_id)

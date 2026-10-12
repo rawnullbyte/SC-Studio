@@ -1,6 +1,7 @@
 """Texture previews for raw SC pixel formats and KTX1 ASTC/ETC/BC/PVRTC."""
 
 import io
+import math
 import struct
 from pathlib import Path
 from PIL import Image
@@ -135,3 +136,71 @@ def replace_from_png(data, path):
         "data": im.tobytes(),
         "external_texture": None,
     }
+
+
+def frame_atlas_bytes(image):
+    """A single RGBA texture resource from a ready-made image."""
+    if image.width > 65535 or image.height > 65535:
+        raise ValueError("Texture dimensions exceed 16-bit range")
+    return {
+        "texture_format": 0,
+        "pixel_type": 0,
+        "width": image.width,
+        "height": image.height,
+        "data": image.convert("RGBA").tobytes(),
+        "external_texture": None,
+    }
+
+
+def decode_animation(path, max_frames=600):
+    """Decode an animated image into a list of RGBA frames.
+
+    Pillow already reads GIF and animated WebP frame by frame, so those need no
+    extra dependency. Each frame is composited onto a full-size canvas, since
+    GIF frames are commonly stored as a small changed rectangle over the
+    previous frame and only the composed result is the picture that is seen.
+    Returns ``(frames, duration_ms)`` where the duration is the total play time
+    of every decoded frame, which a caller uses to derive a framerate; it is 0
+    for a still image.
+    """
+    frames = []
+    delays = []
+    with Image.open(path) as im:
+        if not getattr(im, "is_animated", False):
+            return [im.convert("RGBA")], 0
+        for index in range(getattr(im, "n_frames", 1)):
+            if index >= max_frames:
+                break
+            im.seek(index)
+            delays.append(int(im.info.get("duration", 0) or 0))
+            frames.append(im.convert("RGBA"))
+    return frames, sum(delays)
+
+
+def pack_frames(frames):
+    """Lay frames out in a shelf-packed atlas, returning boxes and placed size.
+
+    A single texture holding every frame keeps one resource to manage and is how
+    real SC animations are usually packed. Shelves are used rather than a
+    general bin packer because the result has to be simple to reason about:
+    every frame in a row shares a top, which is what the shape UVs assume.
+    """
+    if not frames:
+        return [], None, 0, 0
+    width = max(frame.width for frame in frames)
+    height = max(frame.height for frame in frames)
+    # Aim at a roughly square sheet: a single row of a long animation is a very
+    # wide, short texture, which is awkward to crop and to sample.
+    target = math.isqrt(max(1, len(frames))) + 1
+    columns = max(1, min(len(frames), max(target, math.ceil(width / max(height, 1)))))
+    cell_w, cell_h = width, height
+    placements = []
+    for index in range(len(frames)):
+        col, row = index % columns, index // columns
+        placements.append((col * cell_w, row * cell_h))
+    sheet_w = columns * cell_w
+    sheet_h = ((len(frames) + columns - 1) // columns) * cell_h
+    sheet = Image.new("RGBA", (sheet_w, sheet_h), (0, 0, 0, 0))
+    for (x, y), frame in zip(placements, frames):
+        sheet.paste(frame, (x, y))
+    return placements, sheet, sheet_w, sheet_h

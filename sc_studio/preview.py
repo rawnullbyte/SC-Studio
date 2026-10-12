@@ -13,6 +13,7 @@ from PyQt6.QtGui import (
     QColor,
     QPen,
     QPainter,
+    QTextOption,
 )
 from PyQt6.QtWidgets import (
     QApplication,
@@ -145,10 +146,17 @@ class Sprite(QGraphicsPixmapItem):
 
 
 class Container(QGraphicsItem):
-    """A transform parent whose bounds track animated descendants."""
+    """A transform parent whose bounds track animated descendants.
+
+    A textfield declares its own field box, which is not the extent of its
+    glyphs: the text usually overflows the box. When ``logical_bounds`` is set
+    the container measures itself by that box, so the selection outline, the
+    resize handles and the size dialog all agree on the field rather than on
+    however tall the text happens to be.
+    """
 
     def boundingRect(self):
-        return self.childrenBoundingRect()
+        return getattr(self, "logical_bounds", self.childrenBoundingRect())
 
     def paint(self, painter, option, widget=None):
         pass
@@ -364,6 +372,7 @@ class Preview(QGraphicsView):
     def mousePressEvent(self, event):
         self.dragged = None
         self.resize_handle = None
+        self.drag_origin = event.position().toPoint()
         if (
             event.button() == Qt.MouseButton.LeftButton
             and getattr(self, "editable", False)
@@ -406,11 +415,46 @@ class Preview(QGraphicsView):
         )
         super().mousePressEvent(event)
 
+    def drag_translation(self, point):
+        """The ``(dx, dy)`` a drag from ``drag_start`` to ``point`` applies.
+
+        The raw offset is a difference of two ``mapToScene()`` of integer device
+        points, so it is already whole *screen* pixels. That is the device grid,
+        not the asset grid: on a scaled or panned view one screen pixel is a
+        fraction of a scene unit, so a drag lands between the pixels the artwork
+        was authored against. With snapping on the resulting translation is
+        rounded in scene units - the units the file stores and that pixel art is
+        drawn on - so the placement lands on whole pixels.
+        """
+        moved = self.mapToScene(point) - self.drag_start
+        m = self.drag_matrix
+        dx, dy = moved.x(), moved.y()
+        if self.snap_movement:
+            dx, dy = round(m.dx() + dx) - m.dx(), round(m.dy() + dy) - m.dy()
+        return dx, dy
+
+    def drag_past_slop(self, point):
+        """True once the pointer has left the pixel the press landed on.
+
+        A press and release with no movement between them is a click, not a
+        move. Rounding the zero offset onto the grid would otherwise turn that
+        click into a real nudge, because snapping a placement already sitting
+        between two pixels moves it onto one. Requiring the pointer to change
+        pixel is what separates picking something up from dragging it.
+        """
+        return point != getattr(self, "drag_origin", point)
+
     def mouseMoveEvent(self, event):
         if self.panning and getattr(self, "dragged", None) is None:
             self.keep_free()
         if getattr(self, "dragged", None) is not None:
             if self.resize_handle:
+                # A press on a handle that never moves is not a resize either.
+                # The recomputed matrix is not bit-identical to the stored one,
+                # so letting it through committed float noise as a real edit.
+                if not self.drag_past_slop(event.position().toPoint()):
+                    event.accept()
+                    return
                 self.preview_transform(
                     self.resize_matrix(
                         self.mapToScene(event.position().toPoint()),
@@ -420,18 +464,22 @@ class Preview(QGraphicsView):
                 event.accept()
                 return
             m = self.drag_matrix
-            # The drag offset is already whole pixels: both ends are
-            # mapToScene() of an integer device point, so the difference is a
-            # whole number of screen pixels and the move is locked to the grid.
-            moved = self.mapToScene(event.position().toPoint()) - self.drag_start
+            # The offset is whole screen pixels, and snapping rounds it onto the
+            # asset grid, so the movement is locked to whole scene pixels rather
+            # than to a fraction of one. Nothing happens until the pointer
+            # leaves the pixel it started on, so a click never nudges.
+            if not self.drag_past_slop(event.position().toPoint()):
+                event.accept()
+                return
+            dx, dy = self.drag_translation(event.position().toPoint())
             self.dragged.setTransform(
                 QTransform(
                     m.m11(),
                     m.m12(),
                     m.m21(),
                     m.m22(),
-                    m.dx() + moved.x(),
-                    m.dy() + moved.y(),
+                    m.dx() + dx,
+                    m.dy() + dy,
                 )
             )
             self.viewport().update()
@@ -465,9 +513,17 @@ class Preview(QGraphicsView):
     def mouseReleaseEvent(self, event):
         if getattr(self, "dragged", None) is not None:
             if self.resize_handle:
-                matrix = self.resize_matrix(
-                    self.mapToScene(event.position().toPoint()),
-                    bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier),
+                # A press on a handle that never moved is not a resize. The
+                # recomputed matrix differs from the stored one by float noise,
+                # so comparing alone committed that noise as a real edit.
+                moved = self.drag_past_slop(event.position().toPoint())
+                matrix = (
+                    self.resize_matrix(
+                        self.mapToScene(event.position().toPoint()),
+                        bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier),
+                    )
+                    if moved
+                    else self.drag_matrix
                 )
                 row = self.selected_placement
                 self.dragged = None
@@ -490,12 +546,18 @@ class Preview(QGraphicsView):
                 event.accept()
                 return
             # A press and release with no movement between them is not a move, so it
-            # never extends the clip: only a real drag does.
-            delta = self.mapToScene(event.position().toPoint()) - self.drag_start
+            # never extends the clip: only a real drag does. The emitted delta is
+            # the same one the live drag applied, so the committed transform
+            # matches what was on screen - snapped or not. Snapping a placement
+            # that already sits between pixels rounds it onto one, so the slop
+            # check is what stops a plain click from nudging it.
+            dx, dy = self.drag_translation(event.position().toPoint())
             row = self.selected_placement
             self.dragged = None
-            if delta.manhattanLength() > 0.01:
-                self.placementMoved.emit(row, delta.x(), delta.y())
+            if self.drag_past_slop(event.position().toPoint()) and (
+                abs(dx) > 0.01 or abs(dy) > 0.01
+            ):
+                self.placementMoved.emit(row, dx, dy)
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -581,6 +643,9 @@ class Preview(QGraphicsView):
         # True while a pan drag is in progress. Qt reads the scene rect during
         # the drag, so it has to be repaired while the mouse is still down.
         self.panning = False
+        # Device-pixel position of the last press, so a click that never moves
+        # the pointer is told apart from a real drag.
+        self.drag_origin = None
         # Off for a sheet fitted to the view, so keep_free() never widens the
         # browsable area away from the image.
         self.free_camera = True
@@ -619,6 +684,10 @@ class Preview(QGraphicsView):
         self.matrix_override = None
         # Scrollable area for the open resource; set once, then left alone.
         self.view_rect = None
+        # Snap a dragged placement onto whole scene pixels, which are the asset
+        # pixels the file stores. Off means a drag follows the screen pixel grid
+        # exactly, which on a zoomed view lands between stored pixels.
+        self.snap_movement = True
         self.setMouseTracking(True)
 
     def apply_theme(self):
@@ -906,6 +975,15 @@ class Preview(QGraphicsView):
         self.shape_cache.move_to_end(key)
         return self.shape_cache[key]
 
+    def render_triangle(self, painter, vertices, image):
+        """Paint one triangle-strip face, for exports outside a scene.
+
+        ``shape_surface`` builds a scene-bound surface; an export needs the same
+        three-vertex draw against a plain painter, so the geometry is shared
+        here rather than duplicated in the caller.
+        """
+        Triangle(vertices, image, None).paint(painter, None)
+
     def atlas(self, index):
         key = (id(self.doc), index)
         if key not in self.cache:
@@ -1160,18 +1238,48 @@ class Preview(QGraphicsView):
             font.setItalic(bool(obj["styles"] & 8))
             text.setFont(font)
             text.setDefaultTextColor(QColor.fromRgba(obj["font_color"]))
-            text.setPos(obj["left"], obj["top"])
             text.setTextWidth(max(1, obj["right"] - obj["left"]))
-            bounds = self.scene().addRect(
-                QRectF(
-                    obj["left"],
-                    obj["top"],
-                    obj["right"] - obj["left"],
-                    obj["bottom"] - obj["top"],
-                ),
-                QPen(QColor("#68778e")),
+            # Alignment is stored as a packed bitfield and has to be applied to
+            # the document's text option; without this every textfield previewed
+            # left-aligned at the top, so changing the alignment changed nothing
+            # on screen. The vertical offset is worked out after layout, when the
+            # text's own height is known, and the same packing the renderer uses
+            # is read here so the two agree.
+            option = text.document().defaultTextOption()
+            option.setAlignment(
+                {
+                    0: Qt.AlignmentFlag.AlignLeft,
+                    1: Qt.AlignmentFlag.AlignHCenter,
+                    2: Qt.AlignmentFlag.AlignRight,
+                    3: Qt.AlignmentFlag.AlignJustify,
+                }.get(obj["align"] & 3, Qt.AlignmentFlag.AlignLeft)
             )
+            option.setWrapMode(
+                QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere
+                if obj["styles"] & 16
+                else QTextOption.WrapMode.NoWrap
+            )
+            text.document().setDefaultTextOption(option)
+            vertical = (obj["align"] >> 2) & 3
+            space = (obj["bottom"] - obj["top"]) - text.boundingRect().height()
+            dy = space / 2 if vertical == 1 else space if vertical in (2, 3) else 0
+            text.setPos(obj["left"], obj["top"] + dy)
+            box = QRectF(
+                obj["left"],
+                obj["top"],
+                obj["right"] - obj["left"],
+                obj["bottom"] - obj["top"],
+            )
+            bounds = self.scene().addRect(box, QPen(QColor("#68778e")))
             bounds.setParentItem(group)
+            # The textfield is measured by its field box, not by its glyphs, so
+            # the grey box, the blue selection outline and the resize handles
+            # all frame the same rectangle. Without this the container reported
+            # the text's height instead, and a vertical resize scaled about the
+            # wrong edge, leaving the box short of the cursor. The half-pen
+            # padding matches the stroke the grey rect is drawn with, so the two
+            # outlines coincide exactly.
+            group.logical_bounds = box.adjusted(-0.5, -0.5, 0.5, 0.5)
         elif kind == "modifiers":
             self.messages.append(
                 "Mask modifiers are preserved; stencil masks are not simulated"

@@ -668,12 +668,13 @@ class Window(QMainWindow):
         ed = self.current()
         if ed is None or not ed.resolve_drafts():
             return
-        # A child focused in the Children or Placements list is what Copy is
-        # about: it copies the resource that child instances, not the movieclip
-        # it sits in. Everywhere else the browser selection, or the open
-        # resource, is what is copied.
-        child = ed.focused_child_id()
-        ids = [child] if child is not None else ed.selected_ids()
+        # A child picked in the Children or Placements list is what Copy is
+        # about: it copies the resource each picked child instances, not the
+        # movieclip they sit in. Every picked row counts, so a set of instances
+        # copies its several resources. Everywhere else the browser selection,
+        # or the open resource, is what is copied.
+        children = ed.picked_child_ids()
+        ids = children if children else ed.selected_ids()
         if not ids:
             return
 
@@ -737,10 +738,16 @@ class Window(QMainWindow):
         ed = self.current()
         if ed is None or not ed.resolve_drafts():
             return
-        # Duplicating a focused child is the child-list action, which copies the
+        # Duplicating a picked child is the child-list action, which copies the
         # instance into the same movieclip; duplicating a resource makes a new
-        # resource. The two are different enough that focus picks which one.
+        # resource. The two are different enough that the child pick decides.
+        # Read from the picked rows, not the focus widget: with several rows
+        # marked and the table unfocused, that answer was empty and this fell
+        # through to duplicating the whole movieclip.
         child = ed.focused_child_index()
+        if child < 0:
+            rows = ed.selected_child_rows()
+            child = rows[-1] if rows else -1
         if child >= 0:
             ed.duplicate_child(child)
             return

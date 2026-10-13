@@ -3816,3 +3816,93 @@ def test_group_scale_by_dragging_the_box_handle(window):
     assert after[0][4] == pytest.approx(before[0][4])
     e.undo()
     assert placement_matrices(d) == before, "one undo restores both"
+
+
+
+def test_copy_takes_every_picked_child_not_the_movieclip(window):
+    """Ctrl+C over several marked children copies those children's resources.
+
+    The pick was read through focused_child_id, which answers from the focus
+    widget; a marked range whose table was not focused came back empty, and
+    Copy fell through to the browser selection - the whole movieclip.
+    """
+    from PyQt6.QtWidgets import QTableWidgetSelectionRange
+
+    w = window
+    d = populated()
+    clip = d.resource(7)
+    clip["children"] = [
+        {"id": 3, "name": "a", "blend": 0},
+        {"id": 4, "name": "b", "blend": 0},
+        {"id": 3, "name": "c", "blend": 0},
+    ]
+    d.update("movieclips", clip)
+    w.add_doc(d)
+    e = w.current()
+    e.go_to(7)
+    application().processEvents()
+    e.children.setCurrentCell(0, 0)
+    e.children.setRangeSelected(QTableWidgetSelectionRange(0, 0, 1, 0), True)
+    application().processEvents()
+    assert e.picked_child_ids() == [3, 4], "rows 0 and 1 are the shape and the textfield"
+    w.copy()
+    wait_until(lambda: not w.jobs)
+    doc, roots = w.clipboard
+    kinds = sorted(doc.index[root][0] for root in roots)
+    assert kinds == ["shapes", "textfields"], "both picked children, not the clip"
+    assert "movieclips" not in kinds
+
+
+def test_copy_of_two_instances_of_one_resource_deduplicates(window):
+    """Two children sharing a shape copy one resource, not the same id twice."""
+    from PyQt6.QtWidgets import QTableWidgetSelectionRange
+
+    w = window
+    d = populated()
+    clip = d.resource(7)
+    clip["children"] = [
+        {"id": 3, "name": "a", "blend": 0},
+        {"id": 3, "name": "b", "blend": 0},
+    ]
+    d.update("movieclips", clip)
+    w.add_doc(d)
+    e = w.current()
+    e.go_to(7)
+    application().processEvents()
+    e.children.setCurrentCell(0, 0)
+    e.children.setRangeSelected(QTableWidgetSelectionRange(0, 0, 1, 0), True)
+    application().processEvents()
+    assert e.picked_child_ids() == [3]
+    w.copy()
+    wait_until(lambda: not w.jobs)
+    doc, roots = w.clipboard
+    assert len(roots) == 1 and doc.index[roots[0]][0] == "shapes"
+
+
+def test_duplicate_of_a_marked_child_set_copies_instances(window):
+    """Duplicate with marked children copies the instances, not the clip."""
+    from PyQt6.QtWidgets import QTableWidgetSelectionRange
+
+    w = window
+    d = populated()
+    clip = d.resource(7)
+    clip["children"] = [
+        {"id": 3, "name": "a", "blend": 0},
+        {"id": 4, "name": "b", "blend": 0},
+        {"id": 3, "name": "c", "blend": 0},
+    ]
+    clip["frames"] = [{"label": "", "elements": [[0, 0, 65535], [1, 0, 65535]]}]
+    d.update("movieclips", clip)
+    w.add_doc(d)
+    e = w.current()
+    e.go_to(7)
+    application().processEvents()
+    before = len(e.obj["children"])
+    e.children.setCurrentCell(0, 0)
+    e.children.setRangeSelected(QTableWidgetSelectionRange(0, 0, 1, 0), True)
+    application().processEvents()
+    w.duplicate()
+    application().processEvents()
+    # An instance is added to the clip; the movieclip is not duplicated.
+    assert len(e.obj["children"]) == before + 1
+    assert e.selected == 7

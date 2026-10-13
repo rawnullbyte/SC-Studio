@@ -89,6 +89,33 @@ class ChildrenPanel:
         row = self.elements.currentRow()
         return [row] if row >= 0 else []
 
+    def picked_child_ids(self):
+        """The resource id of every picked child instance, in list order.
+
+        Reads the marked rows, so Ctrl- and Shift-click over several children
+        copy exactly those, and the result is deduplicated: two instances of one
+        shape are one resource to copy, and clipboard_pack would otherwise emit
+        the same id twice.
+
+        Deliberately not ``focused_child_id``: that answers from the focus
+        widget, so a marked range whose table does not currently hold focus came
+        back empty and Copy fell through to the browser selection - a whole
+        movieclip copied when a few children were meant.
+        """
+        if (
+            self.selected not in self.doc.index
+            or self.doc.index[self.selected][0] != "movieclips"
+        ):
+            return []
+        children = self.obj.get("children") or []
+        ids = []
+        for row in self.selected_child_rows():
+            if 0 <= row < len(children):
+                id = children[row]["id"]
+                if id not in ids:
+                    ids.append(id)
+        return ids
+
     def children_context_menu(self, position):
         self.list_context_menu(
             self.children,

@@ -14,7 +14,6 @@ never touch are saved back byte-for-byte.
 ## What it does
 
 | | |
-| --- | --- |
 | **Resources** | Movieclips, shapes, textfields, exports and modifiers, with every field in the bundled schemas exposed through Properties, JSON or the geometry editor. |
 | **Animation** | A multi-track keyframe timeline with per-object tracks, nine easing curves, tween baking and the engine's own inheritance rule — a frame with no key holds the last pose set. |
 | **Textures** | Browse atlases, outline every command that samples them, crop to the region a shape actually uses, and preview ASTC/ETC/BC1/PVRTC/raw atlases. |
